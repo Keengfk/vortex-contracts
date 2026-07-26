@@ -302,10 +302,12 @@ impl IntentSettlement {
 
         let is_new_solver = existing.is_none();
 
-        let bond_token: Address = env.storage().instance().get(&DataKey::BondToken).unwrap();
-        let client = token::Client::new(&env, &bond_token);
-        client.transfer(&solver, &env.current_contract_address(), &bond_amount);
-
+        // ── Effects first (CEI) ──────────────────────────────────────────────
+        // Build and persist the SolverRecord *before* pulling funds in so the
+        // contract's storage is always consistent with what it holds: if the
+        // transfer were to fail (or a re-entrant call were made mid-transfer),
+        // the record either doesn't exist yet (new solver) or still reflects
+        // the pre-topup balance, rather than an inflated balance with no matching funds.
         let record = match existing {
             Some(mut s) => {
                 s.bond_amount += bond_amount;
@@ -340,6 +342,11 @@ impl IntentSettlement {
                 .set(&DataKey::TotalSolvers, &(total + 1));
         }
 
+        // ── Interaction: pull bond in ────────────────────────────────────────
+        let bond_token: Address = env.storage().instance().get(&DataKey::BondToken).unwrap();
+        let client = token::Client::new(&env, &bond_token);
+        client.transfer(&solver, &env.current_contract_address(), &bond_amount);
+
         env.events().publish(
             (Symbol::new(&env, "solver_registered"), solver),
             bond_amount,
@@ -360,17 +367,10 @@ impl IntentSettlement {
             panic_with_error!(&env, Error::SolverHasActiveIntents);
         }
 
-        // Return bond
-        if record.bond_amount > 0 {
-            let bond_token: Address = env.storage().instance().get(&DataKey::BondToken).unwrap();
-            let client = token::Client::new(&env, &bond_token);
-            client.transfer(
-                &env.current_contract_address(),
-                &solver,
-                &record.bond_amount,
-            );
-        }
-
+        // ── Effects first (CEI) ──────────────────────────────────────────────
+        // Remove the solver record and update the counter *before* the external
+        // token transfer so that any re-entrant call sees no record and would
+        // panic with SolverNotRegistered rather than processing a double-refund.
         env.storage()
             .persistent()
             .remove(&DataKey::Solver(solver.clone()));
@@ -383,6 +383,17 @@ impl IntentSettlement {
         env.storage()
             .instance()
             .set(&DataKey::TotalSolvers, &total.saturating_sub(1));
+
+        // ── Interaction: return bond ─────────────────────────────────────────
+        if record.bond_amount > 0 {
+            let bond_token: Address = env.storage().instance().get(&DataKey::BondToken).unwrap();
+            let client = token::Client::new(&env, &bond_token);
+            client.transfer(
+                &env.current_contract_address(),
+                &solver,
+                &record.bond_amount,
+            );
+        }
 
         env.events().publish(
             (Symbol::new(&env, "solver_deregistered"), solver),
@@ -596,23 +607,11 @@ impl IntentSettlement {
             panic_with_error!(&env, Error::InsufficientOutput);
         }
 
-        // Solver delivers the full requested output to the user.
-        let dst_client = token::Client::new(&env, &intent.dst_token);
-        dst_client.transfer(&solver, &intent.user, &fill_amount);
-
-        // Solver also pays the protocol fee (priced into their quote). Taking the
-        // fee from the solver — rather than clawing it back from the user — keeps
-        // the user's received amount at or above `min_dst_amount`, and keeps every
-        // token transfer authorized by the solver who signed this call.
-        let fee = fill_amount * PROTOCOL_FEE_BPS / 10_000;
-        if fee > 0 {
-            let fee_recipient: Address = env
-                .storage()
-                .instance()
-                .get(&DataKey::FeeRecipient)
-                .unwrap();
-            dst_client.transfer(&solver, &fee_recipient, &fee);
-        }
+        // ── Effects first (CEI) ──────────────────────────────────────────────
+        // Mark the intent Filled and write every state change to storage
+        // *before* any external token transfer executes. A hostile SEP-41
+        // token that attempts to re-enter fill_intent or slash_solver during
+        // the transfer would see the intent already Filled and be rejected.
 
         intent.state = IntentState::Filled;
         intent.filled_at = Some(now);
@@ -646,6 +645,25 @@ impl IntentSettlement {
             .persistent()
             .set(&DataKey::Intent(intent_id.clone()), &intent);
         Self::bump_intent_ttl(&env, &intent_id);
+
+        // ── Interactions: token transfers ────────────────────────────────────
+        // Solver delivers the full requested output to the user.
+        let dst_client = token::Client::new(&env, &intent.dst_token);
+        dst_client.transfer(&solver, &intent.user, &fill_amount);
+
+        // Solver also pays the protocol fee (priced into their quote). Taking the
+        // fee from the solver — rather than clawing it back from the user — keeps
+        // the user's received amount at or above `min_dst_amount`, and keeps every
+        // token transfer authorized by the solver who signed this call.
+        let fee = fill_amount * PROTOCOL_FEE_BPS / 10_000;
+        if fee > 0 {
+            let fee_recipient: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::FeeRecipient)
+                .unwrap();
+            dst_client.transfer(&solver, &fee_recipient, &fee);
+        }
 
         env.events().publish(
             (Symbol::new(&env, "intent_filled"), solver),
