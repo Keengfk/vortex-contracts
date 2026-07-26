@@ -994,3 +994,19 @@ fn get_bond_token_returns_configured_token() {
     let ctx = setup();
     assert_eq!(ctx.client().get_bond_token(), Some(ctx.bond_token.clone()));
 }
+
+// ─── get_protocol_params view ────────────────────────────────────────────────────
+
+#[test]
+fn get_protocol_params_returns_current_constants() {
+    use crate::{FILL_WINDOW, INTENT_EXPIRY, MIN_BOND};
+    const PROTOCOL_FEE_BPS: i128 = 5;
+
+    let ctx = setup();
+    let params = ctx.client().get_protocol_params();
+
+    assert_eq!(params.min_bond, MIN_BOND);
+    assert_eq!(params.fill_window, FILL_WINDOW);
+    assert_eq!(params.intent_expiry, INTENT_EXPIRY);
+    assert_eq!(params.protocol_fee_bps, PROTOCOL_FEE_BPS);
+}
