@@ -16,10 +16,24 @@ mod test;
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const INTENT_EXPIRY: u64 = 1800; // 30 minutes
-const FILL_WINDOW: u64 = 300; // 5 minutes to fill after intent accepted
-const MIN_BOND: i128 = 50 * 10_000_000; // 50 USDC minimum solver bond
-const PROTOCOL_FEE_BPS: i128 = 5; // 0.05%
+/// Default values — used to seed Config on initialize and as fallback when
+/// Config hasn't been written yet (upgrade safety).
+const DEFAULT_INTENT_EXPIRY: u64 = 1800; // 30 minutes
+const DEFAULT_FILL_WINDOW: u64 = 300; // 5 minutes to fill after intent accepted
+const DEFAULT_MIN_BOND: i128 = 50 * 10_000_000; // 50 USDC minimum solver bond
+const DEFAULT_PROTOCOL_FEE_BPS: i128 = 5; // 0.05%
+
+/// Re-export the defaults under their original names so existing tests that
+/// import the bare constant names continue to compile without changes.
+pub const INTENT_EXPIRY: u64 = DEFAULT_INTENT_EXPIRY;
+pub const FILL_WINDOW: u64 = DEFAULT_FILL_WINDOW;
+pub const MIN_BOND: i128 = DEFAULT_MIN_BOND;
+
+/// Admin-settable bounds to prevent mis-configuration.
+const MAX_PROTOCOL_FEE_BPS: i128 = 1_000; // hard cap: 10%
+const MIN_FILL_WINDOW_SECS: u64 = 60; // at least 1 minute
+const MIN_INTENT_EXPIRY_SECS: u64 = 300; // at least 5 minutes
+const MIN_BOND_FLOOR: i128 = 10_000_000; // at least 1 token (7 decimals)
 
 // Soroban archives ledger entries that go too long without being touched.
 // Persistent Intent/Solver records get their TTL bumped on every write so
@@ -50,9 +64,26 @@ pub enum DataKey {
     Paused,
     AllowedDstToken(Address), // dst_token -> present if allowed
     DstAllowlistEnabled,
+    /// Admin-configurable protocol parameters (replaces compile-time constants).
+    Config,
 }
 
 // ─── Data Structs ─────────────────────────────────────────────────────────────
+
+/// Admin-configurable protocol parameters.  Stored as a single instance-storage
+/// entry so all four values are read/written atomically.
+#[contracttype]
+#[derive(Clone)]
+pub struct ProtocolConfig {
+    /// Minimum solver bond in bond_token's smallest unit.
+    pub min_bond: i128,
+    /// Seconds a solver has to fill after accepting an intent.
+    pub fill_window: u64,
+    /// Default intent lifetime in seconds (used when submit_intent deadline is None).
+    pub intent_expiry: u64,
+    /// Protocol fee in basis points charged on each fill (0.01% per bps).
+    pub protocol_fee_bps: i128,
+}
 
 /// A user's cross-chain swap intent
 #[contracttype]
@@ -133,6 +164,7 @@ pub enum Error {
     DeadlineNotReached = 19,
     InsufficientBond = 20,
     DstTokenNotAllowed = 21,
+    InvalidConfig = 22,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -159,6 +191,17 @@ impl IntentSettlement {
         env.storage().instance().set(&DataKey::TotalIntents, &0u64);
         env.storage().instance().set(&DataKey::TotalVolume, &0i128);
         env.storage().instance().set(&DataKey::TotalSolvers, &0u32);
+        // Seed Config with defaults so the contract is immediately usable
+        // without a follow-up admin call.
+        env.storage().instance().set(
+            &DataKey::Config,
+            &ProtocolConfig {
+                min_bond: DEFAULT_MIN_BOND,
+                fill_window: DEFAULT_FILL_WINDOW,
+                intent_expiry: DEFAULT_INTENT_EXPIRY,
+                protocol_fee_bps: DEFAULT_PROTOCOL_FEE_BPS,
+            },
+        );
         Self::bump_instance_ttl(&env);
     }
 
@@ -200,6 +243,58 @@ impl IntentSettlement {
 
         env.events()
             .publish((Symbol::new(&env, "admin_transferred"),), new_admin);
+    }
+
+    // ── Protocol Config ───────────────────────────────────────────────────────
+
+    /// Read the effective protocol config.  Falls back to compile-time defaults
+    /// for contracts that existed before this upgrade (upgrade safety).
+    pub fn get_config(env: Env) -> ProtocolConfig {
+        Self::load_config(&env)
+    }
+
+    /// Admin-only: update the four configurable protocol parameters atomically.
+    ///
+    /// Bounds (any violation returns `InvalidConfig`):
+    /// * `protocol_fee_bps`  ≤ 1 000 (10%)
+    /// * `fill_window`       ≥ 60 s
+    /// * `intent_expiry`     ≥ 300 s and > fill_window
+    /// * `min_bond`          ≥ 1 token unit (10_000_000 for 7-decimal USDC)
+    pub fn set_config(
+        env: Env,
+        min_bond: i128,
+        fill_window: u64,
+        intent_expiry: u64,
+        protocol_fee_bps: i128,
+    ) {
+        Self::require_admin(&env);
+
+        if !(0..=MAX_PROTOCOL_FEE_BPS).contains(&protocol_fee_bps) {
+            panic_with_error!(&env, Error::InvalidConfig);
+        }
+        if fill_window < MIN_FILL_WINDOW_SECS {
+            panic_with_error!(&env, Error::InvalidConfig);
+        }
+        if intent_expiry < MIN_INTENT_EXPIRY_SECS || intent_expiry <= fill_window {
+            panic_with_error!(&env, Error::InvalidConfig);
+        }
+        if min_bond < MIN_BOND_FLOOR {
+            panic_with_error!(&env, Error::InvalidConfig);
+        }
+
+        let cfg = ProtocolConfig {
+            min_bond,
+            fill_window,
+            intent_expiry,
+            protocol_fee_bps,
+        };
+        env.storage().instance().set(&DataKey::Config, &cfg);
+        Self::bump_instance_ttl(&env);
+
+        env.events().publish(
+            (Symbol::new(&env, "config_updated"),),
+            (min_bond, fill_window, intent_expiry, protocol_fee_bps),
+        );
     }
 
     // ── Destination Token Allowlist ───────────────────────────────────────────
@@ -296,7 +391,8 @@ impl IntentSettlement {
             .get(&DataKey::Solver(solver.clone()));
 
         let existing_bond = existing.as_ref().map(|s| s.bond_amount).unwrap_or(0);
-        if existing_bond + bond_amount < MIN_BOND {
+        let cfg = Self::load_config(&env);
+        if existing_bond + bond_amount < cfg.min_bond {
             panic_with_error!(&env, Error::SolverBondTooLow);
         }
 
@@ -412,7 +508,8 @@ impl IntentSettlement {
         }
 
         let remaining = record.bond_amount - amount;
-        if remaining < MIN_BOND {
+        let cfg = Self::load_config(&env);
+        if remaining < cfg.min_bond {
             panic_with_error!(&env, Error::SolverBondTooLow);
         }
 
@@ -460,7 +557,8 @@ impl IntentSettlement {
         }
 
         let now = env.ledger().timestamp();
-        let expiry = deadline.unwrap_or(now + INTENT_EXPIRY);
+        let cfg = Self::load_config(&env);
+        let expiry = deadline.unwrap_or(now + cfg.intent_expiry);
 
         if expiry <= now {
             panic_with_error!(&env, Error::InvalidDeadline);
@@ -546,7 +644,8 @@ impl IntentSettlement {
         intent.solver = Some(solver.clone());
         intent.state = IntentState::Accepted;
         // Extend deadline to fill window from now
-        intent.deadline = now + FILL_WINDOW;
+        let cfg = Self::load_config(&env);
+        intent.deadline = now + cfg.fill_window;
 
         solver_record.active_intents += 1;
         env.storage()
@@ -604,7 +703,8 @@ impl IntentSettlement {
         // fee from the solver — rather than clawing it back from the user — keeps
         // the user's received amount at or above `min_dst_amount`, and keeps every
         // token transfer authorized by the solver who signed this call.
-        let fee = fill_amount * PROTOCOL_FEE_BPS / 10_000;
+        let cfg = Self::load_config(&env);
+        let fee = fill_amount * cfg.protocol_fee_bps / 10_000;
         if fee > 0 {
             let fee_recipient: Address = env
                 .storage()
@@ -719,16 +819,17 @@ impl IntentSettlement {
         solver_record.fills_failed += 1;
         solver_record.active_intents = solver_record.active_intents.saturating_sub(1);
 
-        // A solver whose bond no longer covers MIN_BOND can't credibly back
+        let cfg = Self::load_config(&env);
+        // A solver whose bond no longer covers min_bond can't credibly back
         // further fills -- take them out of rotation until they top back up.
-        if solver_record.bond_amount < MIN_BOND {
+        if solver_record.bond_amount < cfg.min_bond {
             solver_record.is_active = false;
         }
 
         // Re-open the intent
         intent.state = IntentState::Open;
         intent.solver = None;
-        intent.deadline = now + INTENT_EXPIRY;
+        intent.deadline = now + cfg.intent_expiry;
 
         // Send slash to fee recipient
         if slash_amount > 0 {
@@ -810,12 +911,13 @@ impl IntentSettlement {
     /// bots self-check eligibility without independently reimplementing
     /// the same logic accept_intent enforces.
     pub fn is_solver_eligible(env: Env, solver: Address) -> bool {
+        let cfg = Self::load_config(&env);
         match env
             .storage()
             .persistent()
             .get::<_, SolverRecord>(&DataKey::Solver(solver))
         {
-            Some(record) => record.is_active && record.bond_amount >= MIN_BOND,
+            Some(record) => record.is_active && record.bond_amount >= cfg.min_bond,
             None => false,
         }
     }
@@ -862,6 +964,20 @@ impl IntentSettlement {
         if Self::is_paused(env.clone()) {
             panic_with_error!(env, Error::ContractPaused);
         }
+    }
+
+    /// Load the protocol config from storage, falling back to defaults for
+    /// contracts that pre-date this upgrade (upgrade-safe).
+    fn load_config(env: &Env) -> ProtocolConfig {
+        env.storage()
+            .instance()
+            .get(&DataKey::Config)
+            .unwrap_or(ProtocolConfig {
+                min_bond: DEFAULT_MIN_BOND,
+                fill_window: DEFAULT_FILL_WINDOW,
+                intent_expiry: DEFAULT_INTENT_EXPIRY,
+                protocol_fee_bps: DEFAULT_PROTOCOL_FEE_BPS,
+            })
     }
 
     fn bump_instance_ttl(env: &Env) {

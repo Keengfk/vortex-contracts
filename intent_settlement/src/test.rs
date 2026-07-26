@@ -994,3 +994,103 @@ fn get_bond_token_returns_configured_token() {
     let ctx = setup();
     assert_eq!(ctx.client().get_bond_token(), Some(ctx.bond_token.clone()));
 }
+
+// ─── Admin-configurable protocol parameters ──────────────────────────────────────
+
+#[test]
+fn get_config_returns_defaults_after_initialize() {
+    use crate::{
+        DEFAULT_FILL_WINDOW, DEFAULT_INTENT_EXPIRY, DEFAULT_MIN_BOND, DEFAULT_PROTOCOL_FEE_BPS,
+    };
+    let ctx = setup();
+    let cfg = ctx.client().get_config();
+    assert_eq!(cfg.min_bond, DEFAULT_MIN_BOND);
+    assert_eq!(cfg.fill_window, DEFAULT_FILL_WINDOW);
+    assert_eq!(cfg.intent_expiry, DEFAULT_INTENT_EXPIRY);
+    assert_eq!(cfg.protocol_fee_bps, DEFAULT_PROTOCOL_FEE_BPS);
+}
+
+#[test]
+fn set_config_updates_all_four_params() {
+    let ctx = setup();
+    let c = ctx.client();
+    c.set_config(&(MIN_BOND * 2), &600, &3600, &10);
+    let cfg = c.get_config();
+    assert_eq!(cfg.min_bond, MIN_BOND * 2);
+    assert_eq!(cfg.fill_window, 600);
+    assert_eq!(cfg.intent_expiry, 3600);
+    assert_eq!(cfg.protocol_fee_bps, 10);
+}
+
+#[test]
+fn set_config_fee_above_cap_fails() {
+    let ctx = setup();
+    let res = ctx.client().try_set_config(&MIN_BOND, &300, &1800, &1001);
+    assert_eq!(res, Err(Ok(Error::InvalidConfig.into())));
+}
+
+#[test]
+fn set_config_fill_window_below_minimum_fails() {
+    let ctx = setup();
+    // fill_window < 60 s
+    let res = ctx.client().try_set_config(&MIN_BOND, &59, &1800, &5);
+    assert_eq!(res, Err(Ok(Error::InvalidConfig.into())));
+}
+
+#[test]
+fn set_config_intent_expiry_below_minimum_fails() {
+    let ctx = setup();
+    // intent_expiry < 300 s
+    let res = ctx.client().try_set_config(&MIN_BOND, &60, &299, &5);
+    assert_eq!(res, Err(Ok(Error::InvalidConfig.into())));
+}
+
+#[test]
+fn set_config_intent_expiry_must_exceed_fill_window() {
+    let ctx = setup();
+    // intent_expiry == fill_window — not strictly greater
+    let res = ctx.client().try_set_config(&MIN_BOND, &300, &300, &5);
+    assert_eq!(res, Err(Ok(Error::InvalidConfig.into())));
+}
+
+#[test]
+fn set_config_min_bond_below_floor_fails() {
+    let ctx = setup();
+    // min_bond < 1 token unit
+    let res = ctx
+        .client()
+        .try_set_config(&(10_000_000 - 1), &300, &1800, &5);
+    assert_eq!(res, Err(Ok(Error::InvalidConfig.into())));
+}
+
+#[test]
+fn register_solver_respects_updated_min_bond() {
+    let ctx = setup();
+    let c = ctx.client();
+    // Raise min_bond to 2 000 USDC.
+    c.set_config(&(2_000 * 10_000_000_i128), &300, &1800, &5);
+
+    // BOND is 1_000 USDC — now below the new minimum.
+    ctx.bond_admin().mint(&ctx.solver, &BOND);
+    let res = c.try_register_solver(&ctx.solver, &BOND);
+    assert_eq!(res, Err(Ok(Error::SolverBondTooLow.into())));
+}
+
+#[test]
+fn fill_intent_uses_updated_fee_bps() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    // Set fee to 100 bps (1%).
+    c.set_config(&MIN_BOND, &300, &1800, &100);
+
+    ctx.register_solver();
+    let id = ctx.submit();
+    c.accept_intent(&ctx.solver, &id);
+
+    let fee = FILL * 100 / 10_000; // 1% of FILL
+    ctx.dst_admin().mint(&ctx.solver, &(FILL + fee));
+    c.fill_intent(&ctx.solver, &id, &FILL);
+
+    assert_eq!(ctx.dst().balance(&ctx.fee_recipient), fee);
+}
