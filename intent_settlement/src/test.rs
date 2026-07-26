@@ -994,3 +994,265 @@ fn get_bond_token_returns_configured_token() {
     let ctx = setup();
     assert_eq!(ctx.client().get_bond_token(), Some(ctx.bond_token.clone()));
 }
+
+// ─── #34 Source chain allowlist ──────────────────────────────────────────────────
+
+#[test]
+fn src_chain_allowlist_disabled_by_default() {
+    // The SrcChainAllowlistEnabled flag must default to false so any
+    // existing deployment keeps working until an admin explicitly opts in.
+    let ctx = setup();
+    assert!(!ctx.client().is_src_chain_allowlist_enabled());
+}
+
+#[test]
+fn src_chain_allowlist_disabled_allows_any_chain() {
+    // With enforcement off, free-text src_chain values still go through --
+    // matches the pre-#34 behaviour so no migration is required.
+    let ctx = setup();
+    assert!(!ctx.client().is_src_chain_allowlist_enabled());
+    ctx.submit(); // "ethereum" -- would be rejected if enforcement were on and list were empty
+}
+
+#[test]
+fn src_chain_allowlist_blocks_unlisted_chain_when_enabled() {
+    let ctx = setup();
+    let c = ctx.client();
+    c.set_src_chain_allowlist_enabled(&true);
+
+    let deadline: Option<u64> = None;
+    let res = c.try_submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "etherium"), // typo -- not on list
+        &String::from_str(&ctx.env, "0xabc"),
+        &SRC_AMT,
+        &ctx.dst_token,
+        &MIN_DST,
+        &deadline,
+    );
+    assert_eq!(res, Err(Ok(Error::SrcChainNotAllowed.into())));
+}
+
+#[test]
+fn src_chain_allowlist_allows_listed_chain_when_enabled() {
+    let ctx = setup();
+    let c = ctx.client();
+    c.add_allowed_src_chain(&String::from_str(&ctx.env, "ethereum"));
+    c.set_src_chain_allowlist_enabled(&true);
+
+    assert!(c.is_src_chain_allowed(&String::from_str(&ctx.env, "ethereum")));
+    // ctx.submit() uses "ethereum" -- should now succeed.
+    ctx.submit();
+}
+
+#[test]
+fn src_chain_allowlist_removal_blocks_previously_allowed_chain() {
+    let ctx = setup();
+    let c = ctx.client();
+    let chain = String::from_str(&ctx.env, "ethereum");
+    c.add_allowed_src_chain(&chain);
+    c.set_src_chain_allowlist_enabled(&true);
+    c.remove_allowed_src_chain(&chain);
+
+    assert!(!c.is_src_chain_allowed(&String::from_str(&ctx.env, "ethereum")));
+
+    let deadline: Option<u64> = None;
+    let res = c.try_submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "ethereum"),
+        &String::from_str(&ctx.env, "0xabc"),
+        &SRC_AMT,
+        &ctx.dst_token,
+        &MIN_DST,
+        &deadline,
+    );
+    assert_eq!(res, Err(Ok(Error::SrcChainNotAllowed.into())));
+}
+
+#[test]
+fn src_chain_unlisted_accepted_after_disabling_enforcement() {
+    // Disabling the flag after enabling it should restore open submission.
+    let ctx = setup();
+    let c = ctx.client();
+    c.set_src_chain_allowlist_enabled(&true);
+    c.set_src_chain_allowlist_enabled(&false);
+
+    // "base" was never added to the list, but enforcement is off.
+    let deadline: Option<u64> = None;
+    c.try_submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "base"),
+        &String::from_str(&ctx.env, "0xabc"),
+        &SRC_AMT,
+        &ctx.dst_token,
+        &MIN_DST,
+        &deadline,
+    )
+    .unwrap();
+}
+
+// ─── #35 rescue_tokens ──────────────────────────────────────────────────────────
+
+#[test]
+fn rescue_tokens_moves_non_protocol_token_to_recipient() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    // Mint a random "lost" token directly to the contract.
+    let rescue_token = ctx
+        .env
+        .register_stellar_asset_contract_v2(ctx.admin.clone())
+        .address();
+    let rescue_admin = token::StellarAssetClient::new(&ctx.env, &rescue_token);
+    let rescue_client = token::Client::new(&ctx.env, &rescue_token);
+    let rescue_amount: i128 = 1_000_000;
+    rescue_admin.mint(&ctx.contract_id, &rescue_amount);
+
+    assert_eq!(rescue_client.balance(&ctx.contract_id), rescue_amount);
+
+    let recipient = Address::generate(&ctx.env);
+    c.rescue_tokens(&rescue_token, &recipient, &rescue_amount);
+
+    assert_eq!(rescue_client.balance(&ctx.contract_id), 0);
+    assert_eq!(rescue_client.balance(&recipient), rescue_amount);
+}
+
+#[test]
+fn rescue_tokens_blocked_for_bond_token() {
+    // The bond_token is protected: rescuing it could drain solver collateral.
+    let ctx = setup();
+    let recipient = Address::generate(&ctx.env);
+    let res = ctx
+        .client()
+        .try_rescue_tokens(&ctx.bond_token, &recipient, &1);
+    assert_eq!(res, Err(Ok(Error::RescueProtectedToken.into())));
+}
+
+#[test]
+fn rescue_tokens_zero_amount_fails() {
+    let ctx = setup();
+    // Register a different token so the zero-amount check fires, not the
+    // protected-token check.
+    let other_token = ctx
+        .env
+        .register_stellar_asset_contract_v2(ctx.admin.clone())
+        .address();
+    let recipient = Address::generate(&ctx.env);
+    let res = ctx
+        .client()
+        .try_rescue_tokens(&other_token, &recipient, &0);
+    assert_eq!(res, Err(Ok(Error::ZeroAmount.into())));
+}
+
+#[test]
+fn rescue_tokens_only_admin_can_call() {
+    let ctx = setup();
+    let other_token = ctx
+        .env
+        .register_stellar_asset_contract_v2(ctx.admin.clone())
+        .address();
+    let recipient = Address::generate(&ctx.env);
+
+    // With mock_all_auths, verify that the admin auth is recorded by the
+    // rescue_tokens call. If require_admin weren't present, the call would
+    // succeed but would NOT record an auth for the admin address.
+    let c = ctx.client();
+    let token_admin = token::StellarAssetClient::new(&ctx.env, &other_token);
+    token_admin.mint(&ctx.contract_id, &1_000);
+    c.rescue_tokens(&other_token, &recipient, &1_000);
+
+    let auths = ctx.env.auths();
+    let admin_authed = auths.iter().any(|(addr, _)| *addr == ctx.admin);
+    assert!(
+        admin_authed,
+        "rescue_tokens must require admin auth; got: {:?}",
+        auths
+    );
+}
+
+// ─── #36 Pause gates solver bond management ──────────────────────────────────────
+
+#[test]
+fn pause_blocks_register_solver() {
+    let ctx = setup();
+    let c = ctx.client();
+    c.pause();
+
+    ctx.bond_admin().mint(&ctx.solver, &BOND);
+    let res = c.try_register_solver(&ctx.solver, &BOND);
+    assert_eq!(res, Err(Ok(Error::ContractPaused.into())));
+}
+
+#[test]
+fn pause_blocks_deregister_solver() {
+    let ctx = setup();
+    let c = ctx.client();
+    ctx.register_solver();
+
+    c.pause();
+    let res = c.try_deregister_solver(&ctx.solver);
+    assert_eq!(res, Err(Ok(Error::ContractPaused.into())));
+}
+
+#[test]
+fn pause_blocks_withdraw_bond() {
+    let ctx = setup();
+    let c = ctx.client();
+    ctx.register_solver();
+
+    c.pause();
+    let res = c.try_withdraw_bond(&ctx.solver, &(100 * 10_000_000));
+    assert_eq!(res, Err(Ok(Error::ContractPaused.into())));
+}
+
+#[test]
+fn unpause_restores_solver_bond_management() {
+    let ctx = setup();
+    let c = ctx.client();
+    ctx.register_solver();
+
+    c.pause();
+    c.unpause();
+
+    // All three operations should succeed after unpause.
+    let withdraw_amount = 100 * 10_000_000;
+    c.withdraw_bond(&ctx.solver, &withdraw_amount);
+    assert_eq!(
+        c.get_solver(&ctx.solver).unwrap().bond_amount,
+        BOND - withdraw_amount
+    );
+
+    c.deregister_solver(&ctx.solver);
+    assert!(c.get_solver(&ctx.solver).is_none());
+}
+
+#[test]
+fn pause_does_not_block_cancel_intent() {
+    // cancel_intent stays open during a pause so users can always reclaim
+    // their Open intents -- they shouldn't be locked in by an admin pause.
+    let ctx = setup();
+    let c = ctx.client();
+    let id = ctx.submit();
+
+    c.pause();
+    c.cancel_intent(&ctx.user, &id);
+    assert!(c.get_intent(&id).unwrap().state == IntentState::Cancelled);
+}
+
+// ─── #37 DstAllowlistEnabled default is false ────────────────────────────────────
+
+#[test]
+fn dst_allowlist_enabled_defaults_to_false() {
+    // This test acts as a CI sentinel: if the default is ever changed from
+    // false, this test will catch it before it reaches mainnet.
+    //
+    // Pre-launch action: once the allowed dst_token list is populated,
+    // call set_dst_allowlist_enabled(true) before the contract goes live so
+    // submit_intent validates every destination token.
+    let ctx = setup();
+    assert!(
+        !ctx.client().is_dst_allowlist_enabled(),
+        "DstAllowlistEnabled must default to false; \
+         enable it explicitly via set_dst_allowlist_enabled before mainnet launch"
+    );
+}
