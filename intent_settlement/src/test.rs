@@ -642,6 +642,82 @@ fn submit_intent_past_deadline_fails() {
     assert_eq!(res, Err(Ok(Error::InvalidDeadline.into())));
 }
 
+// #25 — same-ledger intents with identical params produce distinct ids (nonce).
+//
+// Before the fix, compute_intent_id hashed only (user, src_chain, src_amount,
+// timestamp). Two submit_intent calls in the same ledger with the same args
+// produced the same id and the second silently overwrote the first record.
+// After the fix a per-user nonce is included in the preimage, so every call
+// yields a unique id regardless of timestamp.
+#[test]
+fn same_ledger_identical_intents_produce_distinct_ids() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    // Both submits happen at the same ledger timestamp.
+    let id1 = ctx.submit();
+    let id2 = ctx.submit();
+
+    // The ids must be different — neither intent overwrote the other.
+    assert_ne!(id1, id2);
+
+    // Both records must be independently retrievable.
+    assert!(c.get_intent(&id1).is_some());
+    assert!(c.get_intent(&id2).is_some());
+
+    // Total intents counter must reflect both submissions.
+    assert_eq!(c.get_stats().0, 2);
+}
+
+#[test]
+fn nonce_increments_per_user_across_submissions() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    // Submit three intents from the same user in the same ledger close.
+    let id1 = ctx.submit();
+    let id2 = ctx.submit();
+    let id3 = ctx.submit();
+
+    // All three must be distinct.
+    assert_ne!(id1, id2);
+    assert_ne!(id2, id3);
+    assert_ne!(id1, id3);
+
+    // All three records exist.
+    assert!(c.get_intent(&id1).is_some());
+    assert!(c.get_intent(&id2).is_some());
+    assert!(c.get_intent(&id3).is_some());
+
+    assert_eq!(c.get_stats().0, 3);
+}
+
+#[test]
+fn different_users_same_params_same_ledger_produce_distinct_ids() {
+    // Nonces are per-user so two different users both on nonce 0 at the same
+    // timestamp must still get different ids (the user address is in the preimage).
+    let ctx = setup();
+    let c = ctx.client();
+
+    let user2 = Address::generate(&ctx.env);
+    let deadline: Option<u64> = None;
+
+    let id1 = ctx.submit(); // ctx.user, nonce=0
+    let id2 = c.submit_intent(
+        &user2,
+        &String::from_str(&ctx.env, "ethereum"),
+        &String::from_str(&ctx.env, "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+        &SRC_AMT,
+        &ctx.dst_token,
+        &MIN_DST,
+        &deadline,
+    ); // user2, nonce=0
+
+    assert_ne!(id1, id2);
+    assert!(c.get_intent(&id1).is_some());
+    assert!(c.get_intent(&id2).is_some());
+}
+
 // ─── Happy path: submit → accept → fill ─────────────────────────────────────────
 
 #[test]

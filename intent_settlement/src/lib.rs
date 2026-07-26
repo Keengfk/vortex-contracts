@@ -50,6 +50,7 @@ pub enum DataKey {
     Paused,
     AllowedDstToken(Address), // dst_token -> present if allowed
     DstAllowlistEnabled,
+    UserNonce(Address),       // per-user submit counter to widen intent_id preimage
 }
 
 // ─── Data Structs ─────────────────────────────────────────────────────────────
@@ -133,6 +134,7 @@ pub enum Error {
     DeadlineNotReached = 19,
     InsufficientBond = 20,
     DstTokenNotAllowed = 21,
+    IntentAlreadyExists = 22,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -477,8 +479,30 @@ impl IntentSettlement {
             panic_with_error!(&env, Error::InvalidDeadline);
         }
 
-        // Deterministic intent_id = hash(user, src_chain, src_token, src_amount, now)
-        let intent_id = Self::compute_intent_id(&env, &user, &src_chain, src_amount, now);
+        // Widen the preimage with a per-user nonce so that two intents from
+        // the same user with identical (src_chain, src_amount) in the same
+        // ledger close produce distinct ids rather than colliding silently.
+        let nonce: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::UserNonce(user.clone()))
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::UserNonce(user.clone()), &(nonce + 1));
+
+        // Deterministic intent_id = hash(user, src_chain, src_token, src_amount, now, nonce)
+        let intent_id = Self::compute_intent_id(&env, &user, &src_chain, src_amount, now, nonce);
+
+        // Guard against an extremely unlikely hash collision: if a record with
+        // this id somehow already exists, reject rather than silently overwrite.
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::Intent(intent_id.clone()))
+        {
+            panic_with_error!(&env, Error::IntentAlreadyExists);
+        }
 
         let intent = IntentRecord {
             intent_id: intent_id.clone(),
@@ -910,15 +934,18 @@ impl IntentSettlement {
         src_chain: &String,
         amount: i128,
         timestamp: u64,
+        nonce: u64,
     ) -> BytesN<32> {
         // Build a collision-resistant preimage from the full intent context, then
-        // hash to a 32-byte id. Including the user and source chain ensures two
-        // otherwise-identical intents from different users or chains never collide.
+        // hash to a 32-byte id. Including the user, source chain, and a
+        // per-user nonce ensures two otherwise-identical intents from the same
+        // user in the same ledger always produce distinct ids.
         let mut preimage = Bytes::new(env);
         preimage.append(&user.clone().to_xdr(env));
         preimage.append(&src_chain.clone().to_xdr(env));
         preimage.extend_from_array(&amount.to_be_bytes());
         preimage.extend_from_array(&timestamp.to_be_bytes());
+        preimage.extend_from_array(&nonce.to_be_bytes());
         env.crypto().sha256(&preimage).into()
     }
 }
