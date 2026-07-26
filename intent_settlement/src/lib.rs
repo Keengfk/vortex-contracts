@@ -14,6 +14,9 @@ use soroban_sdk::{
 #[cfg(test)]
 mod test;
 
+#[cfg(test)]
+mod proptest_bond;
+
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const INTENT_EXPIRY: u64 = 1800; // 30 minutes
@@ -730,7 +733,19 @@ impl IntentSettlement {
         intent.solver = None;
         intent.deadline = now + INTENT_EXPIRY;
 
-        // Send slash to fee recipient
+        // Persist both records BEFORE any token transfer so that a re-entrant
+        // or back-to-back call on the same intent_id is rejected by the
+        // IntentNotAccepted guard above (the state is already Open by then).
+        env.storage()
+            .persistent()
+            .set(&DataKey::Solver(solver_addr.clone()), &solver_record);
+        Self::bump_solver_ttl(&env, &solver_addr);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Intent(intent_id.clone()), &intent);
+        Self::bump_intent_ttl(&env, &intent_id);
+
+        // Send slash to fee recipient (state already committed above)
         if slash_amount > 0 {
             let bond_token: Address = env.storage().instance().get(&DataKey::BondToken).unwrap();
             let fee_recipient: Address = env
@@ -745,15 +760,6 @@ impl IntentSettlement {
                 &slash_amount,
             );
         }
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::Solver(solver_addr.clone()), &solver_record);
-        Self::bump_solver_ttl(&env, &solver_addr);
-        env.storage()
-            .persistent()
-            .set(&DataKey::Intent(intent_id.clone()), &intent);
-        Self::bump_intent_ttl(&env, &intent_id);
 
         env.events().publish(
             (Symbol::new(&env, "solver_slashed"), solver_addr),
@@ -805,6 +811,19 @@ impl IntentSettlement {
         env.storage().persistent().get(&DataKey::Solver(solver))
     }
 
+    /// Returns the reputation score (0–10_000 basis points) for `solver`,
+    /// or None if the solver has never registered.
+    ///
+    /// Callers that only need the numeric value and already hold the
+    /// SolverRecord can call `compute_reputation_score` directly.
+    pub fn get_reputation_score(env: Env, solver: Address) -> Option<u32> {
+        let record: SolverRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Solver(solver))?;
+        Some(Self::compute_reputation_score(&record))
+    }
+
     /// Whether `solver` currently meets accept_intent's requirements
     /// (registered, active, bonded above MIN_BOND). Lets off-chain solver
     /// bots self-check eligibility without independently reimplementing
@@ -848,6 +867,54 @@ impl IntentSettlement {
     }
 
     // ── Internal ──────────────────────────────────────────────────────────────
+
+    /// Compute a reputation score (0–10 000 bps) for a solver.
+    ///
+    /// Formula:
+    ///   base  = fills_completed / (fills_completed + fills_failed)  [0–1]
+    ///   decay = 1 / (1 + total_volume / VOLUME_SCALE)               [0–1]
+    ///   score = base * (1 - 0.1 * decay) * 10_000
+    ///
+    /// Rationale:
+    /// - `base` is the raw success rate.
+    /// - `decay` gives a small bonus (up to 10%) to high-volume solvers who
+    ///   demonstrate consistent execution: at zero volume the score is 90% of
+    ///   the success rate; at very high volume it approaches 100%.
+    /// - All arithmetic is integer-only and cannot panic — division by zero is
+    ///   guarded, and intermediate values stay within i128/u64 range.
+    ///
+    /// Edge cases:
+    ///   zero fills  → 0
+    ///   all failures → 0
+    ///   perfect rate, no volume → 9 000  (90% × 10 000)
+    ///   perfect rate, high vol  → approaches 10 000
+    pub fn compute_reputation_score(record: &SolverRecord) -> u32 {
+        let total_fills = record.fills_completed as u64 + record.fills_failed as u64;
+        if total_fills == 0 {
+            return 0;
+        }
+
+        // base_bps ∈ [0, 10_000]
+        let base_bps = (record.fills_completed as u64 * 10_000) / total_fills;
+
+        // Volume scale: 1 000 fills × 100 dst tokens (7 dp) is the knee of
+        // the curve. Only the shape matters — the constant can be tuned later.
+        const VOLUME_SCALE: i128 = 1_000 * 100 * 10_000_000;
+
+        // decay_bps = VOLUME_SCALE / (VOLUME_SCALE + vol + 1) × 10_000
+        // ∈ (0, 10_000].  High volume → low decay_bps.
+        let vol = record.total_volume.max(0);
+        let decay_bps = ((VOLUME_SCALE as u64) * 10_000)
+            / ((VOLUME_SCALE + vol + 1) as u64);
+
+        // volume_multiplier_bps ∈ [9_000, 10_000)
+        // At zero volume: decay_bps = ~10_000, multiplier = 9_000
+        // At high  volume: decay_bps → 0,      multiplier → 10_000
+        let multiplier_bps = 10_000u64 - decay_bps / 10;
+
+        let score = base_bps * multiplier_bps / 10_000;
+        score as u32
+    }
 
     fn require_admin(env: &Env) {
         let admin: Address = env
