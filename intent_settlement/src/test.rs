@@ -6,8 +6,8 @@
 //! expiry, solver bonding/slashing, and the guard conditions on each step.
 
 use crate::{
-    Error, IntentSettlement, IntentSettlementClient, IntentState, FILL_WINDOW, INTENT_EXPIRY,
-    MIN_BOND,
+    DataKey, Error, IntentSettlement, IntentSettlementClient, IntentState, SolverRecord,
+    FILL_WINDOW, INTENT_EXPIRY, MIN_BOND,
 };
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
@@ -136,15 +136,29 @@ fn cannot_initialize_twice() {
 // ─── Admin ──────────────────────────────────────────────────────────────────────
 
 #[test]
-fn admin_can_set_fee_recipient() {
+fn admin_can_propose_and_accept_fee_recipient() {
     let ctx = setup();
     let new_recipient = Address::generate(&ctx.env);
 
-    ctx.client().set_fee_recipient(&new_recipient);
+    // Step 1: admin proposes
+    ctx.client().propose_fee_recipient(&new_recipient);
+    assert_eq!(
+        ctx.client().get_pending_fee_recipient(),
+        Some(new_recipient.clone())
+    );
+    // Active recipient unchanged until accepted
+    assert_eq!(
+        ctx.client().get_fee_recipient(),
+        Some(ctx.fee_recipient.clone())
+    );
+
+    // Step 2: new recipient accepts
+    ctx.client().accept_fee_recipient(&new_recipient);
     assert_eq!(
         ctx.client().get_fee_recipient(),
         Some(new_recipient.clone())
     );
+    assert_eq!(ctx.client().get_pending_fee_recipient(), None);
 
     // The new recipient actually receives fees going forward.
     let c = ctx.client();
@@ -157,6 +171,34 @@ fn admin_can_set_fee_recipient() {
     assert_eq!(ctx.dst().balance(&new_recipient), fee);
 }
 
+/// #30: A non-pending address cannot hijack the accept step.
+#[test]
+fn accept_fee_recipient_wrong_address_fails() {
+    let ctx = setup();
+    let new_recipient = Address::generate(&ctx.env);
+    let imposter = Address::generate(&ctx.env);
+
+    ctx.client().propose_fee_recipient(&new_recipient);
+
+    let res = ctx.client().try_accept_fee_recipient(&imposter);
+    assert_eq!(res, Err(Ok(Error::Unauthorized.into())));
+
+    // Original fee recipient unchanged.
+    assert_eq!(
+        ctx.client().get_fee_recipient(),
+        Some(ctx.fee_recipient.clone())
+    );
+}
+
+/// #30: Calling accept before propose fails cleanly.
+#[test]
+fn accept_fee_recipient_without_proposal_fails() {
+    let ctx = setup();
+    let addr = Address::generate(&ctx.env);
+    let res = ctx.client().try_accept_fee_recipient(&addr);
+    assert_eq!(res, Err(Ok(Error::NoPendingFeeRecipient.into())));
+}
+
 #[test]
 fn admin_can_transfer_admin() {
     let ctx = setup();
@@ -166,9 +208,15 @@ fn admin_can_transfer_admin() {
     ctx.client().transfer_admin(&new_admin);
     assert_eq!(ctx.client().get_admin(), Some(new_admin.clone()));
 
-    // The new admin can now exercise admin-only functions.
+    // The new admin can now exercise admin-only functions — use the two-step
+    // propose/accept flow that replaced set_fee_recipient (issue #30).
     let another_recipient = Address::generate(&ctx.env);
-    ctx.client().set_fee_recipient(&another_recipient);
+    ctx.client().propose_fee_recipient(&another_recipient);
+    assert_eq!(
+        ctx.client().get_pending_fee_recipient(),
+        Some(another_recipient.clone())
+    );
+    ctx.client().accept_fee_recipient(&another_recipient);
     assert_eq!(ctx.client().get_fee_recipient(), Some(another_recipient));
 }
 
@@ -993,4 +1041,144 @@ fn get_intent_returns_none_for_unknown_id() {
 fn get_bond_token_returns_configured_token() {
     let ctx = setup();
     assert_eq!(ctx.client().get_bond_token(), Some(ctx.bond_token.clone()));
+}
+
+// ─── Issue #31: fee overflow boundary ────────────────────────────────────────────
+
+/// #31: fill_amount just above i128::MAX / PROTOCOL_FEE_BPS (5) overflows the
+/// checked_mul and returns FeeOverflow rather than silently wrapping.
+///
+/// Boundary: i128::MAX / 5 = 34_028_236_692_093_846_346_337_460_743_176_821_145.
+/// Any value above that will cause `fill_amount * 5` to overflow i128.
+#[test]
+fn fill_intent_fee_overflow_returns_error() {
+    let ctx = setup();
+    let c = ctx.client();
+    ctx.register_solver();
+    let id = ctx.submit();
+    c.accept_intent(&ctx.solver, &id);
+
+    // Smallest fill_amount that overflows: (i128::MAX / 5) + 1.
+    // We satisfy min_dst_amount by keeping fill_amount >> MIN_DST.
+    let overflow_fill: i128 = i128::MAX / 5 + 1;
+
+    // Fund the solver so the dst transfer can proceed; the overflow is caught
+    // in the fee calculation that follows the transfer (the full transaction
+    // rolls back on panic_with_error, so the user's balance stays zero).
+    ctx.dst_admin().mint(&ctx.solver, &overflow_fill);
+
+    let res = c.try_fill_intent(&ctx.solver, &id, &overflow_fill);
+    assert_eq!(res, Err(Ok(Error::FeeOverflow.into())));
+}
+
+/// Sanity: a fill_amount just *at* the boundary (i128::MAX / 5) does not overflow.
+#[test]
+fn fill_intent_fee_at_boundary_does_not_overflow() {
+    let ctx = setup();
+    let c = ctx.client();
+    ctx.register_solver();
+    let id = ctx.submit();
+    c.accept_intent(&ctx.solver, &id);
+
+    // i128::MAX / 5 — fee = (i128::MAX / 5) * 5 / 10_000, which fits in i128.
+    let boundary_fill: i128 = i128::MAX / 5;
+    let fee = boundary_fill * 5 / 10_000;
+    ctx.dst_admin().mint(&ctx.solver, &(boundary_fill + fee));
+
+    // Should succeed (no overflow).
+    c.fill_intent(&ctx.solver, &id, &boundary_fill);
+    assert!(c.get_intent(&id).unwrap().state == IntentState::Filled);
+}
+
+// ─── Issue #32: tiny bond slash floor ────────────────────────────────────────────
+
+/// #32: When a solver's bond has been whittled to a very small value (< 10 in
+/// the token's smallest unit), integer division `bond / 10` rounds to 0.  The
+/// `.max(1)` floor ensures the slash is never economically free — a non-zero
+/// bond always produces a non-zero slash.
+///
+/// We plant a SolverRecord with bond_amount = 5 directly into storage (bypassing
+/// the MIN_BOND registration guard) to test the math boundary in isolation.
+#[test]
+fn slash_tiny_bond_always_yields_nonzero_slash() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    // Register normally first so the contract recognises ctx.solver.
+    ctx.register_solver();
+
+    // Plant a SolverRecord with an artificially tiny bond directly into
+    // contract storage, simulating a bond that has been slashed many times.
+    let tiny_bond: i128 = 5; // 5 / 10 = 0 without the .max(1) floor
+    ctx.env.as_contract(&ctx.contract_id, || {
+        let mut record: SolverRecord = ctx
+            .env
+            .storage()
+            .persistent()
+            .get(&DataKey::Solver(ctx.solver.clone()))
+            .unwrap();
+        record.bond_amount = tiny_bond;
+        record.active_intents = 0;
+        ctx.env
+            .storage()
+            .persistent()
+            .set(&DataKey::Solver(ctx.solver.clone()), &record);
+    });
+
+    // Submit and accept an intent so slash_solver has something to slash.
+    let id = ctx.submit();
+    c.accept_intent(&ctx.solver, &id);
+
+    ctx.pass_time(FILL_WINDOW + 1);
+    c.slash_solver(&id);
+
+    // The slash must be >= 1 even though 5 / 10 == 0.
+    let solver = c.get_solver(&ctx.solver).unwrap();
+    assert!(
+        solver.bond_amount < tiny_bond,
+        "bond should have decreased after slash"
+    );
+    let slashed = tiny_bond - solver.bond_amount;
+    assert!(slashed >= 1, "slash_amount must be at least 1, got {slashed}");
+}
+
+// ─── Issue #33: add_allowed_dst_token validates SEP-41 interface ─────────────────
+
+/// #33: Passing the settlement contract's own address (which is not a token)
+/// to add_allowed_dst_token must fail.  The `decimals()` probe inside
+/// add_allowed_dst_token will trap on a contract that doesn't implement SEP-41,
+/// reverting the transaction before any storage entry is written.
+#[test]
+fn add_allowed_dst_token_rejects_non_token_contract() {
+    let ctx = setup();
+
+    // ctx.contract_id is a real deployed contract (IntentSettlement) but it
+    // does not implement the SEP-41 token interface, so decimals() will trap.
+    let res = ctx
+        .client()
+        .try_add_allowed_dst_token(&ctx.contract_id);
+
+    // The call must fail — either with InvalidTokenInterface or a generic
+    // contract-trap error (the host converts a trapped cross-contract call
+    // into an Err result in the test environment).
+    assert!(
+        res.is_err(),
+        "allowlisting a non-token address should fail"
+    );
+
+    // No storage entry must have been written for the bogus address.
+    assert!(
+        !ctx.client().is_dst_token_allowed(&ctx.contract_id),
+        "non-token address must not be stored in the allowlist"
+    );
+}
+
+/// #33 (positive case): a real SEP-41 token passes the probe and is stored.
+#[test]
+fn add_allowed_dst_token_accepts_real_token() {
+    let ctx = setup();
+
+    // dst_token was registered as a StellarAssetContract — it implements SEP-41.
+    ctx.client().add_allowed_dst_token(&ctx.dst_token);
+    assert!(ctx.client().is_dst_token_allowed(&ctx.dst_token));
 }
