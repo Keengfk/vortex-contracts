@@ -1079,7 +1079,7 @@ fn src_chain_unlisted_accepted_after_disabling_enforcement() {
 
     // "base" was never added to the list, but enforcement is off.
     let deadline: Option<u64> = None;
-    c.try_submit_intent(
+    c.submit_intent(
         &ctx.user,
         &String::from_str(&ctx.env, "base"),
         &String::from_str(&ctx.env, "0xabc"),
@@ -1087,8 +1087,7 @@ fn src_chain_unlisted_accepted_after_disabling_enforcement() {
         &ctx.dst_token,
         &MIN_DST,
         &deadline,
-    )
-    .unwrap();
+    );
 }
 
 // ─── #35 rescue_tokens ──────────────────────────────────────────────────────────
@@ -1138,9 +1137,7 @@ fn rescue_tokens_zero_amount_fails() {
         .register_stellar_asset_contract_v2(ctx.admin.clone())
         .address();
     let recipient = Address::generate(&ctx.env);
-    let res = ctx
-        .client()
-        .try_rescue_tokens(&other_token, &recipient, &0);
+    let res = ctx.client().try_rescue_tokens(&other_token, &recipient, &0);
     assert_eq!(res, Err(Ok(Error::ZeroAmount.into())));
 }
 
