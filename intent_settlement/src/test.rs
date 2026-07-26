@@ -6,8 +6,8 @@
 //! expiry, solver bonding/slashing, and the guard conditions on each step.
 
 use crate::{
-    Error, IntentSettlement, IntentSettlementClient, IntentState, FILL_WINDOW, INTENT_EXPIRY,
-    MIN_BOND,
+    Error, IntentSettlement, IntentSettlementClient, IntentState, BID_WINDOW, FILL_WINDOW,
+    INTENT_EXPIRY, MIN_BOND,
 };
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
@@ -993,4 +993,135 @@ fn get_intent_returns_none_for_unknown_id() {
 fn get_bond_token_returns_configured_token() {
     let ctx = setup();
     assert_eq!(ctx.client().get_bond_token(), Some(ctx.bond_token.clone()));
+}
+
+// ─── Competitive bid-window mode ─────────────────────────────────────────────────
+
+#[test]
+fn bid_window_disabled_by_default_submit_opens_in_open_state() {
+    let ctx = setup();
+    let id = ctx.submit();
+    assert_eq!(
+        ctx.client().get_intent(&id).unwrap().state,
+        IntentState::Open
+    );
+}
+
+#[test]
+fn bid_window_enabled_submit_opens_in_bidding_state() {
+    let ctx = setup();
+    ctx.client().set_bid_window_enabled(&true);
+    let id = ctx.submit();
+    assert_eq!(
+        ctx.client().get_intent(&id).unwrap().state,
+        IntentState::Bidding
+    );
+}
+
+#[test]
+fn best_bidder_wins_after_window_closes() {
+    let ctx = setup();
+    let c = ctx.client();
+    c.set_bid_window_enabled(&true);
+
+    // Register a second solver who bids higher.
+    let solver2 = Address::generate(&ctx.env);
+    ctx.bond_admin().mint(&solver2, &BOND);
+    c.register_solver(&solver2, &BOND);
+
+    ctx.register_solver();
+
+    let id = ctx.submit();
+
+    // solver1 bids MIN_DST; solver2 bids higher.
+    c.bid_intent(&ctx.solver, &id, &MIN_DST);
+    c.bid_intent(&solver2, &id, &(MIN_DST + 1_000_000));
+
+    // Advance past the bid window.
+    ctx.pass_time(BID_WINDOW + 1);
+
+    // Anyone can settle.
+    c.settle_bids(&id);
+
+    let intent = c.get_intent(&id).unwrap();
+    assert_eq!(intent.state, IntentState::Accepted);
+    // solver2 was the highest bidder.
+    assert_eq!(intent.solver, Some(solver2.clone()));
+
+    // solver2 can now fill.
+    let fee = FILL * 5 / 10_000;
+    ctx.dst_admin().mint(&solver2, &(FILL + fee));
+    c.fill_intent(&solver2, &id, &FILL);
+    assert_eq!(c.get_intent(&id).unwrap().state, IntentState::Filled);
+}
+
+#[test]
+fn bid_intent_on_open_intent_fails() {
+    let ctx = setup();
+    ctx.register_solver();
+    // Bid-window mode off → intent is Open, not Bidding.
+    let id = ctx.submit();
+    let res = ctx.client().try_bid_intent(&ctx.solver, &id, &MIN_DST);
+    assert_eq!(res, Err(Ok(Error::BidWindowNotOpen.into())));
+}
+
+#[test]
+fn settle_bids_before_window_closes_fails() {
+    let ctx = setup();
+    let c = ctx.client();
+    c.set_bid_window_enabled(&true);
+    ctx.register_solver();
+    let id = ctx.submit();
+    c.bid_intent(&ctx.solver, &id, &MIN_DST);
+    // Window is still open.
+    let res = c.try_settle_bids(&id);
+    assert_eq!(res, Err(Ok(Error::BidWindowStillOpen.into())));
+}
+
+#[test]
+fn settle_bids_with_no_bids_fails() {
+    let ctx = setup();
+    let c = ctx.client();
+    c.set_bid_window_enabled(&true);
+    ctx.register_solver();
+    let id = ctx.submit();
+    ctx.pass_time(BID_WINDOW + 1);
+    let res = c.try_settle_bids(&id);
+    assert_eq!(res, Err(Ok(Error::NoBidsSubmitted.into())));
+}
+
+#[test]
+fn lower_bid_does_not_displace_higher_existing_bid() {
+    let ctx = setup();
+    let c = ctx.client();
+    c.set_bid_window_enabled(&true);
+
+    let solver2 = Address::generate(&ctx.env);
+    ctx.bond_admin().mint(&solver2, &BOND);
+    c.register_solver(&solver2, &BOND);
+    ctx.register_solver();
+
+    let id = ctx.submit();
+
+    // solver2 bids high first.
+    c.bid_intent(&solver2, &id, &(MIN_DST + 1_000_000));
+    // solver1 bids lower — should not displace solver2.
+    c.bid_intent(&ctx.solver, &id, &MIN_DST);
+
+    ctx.pass_time(BID_WINDOW + 1);
+    c.settle_bids(&id);
+
+    assert_eq!(c.get_intent(&id).unwrap().solver, Some(solver2));
+}
+
+#[test]
+fn first_accept_wins_still_works_when_bid_window_disabled() {
+    let ctx = setup();
+    let c = ctx.client();
+    // Bid-window mode is off (default).
+    ctx.register_solver();
+    let id = ctx.submit();
+    c.accept_intent(&ctx.solver, &id);
+    assert_eq!(c.get_intent(&id).unwrap().state, IntentState::Accepted);
+    assert_eq!(c.get_intent(&id).unwrap().solver, Some(ctx.solver.clone()));
 }

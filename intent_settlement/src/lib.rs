@@ -20,6 +20,11 @@ const INTENT_EXPIRY: u64 = 1800; // 30 minutes
 const FILL_WINDOW: u64 = 300; // 5 minutes to fill after intent accepted
 const MIN_BOND: i128 = 50 * 10_000_000; // 50 USDC minimum solver bond
 const PROTOCOL_FEE_BPS: i128 = 5; // 0.05%
+/// Duration of the competitive bid-collection window when bid-window mode is
+/// enabled.  Solvers have this many seconds after `submit_intent` to submit
+/// competing quotes via `bid_intent`; the best quote wins once the window
+/// closes.
+const BID_WINDOW: u64 = 120; // 2 minutes
 
 // Soroban archives ledger entries that go too long without being touched.
 // Persistent Intent/Solver records get their TTL bumped on every write so
@@ -50,6 +55,12 @@ pub enum DataKey {
     Paused,
     AllowedDstToken(Address), // dst_token -> present if allowed
     DstAllowlistEnabled,
+    /// When true, submit_intent opens a BID_WINDOW-second bidding period
+    /// instead of immediately accepting the first solver via accept_intent.
+    BidWindowEnabled,
+    /// Best bid recorded for an intent during its bidding window.
+    /// Stores the solver address and their quoted dst amount.
+    BestBid(BytesN<32>),
 }
 
 // ─── Data Structs ─────────────────────────────────────────────────────────────
@@ -80,10 +91,11 @@ pub struct IntentRecord {
 }
 
 #[contracttype]
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Debug)]
 pub enum IntentState {
-    Open,      // awaiting solver
-    Accepted,  // solver claimed it
+    Open,      // awaiting solver (first-accept-wins mode)
+    Bidding,   // competitive bid-window open; solvers submit quotes
+    Accepted,  // solver claimed it (either mode)
     Filled,    // user received output
     Cancelled, // user cancelled before fill
     Expired,   // deadline passed, no fill
@@ -104,6 +116,16 @@ pub struct SolverRecord {
     /// Number of intents currently Accepted by this solver (not yet filled or slashed).
     /// Bond stays locked behind these obligations, so it must be zero before deregistration.
     pub active_intents: u32,
+}
+
+/// Tracks the leading bid for an intent that is in the `Bidding` state.
+/// Only the current best bid is kept — a new submission replaces it only
+/// if it quotes a strictly higher `quoted_dst_amount`.
+#[contracttype]
+#[derive(Clone)]
+pub struct BestBidRecord {
+    pub solver: Address,
+    pub quoted_dst_amount: i128,
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -133,6 +155,9 @@ pub enum Error {
     DeadlineNotReached = 19,
     InsufficientBond = 20,
     DstTokenNotAllowed = 21,
+    BidWindowNotOpen = 22,
+    BidWindowStillOpen = 23,
+    NoBidsSubmitted = 24,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -248,6 +273,170 @@ impl IntentSettlement {
             .instance()
             .get(&DataKey::DstAllowlistEnabled)
             .unwrap_or(false)
+    }
+
+    // ── Competitive Bid-Window Mode ───────────────────────────────────────────
+
+    /// Admin-only: enable the competitive bid-window mode.
+    ///
+    /// When enabled, `submit_intent` opens a `BID_WINDOW`-second collection
+    /// period (state = `Bidding`) instead of immediately allowing the first
+    /// solver to call `accept_intent`.  Solvers call `bid_intent` to quote
+    /// how much dst_token they will deliver.  After the window closes,
+    /// `settle_bids` is called permissionlessly: the highest bidder is
+    /// assigned exclusive fill rights (state = `Accepted`) and the normal
+    /// `fill_intent` / `slash_solver` lifecycle continues unchanged.
+    ///
+    /// The existing `accept_intent` path is preserved and is used for all
+    /// intents that are in state `Open` (i.e. bid-window mode was off when
+    /// they were submitted).
+    pub fn set_bid_window_enabled(env: Env, enabled: bool) {
+        Self::require_admin(&env);
+        env.storage()
+            .instance()
+            .set(&DataKey::BidWindowEnabled, &enabled);
+        env.events()
+            .publish((Symbol::new(&env, "bid_window_enabled"),), enabled);
+    }
+
+    pub fn is_bid_window_enabled(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::BidWindowEnabled)
+            .unwrap_or(false)
+    }
+
+    /// Solver submits a competitive bid quoting `quoted_dst_amount` of
+    /// dst_token they will deliver.  Only valid while the intent is in the
+    /// `Bidding` state and within the bid window.  The leading bid is kept;
+    /// a new bid only replaces the current leader if it quotes strictly more.
+    pub fn bid_intent(env: Env, solver: Address, intent_id: BytesN<32>, quoted_dst_amount: i128) {
+        solver.require_auth();
+        Self::require_not_paused(&env);
+        Self::bump_instance_ttl(&env);
+
+        let solver_record: SolverRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Solver(solver.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::SolverNotRegistered));
+
+        if !solver_record.is_active {
+            panic_with_error!(&env, Error::SolverInactive);
+        }
+
+        if quoted_dst_amount <= 0 {
+            panic_with_error!(&env, Error::ZeroAmount);
+        }
+
+        let intent: IntentRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Intent(intent_id.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::IntentNotFound));
+
+        let now = env.ledger().timestamp();
+        if now >= intent.deadline {
+            panic_with_error!(&env, Error::IntentExpired);
+        }
+
+        if intent.state != IntentState::Bidding {
+            panic_with_error!(&env, Error::BidWindowNotOpen);
+        }
+
+        // Keep only the highest bid.
+        let existing: Option<BestBidRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BestBid(intent_id.clone()));
+
+        let is_better = existing
+            .as_ref()
+            .map(|b| quoted_dst_amount > b.quoted_dst_amount)
+            .unwrap_or(true);
+
+        if is_better {
+            env.storage().persistent().set(
+                &DataKey::BestBid(intent_id.clone()),
+                &BestBidRecord {
+                    solver: solver.clone(),
+                    quoted_dst_amount,
+                },
+            );
+            env.storage().persistent().extend_ttl(
+                &DataKey::BestBid(intent_id.clone()),
+                PERSISTENT_TTL_THRESHOLD,
+                PERSISTENT_TTL_EXTEND_TO,
+            );
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "bid_submitted"), solver),
+            (intent_id, quoted_dst_amount),
+        );
+    }
+
+    /// Permissionless: close the bid window and assign fill rights to the
+    /// highest bidder.  Callable by anyone once `now >= intent.deadline`
+    /// (i.e. the bid window has elapsed).
+    ///
+    /// The winning solver gets a fresh `FILL_WINDOW` to deliver; the intent
+    /// transitions to `Accepted` and the normal lifecycle continues.
+    pub fn settle_bids(env: Env, intent_id: BytesN<32>) {
+        Self::bump_instance_ttl(&env);
+
+        let mut intent: IntentRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Intent(intent_id.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::IntentNotFound));
+
+        if intent.state != IntentState::Bidding {
+            panic_with_error!(&env, Error::BidWindowNotOpen);
+        }
+
+        let now = env.ledger().timestamp();
+        if now < intent.deadline {
+            panic_with_error!(&env, Error::BidWindowStillOpen);
+        }
+
+        let best: BestBidRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BestBid(intent_id.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoBidsSubmitted));
+
+        // Assign the winner; update active_intents on their solver record.
+        let mut solver_record: SolverRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Solver(best.solver.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::SolverNotRegistered));
+
+        solver_record.active_intents += 1;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Solver(best.solver.clone()), &solver_record);
+        Self::bump_solver_ttl(&env, &best.solver);
+
+        intent.solver = Some(best.solver.clone());
+        intent.state = IntentState::Accepted;
+        intent.deadline = now + FILL_WINDOW;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Intent(intent_id.clone()), &intent);
+        Self::bump_intent_ttl(&env, &intent_id);
+
+        // Clean up the bid record.
+        env.storage()
+            .persistent()
+            .remove(&DataKey::BestBid(intent_id.clone()));
+
+        env.events().publish(
+            (Symbol::new(&env, "bids_settled"), best.solver.clone()),
+            (intent_id, best.quoted_dst_amount),
+        );
     }
 
     // ── Pause Control ─────────────────────────────────────────────────────────
@@ -478,9 +667,25 @@ impl IntentSettlement {
             dst_token,
             min_dst_amount,
             solver: None,
-            state: IntentState::Open,
+            // When bid-window mode is active, the intent opens in Bidding state
+            // so solvers can compete before one is assigned exclusive fill rights.
+            // The bid-window deadline is BID_WINDOW seconds from now, not the
+            // full intent expiry — settle_bids extends it to FILL_WINDOW once a
+            // winner is picked.  The original expiry is stored separately in
+            // deadline and reset after settlement.
+            state: if Self::is_bid_window_enabled(env.clone()) {
+                IntentState::Bidding
+            } else {
+                IntentState::Open
+            },
             created_at: now,
-            deadline: expiry,
+            // In bidding mode, deadline tracks the end of the bid window.
+            // In first-accept-wins mode, deadline tracks the intent expiry.
+            deadline: if Self::is_bid_window_enabled(env.clone()) {
+                now + BID_WINDOW
+            } else {
+                expiry
+            },
             filled_at: None,
             fill_amount: None,
         };
