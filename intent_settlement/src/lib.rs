@@ -16,10 +16,11 @@ mod test;
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const INTENT_EXPIRY: u64 = 1800; // 30 minutes
-const FILL_WINDOW: u64 = 300; // 5 minutes to fill after intent accepted
-const MIN_BOND: i128 = 50 * 10_000_000; // 50 USDC minimum solver bond
-const PROTOCOL_FEE_BPS: i128 = 5; // 0.05%
+pub const INTENT_EXPIRY: u64 = 1800; // 30 minutes
+pub const FILL_WINDOW: u64 = 300; // 5 minutes to fill after intent accepted
+pub const MIN_BOND: i128 = 50 * 10_000_000; // 50 USDC minimum solver bond
+pub const PROTOCOL_FEE_BPS: i128 = 5; // 0.05%
+pub const SLASH_COOLDOWN: u64 = 3600; // 1 hour cooldown after slash
 
 // Soroban archives ledger entries that go too long without being touched.
 // Persistent Intent/Solver records get their TTL bumped on every write so
@@ -50,6 +51,8 @@ pub enum DataKey {
     Paused,
     AllowedDstToken(Address), // dst_token -> present if allowed
     DstAllowlistEnabled,
+    MinBondMultiplier(Address), // dst_token -> multiplier (as i128, e.g., 15 for 1.5x)
+    UserIntents(Address), // user -> Vec<BytesN<32>> of intent IDs
 }
 
 // ─── Data Structs ─────────────────────────────────────────────────────────────
@@ -104,6 +107,8 @@ pub struct SolverRecord {
     /// Number of intents currently Accepted by this solver (not yet filled or slashed).
     /// Bond stays locked behind these obligations, so it must be zero before deregistration.
     pub active_intents: u32,
+    /// Timestamp of last slash; cooldown applies after a slash.
+    pub last_slash_time: u64,
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -250,6 +255,33 @@ impl IntentSettlement {
             .unwrap_or(false)
     }
 
+    // ── Per-Token Bond Multiplier ──────────────────────────────────────────────
+
+    /// Admin-only: set a custom bond multiplier for a dst_token.
+    /// Multiplier is stored as i128 where 10 = 1.0x, 15 = 1.5x, 20 = 2.0x.
+    /// Unset tokens default to 10 (1.0x).
+    pub fn set_min_bond_multiplier(env: Env, token: Address, multiplier: i128) {
+        Self::require_admin(&env);
+        if multiplier <= 0 {
+            panic_with_error!(&env, Error::ZeroAmount);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::MinBondMultiplier(token.clone()), &multiplier);
+        env.events().publish(
+            (Symbol::new(&env, "bond_multiplier_set"),),
+            (token, multiplier),
+        );
+    }
+
+    /// Get the bond multiplier for a dst_token, or 10 (1.0x) if unset.
+    pub fn get_min_bond_multiplier(env: Env, token: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MinBondMultiplier(token))
+            .unwrap_or(10)
+    }
+
     // ── Pause Control ─────────────────────────────────────────────────────────
 
     /// Admin-only: halt new intent submission, acceptance, and fills for
@@ -321,6 +353,7 @@ impl IntentSettlement {
                 is_active: true,
                 registered_at: env.ledger().timestamp(),
                 active_intents: 0,
+                last_slash_time: 0,
             },
         };
 
@@ -490,6 +523,16 @@ impl IntentSettlement {
             .set(&DataKey::Intent(intent_id.clone()), &intent);
         Self::bump_intent_ttl(&env, &intent_id);
 
+        let mut user_intents: Vec<BytesN<32>> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UserIntents(user.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        user_intents.push_back(intent_id.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::UserIntents(user.clone()), &user_intents);
+
         let total: u64 = env
             .storage()
             .instance()
@@ -523,13 +566,22 @@ impl IntentSettlement {
             panic_with_error!(&env, Error::SolverInactive);
         }
 
+        let now = env.ledger().timestamp();
+        if solver_record.last_slash_time > 0 && now < solver_record.last_slash_time + SLASH_COOLDOWN {
+            panic_with_error!(&env, Error::SolverInactive);
+        }
+
         let mut intent: IntentRecord = env
             .storage()
             .persistent()
             .get(&DataKey::Intent(intent_id.clone()))
             .unwrap_or_else(|| panic_with_error!(&env, Error::IntentNotFound));
 
-        let now = env.ledger().timestamp();
+        let adjusted_min_bond = Self::get_adjusted_min_bond(&env, &intent.dst_token);
+        if solver_record.bond_amount < adjusted_min_bond {
+            panic_with_error!(&env, Error::SolverBondTooLow);
+        }
+
         if now >= intent.deadline {
             intent.state = IntentState::Expired;
             env.storage()
@@ -717,6 +769,7 @@ impl IntentSettlement {
         let slash_amount = solver_record.bond_amount / 10;
         solver_record.bond_amount -= slash_amount;
         solver_record.fills_failed += 1;
+        solver_record.last_slash_time = now;
         solver_record.active_intents = solver_record.active_intents.saturating_sub(1);
 
         // A solver whose bond no longer covers MIN_BOND can't credibly back
@@ -852,6 +905,14 @@ impl IntentSettlement {
         MIN_BOND
     }
 
+    /// List all intent IDs for a given user. Returns empty Vec if user has no intents.
+    pub fn list_intents_by_user(env: Env, user: Address) -> Vec<BytesN<32>> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::UserIntents(user))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
     // ── Internal ──────────────────────────────────────────────────────────────
 
     fn require_admin(env: &Env) {
@@ -867,6 +928,15 @@ impl IntentSettlement {
         if Self::is_paused(env.clone()) {
             panic_with_error!(env, Error::ContractPaused);
         }
+    }
+
+    fn get_adjusted_min_bond(env: &Env, dst_token: &Address) -> i128 {
+        let multiplier = env
+            .storage()
+            .persistent()
+            .get::<_, i128>(&DataKey::MinBondMultiplier(dst_token.clone()))
+            .unwrap_or(10);
+        (MIN_BOND * multiplier) / 10
     }
 
     fn bump_instance_ttl(env: &Env) {

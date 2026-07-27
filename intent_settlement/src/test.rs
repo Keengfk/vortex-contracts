@@ -7,7 +7,7 @@
 
 use crate::{
     Error, IntentSettlement, IntentSettlementClient, IntentState, FILL_WINDOW, INTENT_EXPIRY,
-    MIN_BOND,
+    MIN_BOND, SLASH_COOLDOWN,
 };
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
@@ -999,4 +999,105 @@ fn get_bond_token_returns_configured_token() {
 fn get_min_bond_returns_enforced_minimum() {
     let ctx = setup();
     assert_eq!(ctx.client().get_min_bond(), MIN_BOND);
+}
+
+#[test]
+fn get_min_bond_multiplier_defaults_to_one() {
+    let ctx = setup();
+    assert_eq!(ctx.client().get_min_bond_multiplier(&ctx.dst_token), 10);
+}
+
+#[test]
+fn set_min_bond_multiplier_updates_requirement() {
+    let ctx = setup();
+    ctx.register_solver();
+    let id = ctx.submit();
+
+    // Set multiplier to 1.5x (15 in fixed-point)
+    ctx.client().set_min_bond_multiplier(&ctx.dst_token, &15);
+    assert_eq!(ctx.client().get_min_bond_multiplier(&ctx.dst_token), 15);
+
+    // Submit another intent targeting same token
+    let id2 = ctx.submit();
+
+    // Solver with 1000 USDC bond (10x MIN_BOND) can still accept
+    ctx.client().accept_intent(&ctx.solver, &id2);
+    assert_eq!(ctx.client().get_intent(&id2).unwrap().solver, Some(ctx.solver.clone()));
+}
+
+#[test]
+fn accept_intent_checks_token_specific_bond_requirement() {
+    let ctx = setup();
+    // Register solver with exactly MIN_BOND
+    let min_bond = MIN_BOND;
+    ctx.bond_admin().mint(&ctx.solver, &min_bond);
+    ctx.client().register_solver(&ctx.solver, &min_bond);
+
+    let id = ctx.submit();
+
+    // Set multiplier to 2.0x for this token
+    ctx.client().set_min_bond_multiplier(&ctx.dst_token, &20);
+
+    // Solver's bond is now insufficient (50 USDC < 100 USDC required)
+    let res = ctx.client().try_accept_intent(&ctx.solver, &id);
+    assert_eq!(res, Err(Ok(Error::SolverBondTooLow.into())));
+}
+
+#[test]
+fn list_intents_by_user_returns_empty_for_new_user() {
+    let ctx = setup();
+    let other_user = Address::generate(&ctx.env);
+    let intents = ctx.client().list_intents_by_user(&other_user);
+    assert_eq!(intents.len(), 0);
+}
+
+#[test]
+fn list_intents_by_user_returns_submitted_intents() {
+    let ctx = setup();
+    let id1 = ctx.submit();
+    let id2 = ctx.submit();
+
+    let intents = ctx.client().list_intents_by_user(&ctx.user);
+    assert_eq!(intents.len(), 2);
+    assert_eq!(intents.get(0), id1);
+    assert_eq!(intents.get(1), id2);
+}
+
+#[test]
+fn slash_cooldown_prevents_accept_after_slash() {
+    let ctx = setup();
+    ctx.register_solver();
+
+    let id1 = ctx.submit();
+    ctx.client().accept_intent(&ctx.solver, &id1);
+
+    // Slash the solver
+    ctx.pass_time(FILL_WINDOW + 1);
+    ctx.client().slash_solver(&id1);
+
+    // Try to accept another intent immediately
+    let id2 = ctx.submit();
+    let res = ctx.client().try_accept_intent(&ctx.solver, &id2);
+    assert_eq!(res, Err(Ok(Error::SolverInactive.into())));
+}
+
+#[test]
+fn slash_cooldown_expires_after_time_window() {
+    let ctx = setup();
+    ctx.register_solver();
+
+    let id1 = ctx.submit();
+    ctx.client().accept_intent(&ctx.solver, &id1);
+
+    // Slash the solver
+    ctx.pass_time(FILL_WINDOW + 1);
+    ctx.client().slash_solver(&id1);
+
+    // Wait for cooldown to expire (1 hour)
+    ctx.pass_time(3600);
+
+    // Should be able to accept now
+    let id2 = ctx.submit();
+    ctx.client().accept_intent(&ctx.solver, &id2);
+    assert_eq!(ctx.client().get_intent(&id2).unwrap().solver, Some(ctx.solver.clone()));
 }
