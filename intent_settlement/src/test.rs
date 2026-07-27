@@ -1037,6 +1037,119 @@ fn state_changing_calls_extend_instance_ttl() {
     assert!(instance_ttl >= crate::INSTANCE_TTL_EXTEND_TO - 1);
 }
 
+#[test]
+fn persistent_intent_ttl_extended_near_threshold() {
+    use soroban_sdk::testutils::storage::Persistent as _;
+
+    let ctx = setup();
+    let id = ctx.submit();
+
+    // Get the initial TTL after submission
+    let initial_ttl = ctx.env.as_contract(&ctx.contract_id, || {
+        ctx.env
+            .storage()
+            .persistent()
+            .get_ttl(&crate::DataKey::Intent(id.clone()))
+    });
+
+    // Simulate advancing ledger close to the threshold
+    let mut new_ttl = initial_ttl;
+    while new_ttl > crate::PERSISTENT_TTL_THRESHOLD + 100 {
+        ctx.pass_time(1000); // Each pass reduces TTL
+        new_ttl = ctx.env.as_contract(&ctx.contract_id, || {
+            ctx.env
+                .storage()
+                .persistent()
+                .get_ttl(&crate::DataKey::Intent(id.clone()))
+        });
+    }
+
+    // Now call a function that touches the intent (accept_intent)
+    ctx.register_solver();
+    ctx.client().accept_intent(&ctx.solver, &id);
+
+    // TTL should be extended to near PERSISTENT_TTL_EXTEND_TO
+    let extended_ttl = ctx.env.as_contract(&ctx.contract_id, || {
+        ctx.env
+            .storage()
+            .persistent()
+            .get_ttl(&crate::DataKey::Intent(id))
+    });
+
+    assert!(extended_ttl >= crate::PERSISTENT_TTL_EXTEND_TO - 1);
+}
+
+#[test]
+fn persistent_solver_ttl_extended_near_threshold() {
+    use soroban_sdk::testutils::storage::Persistent as _;
+
+    let ctx = setup();
+    ctx.register_solver();
+
+    let initial_ttl = ctx.env.as_contract(&ctx.contract_id, || {
+        ctx.env
+            .storage()
+            .persistent()
+            .get_ttl(&crate::DataKey::Solver(ctx.solver.clone()))
+    });
+
+    // Simulate advancing ledger close to the threshold
+    let mut new_ttl = initial_ttl;
+    while new_ttl > crate::PERSISTENT_TTL_THRESHOLD + 100 {
+        ctx.pass_time(1000);
+        new_ttl = ctx.env.as_contract(&ctx.contract_id, || {
+            ctx.env
+                .storage()
+                .persistent()
+                .get_ttl(&crate::DataKey::Solver(ctx.solver.clone()))
+        });
+    }
+
+    // Call a function that touches the solver record (accept_intent)
+    let id = ctx.submit();
+    ctx.client().accept_intent(&ctx.solver, &id);
+
+    // TTL should be extended to near PERSISTENT_TTL_EXTEND_TO
+    let extended_ttl = ctx.env.as_contract(&ctx.contract_id, || {
+        ctx.env
+            .storage()
+            .persistent()
+            .get_ttl(&crate::DataKey::Solver(ctx.solver.clone()))
+    });
+
+    assert!(extended_ttl >= crate::PERSISTENT_TTL_EXTEND_TO - 1);
+}
+
+#[test]
+fn instance_ttl_extended_near_threshold() {
+    use soroban_sdk::testutils::storage::Instance as _;
+
+    let ctx = setup();
+
+    let initial_ttl = ctx.env.as_contract(&ctx.contract_id, || {
+        ctx.env.storage().instance().get_ttl()
+    });
+
+    // Simulate advancing ledger close to the threshold
+    let mut new_ttl = initial_ttl;
+    while new_ttl > crate::INSTANCE_TTL_THRESHOLD + 100 {
+        ctx.pass_time(1000);
+        new_ttl = ctx.env.as_contract(&ctx.contract_id, || {
+            ctx.env.storage().instance().get_ttl()
+        });
+    }
+
+    // Call a state-changing function (register_solver touches instance)
+    ctx.register_solver();
+
+    // TTL should be extended to near INSTANCE_TTL_EXTEND_TO
+    let extended_ttl = ctx.env.as_contract(&ctx.contract_id, || {
+        ctx.env.storage().instance().get_ttl()
+    });
+
+    assert!(extended_ttl >= crate::INSTANCE_TTL_EXTEND_TO - 1);
+}
+
 // ─── Views ──────────────────────────────────────────────────────────────────────
 
 #[test]
