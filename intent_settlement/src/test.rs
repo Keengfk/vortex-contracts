@@ -6,8 +6,8 @@
 //! expiry, solver bonding/slashing, and the guard conditions on each step.
 
 use crate::{
-    Error, IntentSettlement, IntentSettlementClient, IntentState, FILL_WINDOW, INTENT_EXPIRY,
-    MIN_BOND,
+    Error, IntentSettlement, IntentSettlementClient, IntentState, CANCEL_COOLDOWN, FILL_WINDOW,
+    INTENT_EXPIRY, MIN_BOND,
 };
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
@@ -793,6 +793,72 @@ fn cannot_cancel_someone_elses_intent() {
     let stranger = Address::generate(&ctx.env);
     let res = ctx.client().try_cancel_intent(&stranger, &id);
     assert_eq!(res, Err(Ok(Error::Unauthorized.into())));
+}
+
+#[test]
+fn cancel_cooldown_prevents_rapid_cancellations() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    // Submit two intents at different times to avoid collision
+    let id1 = ctx.submit();
+    ctx.pass_time(1);
+    let id2 = ctx.submit();
+
+    // First cancellation succeeds
+    c.cancel_intent(&ctx.user, &id1);
+    assert!(c.get_intent(&id1).unwrap().state == IntentState::Cancelled);
+
+    // Second cancellation within cooldown fails
+    let res = c.try_cancel_intent(&ctx.user, &id2);
+    assert_eq!(res, Err(Ok(Error::CancelCooldownNotExpired.into())));
+}
+
+#[test]
+fn cancel_cooldown_expires_after_delay() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    let id1 = ctx.submit();
+    ctx.pass_time(1);
+    let id2 = ctx.submit();
+
+    // First cancellation
+    c.cancel_intent(&ctx.user, &id1);
+
+    // Wait for cooldown to expire
+    ctx.pass_time(CANCEL_COOLDOWN);
+
+    // Second cancellation now succeeds
+    c.cancel_intent(&ctx.user, &id2);
+    assert!(c.get_intent(&id2).unwrap().state == IntentState::Cancelled);
+}
+
+#[test]
+fn different_users_have_independent_cooldowns() {
+    let ctx = setup();
+    let c = ctx.client();
+    let user2 = Address::generate(&ctx.env);
+
+    let id1 = ctx.submit();
+    ctx.pass_time(1);
+
+    let id2_user: BytesN<32> = c.submit_intent(
+        &user2,
+        &String::from_str(&ctx.env, "ethereum"),
+        &String::from_str(&ctx.env, "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+        &SRC_AMT,
+        &ctx.dst_token,
+        &MIN_DST,
+        &None,
+    );
+
+    // User 1 cancels
+    c.cancel_intent(&ctx.user, &id1);
+
+    // User 2 can immediately cancel despite user 1's recent cancellation
+    c.cancel_intent(&user2, &id2_user);
+    assert!(c.get_intent(&id2_user).unwrap().state == IntentState::Cancelled);
 }
 
 // ─── Slashing ───────────────────────────────────────────────────────────────────

@@ -20,6 +20,7 @@ const INTENT_EXPIRY: u64 = 1800; // 30 minutes
 const FILL_WINDOW: u64 = 300; // 5 minutes to fill after intent accepted
 const MIN_BOND: i128 = 50 * 10_000_000; // 50 USDC minimum solver bond
 const PROTOCOL_FEE_BPS: i128 = 5; // 0.05%
+const CANCEL_COOLDOWN: u64 = 10; // 10 seconds between cancellations per user
 
 // Soroban archives ledger entries that go too long without being touched.
 // Persistent Intent/Solver records get their TTL bumped on every write so
@@ -50,6 +51,7 @@ pub enum DataKey {
     Paused,
     AllowedDstToken(Address), // dst_token -> present if allowed
     DstAllowlistEnabled,
+    CancelCooldown(Address), // user -> timestamp of last cancellation
 }
 
 // ─── Data Structs ─────────────────────────────────────────────────────────────
@@ -133,6 +135,7 @@ pub enum Error {
     DeadlineNotReached = 19,
     InsufficientBond = 20,
     DstTokenNotAllowed = 21,
+    CancelCooldownNotExpired = 22,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -658,6 +661,19 @@ impl IntentSettlement {
         user.require_auth();
         Self::bump_instance_ttl(&env);
 
+        let now = env.ledger().timestamp();
+
+        // Check cancellation cooldown for spam-deterrence
+        if let Some(last_cancel_time) = env
+            .storage()
+            .persistent()
+            .get::<_, u64>(&DataKey::CancelCooldown(user.clone()))
+        {
+            if now < last_cancel_time + CANCEL_COOLDOWN {
+                panic_with_error!(&env, Error::CancelCooldownNotExpired);
+            }
+        }
+
         let mut intent: IntentRecord = env
             .storage()
             .persistent()
@@ -681,6 +697,11 @@ impl IntentSettlement {
             .persistent()
             .set(&DataKey::Intent(intent_id.clone()), &intent);
         Self::bump_intent_ttl(&env, &intent_id);
+
+        // Update cancellation cooldown
+        env.storage()
+            .persistent()
+            .set(&DataKey::CancelCooldown(user.clone()), &now);
 
         env.events()
             .publish((Symbol::new(&env, "intent_cancelled"), user), intent_id);
