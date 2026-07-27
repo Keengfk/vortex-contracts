@@ -7,7 +7,7 @@
 
 use crate::{
     Error, IntentSettlement, IntentSettlementClient, IntentState, FILL_WINDOW, INTENT_EXPIRY,
-    MIN_BOND, MAX_BATCH_SIZE,
+    MIN_BOND, MAX_BATCH_SIZE, MAX_EXTENSION_DURATION,
 };
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
@@ -1142,4 +1142,113 @@ fn batch_accept_intent_partial_failure_reverts_all() {
 
     // Verify first intent was NOT accepted (batch reverted)
     assert_eq!(c.get_intent(&id1).unwrap().state, IntentState::Open);
+}
+
+// ─── Fill Window Extension ──────────────────────────────────────────────────
+
+#[test]
+fn request_extension_extends_deadline_once() {
+    let ctx = setup();
+    let c = ctx.client();
+    ctx.register_solver();
+
+    let id = ctx.submit();
+    c.accept_intent(&ctx.solver, &id);
+
+    let intent_before = c.get_intent(&id).unwrap();
+    let original_deadline = intent_before.deadline;
+
+    ctx.pass_time(100); // Move time forward
+    c.request_extension(&ctx.solver, &id);
+
+    let intent_after = c.get_intent(&id).unwrap();
+    let new_deadline = intent_after.deadline;
+
+    // Deadline should be extended by MAX_EXTENSION_DURATION from the time of extension
+    assert_eq!(new_deadline, original_deadline + 100 + MAX_EXTENSION_DURATION);
+    assert!(new_deadline > original_deadline);
+}
+
+#[test]
+fn request_extension_rejected_on_second_request() {
+    let ctx = setup();
+    let c = ctx.client();
+    ctx.register_solver();
+
+    let id = ctx.submit();
+    c.accept_intent(&ctx.solver, &id);
+
+    // First extension succeeds
+    c.request_extension(&ctx.solver, &id);
+
+    // Second extension attempt fails (one per intent limit)
+    let res = c.try_request_extension(&ctx.solver, &id);
+    assert!(res.is_err());
+}
+
+#[test]
+fn request_extension_on_non_accepted_intent_fails() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    let id = ctx.submit();
+    // Don't accept; leave it in Open state
+
+    let res = c.try_request_extension(&ctx.solver, &id);
+    assert_eq!(res, Err(Ok(Error::IntentNotAccepted.into())));
+}
+
+#[test]
+fn request_extension_by_non_assigned_solver_fails() {
+    let ctx = setup();
+    let c = ctx.client();
+    ctx.register_solver();
+
+    let other_solver = Address::generate(&ctx.env);
+    ctx.bond_admin().mint(&other_solver, &BOND);
+    c.register_solver(&other_solver, &BOND);
+
+    let id = ctx.submit();
+    c.accept_intent(&ctx.solver, &id);
+
+    // Different solver tries to extend
+    let res = c.try_request_extension(&other_solver, &id);
+    assert_eq!(res, Err(Ok(Error::Unauthorized.into())));
+}
+
+#[test]
+fn request_extension_on_unknown_intent_fails() {
+    let ctx = setup();
+    let c = ctx.client();
+    ctx.register_solver();
+
+    let unknown_id = BytesN::from_array(&ctx.env, &[0u8; 32]);
+    let res = c.try_request_extension(&ctx.solver, &unknown_id);
+    assert_eq!(res, Err(Ok(Error::IntentNotFound.into())));
+}
+
+#[test]
+fn request_extension_allows_late_fill() {
+    let ctx = setup();
+    let c = ctx.client();
+    ctx.register_solver();
+
+    let id = ctx.submit();
+    c.accept_intent(&ctx.solver, &id);
+
+    // Move time just before original fill window expires
+    ctx.pass_time(FILL_WINDOW - 10);
+
+    // Request extension to get more time
+    c.request_extension(&ctx.solver, &id);
+
+    // Move time to just beyond original deadline but within extension
+    ctx.pass_time(20);
+
+    // Fill should succeed because extension grants additional time
+    let fee = FILL * 5 / 10_000;
+    ctx.dst_admin().mint(&ctx.solver, &(FILL + fee));
+    c.fill_intent(&ctx.solver, &id, &FILL);
+
+    assert_eq!(c.get_intent(&id).unwrap().state, IntentState::Filled);
 }

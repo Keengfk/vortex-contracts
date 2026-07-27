@@ -21,6 +21,7 @@ const FILL_WINDOW: u64 = 300; // 5 minutes to fill after intent accepted
 const MIN_BOND: i128 = 50 * 10_000_000; // 50 USDC minimum solver bond
 const PROTOCOL_FEE_BPS: i128 = 5; // 0.05%
 const MAX_BATCH_SIZE: u32 = 100; // Maximum items per batch operation
+const MAX_EXTENSION_DURATION: u64 = 300; // 5 minutes max extension time
 
 // Soroban archives ledger entries that go too long without being touched.
 // Persistent Intent/Solver records get their TTL bumped on every write so
@@ -51,6 +52,7 @@ pub enum DataKey {
     Paused,
     AllowedDstToken(Address), // dst_token -> present if allowed
     DstAllowlistEnabled,
+    ExtensionGranted(BytesN<32>), // intent_id -> true if extension already granted
 }
 
 // ─── Data Structs ─────────────────────────────────────────────────────────────
@@ -842,6 +844,62 @@ impl IntentSettlement {
         for intent_id in intent_ids {
             Self::accept_intent(env.clone(), solver.clone(), intent_id);
         }
+    }
+
+    // ── Fill Window Extension ─────────────────────────────────────────────────
+
+    /// Solver requests a grace-period extension on an Accepted intent.
+    /// Grants exactly one extension per intent, each extending the deadline
+    /// by up to MAX_EXTENSION_DURATION. Further extension requests on the
+    /// same intent are rejected to prevent abuse.
+    pub fn request_extension(env: Env, solver: Address, intent_id: BytesN<32>) {
+        solver.require_auth();
+        Self::bump_instance_ttl(&env);
+
+        let mut intent: IntentRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Intent(intent_id.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::IntentNotFound));
+
+        // Only Accepted intents can be extended
+        if intent.state != IntentState::Accepted {
+            panic_with_error!(&env, Error::IntentNotAccepted);
+        }
+
+        // Only the assigned solver can request an extension
+        if intent.solver.as_ref() != Some(&solver) {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+
+        // Each intent gets exactly one extension
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::ExtensionGranted(intent_id.clone()))
+        {
+            panic_with_error!(&env, Error::ZeroAmount); // No dedicated error; reuse nearest
+        }
+
+        let now = env.ledger().timestamp();
+
+        // Extend the deadline by the full extension duration
+        intent.deadline = now + MAX_EXTENSION_DURATION;
+
+        // Record that this intent has used its one extension
+        env.storage()
+            .persistent()
+            .set(&DataKey::ExtensionGranted(intent_id.clone()), &true);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Intent(intent_id.clone()), &intent);
+        Self::bump_intent_ttl(&env, &intent_id);
+
+        env.events().publish(
+            (Symbol::new(&env, "extension_granted"), solver),
+            (intent_id, intent.deadline),
+        );
     }
 
     // ── Views ─────────────────────────────────────────────────────────────────
