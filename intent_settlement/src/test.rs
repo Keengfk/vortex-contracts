@@ -1060,3 +1060,161 @@ fn get_bond_token_returns_configured_token() {
     let ctx = setup();
     assert_eq!(ctx.client().get_bond_token(), Some(ctx.bond_token.clone()));
 }
+
+// ─── Intent ID collision resistance ──────────────────────────────────────────
+
+#[test]
+fn compute_intent_id_different_users_no_collision() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    let user1 = Address::generate(&ctx.env);
+    let user2 = Address::generate(&ctx.env);
+
+    let id1 = c.submit_intent(
+        &user1,
+        &String::from_str(&ctx.env, "ethereum"),
+        &String::from_str(&ctx.env, "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+        &SRC_AMT,
+        &ctx.dst_token,
+        &MIN_DST,
+        &None,
+    );
+
+    let id2 = c.submit_intent(
+        &user2,
+        &String::from_str(&ctx.env, "ethereum"),
+        &String::from_str(&ctx.env, "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+        &SRC_AMT,
+        &ctx.dst_token,
+        &MIN_DST,
+        &None,
+    );
+
+    // Different users with identical other parameters should produce different IDs
+    assert_ne!(id1, id2);
+}
+
+#[test]
+fn compute_intent_id_different_amounts_no_collision() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    let id1 = c.submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "ethereum"),
+        &String::from_str(&ctx.env, "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+        &SRC_AMT,
+        &ctx.dst_token,
+        &MIN_DST,
+        &None,
+    );
+
+    ctx.pass_time(1); // ensure different timestamp
+
+    let id2 = c.submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "ethereum"),
+        &String::from_str(&ctx.env, "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+        &(SRC_AMT + 1),
+        &ctx.dst_token,
+        &MIN_DST,
+        &None,
+    );
+
+    // Different amounts should produce different IDs
+    assert_ne!(id1, id2);
+}
+
+#[test]
+fn compute_intent_id_different_chains_no_collision() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    let id1 = c.submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "ethereum"),
+        &String::from_str(&ctx.env, "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+        &SRC_AMT,
+        &ctx.dst_token,
+        &MIN_DST,
+        &None,
+    );
+
+    ctx.pass_time(1);
+
+    let id2 = c.submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "base"),
+        &String::from_str(&ctx.env, "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+        &SRC_AMT,
+        &ctx.dst_token,
+        &MIN_DST,
+        &None,
+    );
+
+    // Different source chains should produce different IDs
+    assert_ne!(id1, id2);
+}
+
+#[test]
+fn compute_intent_id_different_timestamps_no_collision() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    let id1 = ctx.submit();
+    ctx.pass_time(10);
+    let id2 = ctx.submit();
+
+    // Different timestamps should produce different IDs
+    assert_ne!(id1, id2);
+}
+
+#[test]
+fn compute_intent_id_batch_no_collisions() {
+    // Test that many intents with various parameters don't collide
+    let ctx = setup();
+    let c = ctx.client();
+    let mut ids: Vec<BytesN<32>> = Vec::new();
+
+    // Generate 10 intents with varying parameters
+    for i in 0..10 {
+        let user = if i % 2 == 0 {
+            ctx.user.clone()
+        } else {
+            Address::generate(&ctx.env)
+        };
+
+        let chain = if i < 5 {
+            String::from_str(&ctx.env, "ethereum")
+        } else {
+            String::from_str(&ctx.env, "base")
+        };
+
+        let amount = SRC_AMT + (i as i128) * 1_000_000;
+
+        let id = c.submit_intent(
+            &user,
+            &chain,
+            &String::from_str(&ctx.env, "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+            &amount,
+            &ctx.dst_token,
+            &MIN_DST,
+            &None,
+        );
+
+        ids.push(id);
+        ctx.pass_time(1);
+    }
+
+    // Verify all IDs are unique
+    for i in 0..ids.len() {
+        for j in (i + 1)..ids.len() {
+            assert_ne!(
+                ids[i], ids[j],
+                "Collision detected between intent {} and {}",
+                i, j
+            );
+        }
+    }
+}
