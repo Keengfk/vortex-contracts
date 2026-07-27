@@ -1164,3 +1164,69 @@ fn get_bond_token_returns_configured_token() {
     let ctx = setup();
     assert_eq!(ctx.client().get_bond_token(), Some(ctx.bond_token.clone()));
 }
+
+// ─── Error variant coverage ─────────────────────────────────────────────────────
+
+#[test]
+fn intent_already_filled_error_when_fill_called_twice() {
+    let ctx = setup();
+    let c = ctx.client();
+    ctx.register_solver();
+    let id = ctx.submit();
+    c.accept_intent(&ctx.solver, &id);
+
+    // Fill the intent once
+    let fee = FILL * 5 / 10_000;
+    ctx.dst_admin().mint(&ctx.solver, &(FILL + fee));
+    c.fill_intent(&ctx.solver, &id, &FILL);
+
+    // Attempt to fill again with fresh funds
+    ctx.dst_admin().mint(&ctx.solver, &(FILL + fee));
+    let res = c.try_fill_intent(&ctx.solver, &id, &FILL);
+    assert_eq!(res, Err(Ok(Error::IntentAlreadyFilled.into())));
+}
+
+#[test]
+fn not_initialized_error_when_accessing_admin_before_init() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, IntentSettlement);
+    let c = IntentSettlementClient::new(&env, &contract_id);
+
+    // Attempting to access admin before initialize should fail
+    let res = c.try_get_admin();
+    assert_eq!(res, Err(Ok(Error::NotInitialized.into())));
+}
+
+#[test]
+fn solver_inactive_error_when_accepting_after_slash_deactivation() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    let thin_bond = MIN_BOND + MIN_BOND / 10;
+    ctx.bond_admin().mint(&ctx.solver, &thin_bond);
+    c.register_solver(&ctx.solver, &thin_bond);
+
+    let id = ctx.submit();
+    c.accept_intent(&ctx.solver, &id);
+    ctx.pass_time(FILL_WINDOW + 1);
+    c.slash_solver(&id);
+
+    // Solver is now inactive; try to accept another intent
+    let id2 = ctx.submit();
+    let res = c.try_accept_intent(&ctx.solver, &id2);
+    assert_eq!(res, Err(Ok(Error::SolverInactive.into())));
+}
+
+#[test]
+fn fill_window_expired_error_when_slash_called_too_early() {
+    let ctx = setup();
+    ctx.register_solver();
+    let id = ctx.submit();
+    ctx.client().accept_intent(&ctx.solver, &id);
+
+    // Still within the fill window, so slash should fail with FillWindowExpired
+    // (meaning "the window isn't expired yet, you can't slash")
+    let res = ctx.client().try_slash_solver(&id);
+    assert_eq!(res, Err(Ok(Error::FillWindowExpired.into())));
+}
