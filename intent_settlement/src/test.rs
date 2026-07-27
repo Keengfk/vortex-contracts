@@ -234,6 +234,83 @@ fn pause_does_not_block_slashing_an_already_accepted_intent() {
     assert_eq!(c.get_solver(&ctx.solver).unwrap().fills_failed, 1);
 }
 
+#[test]
+fn pause_blocks_fill_intent() {
+    let ctx = setup();
+    let c = ctx.client();
+    ctx.register_solver();
+    let id = ctx.submit();
+    c.accept_intent(&ctx.solver, &id);
+
+    c.pause();
+
+    let fee = FILL * 5 / 10_000;
+    ctx.dst_admin().mint(&ctx.solver, &(FILL + fee));
+    let res = c.try_fill_intent(&ctx.solver, &id, &FILL);
+    assert_eq!(res, Err(Ok(Error::ContractPaused.into())));
+}
+
+#[test]
+fn pause_does_not_block_cancel_intent() {
+    let ctx = setup();
+    let c = ctx.client();
+    let id = ctx.submit();
+
+    c.pause();
+    assert!(c.is_paused());
+
+    // cancel_intent should succeed even while paused
+    c.cancel_intent(&ctx.user, &id);
+    assert!(c.get_intent(&id).unwrap().state == IntentState::Cancelled);
+}
+
+#[test]
+fn pause_blocks_submit_accept_fill_but_allows_cancel_and_slash() {
+    let ctx = setup();
+    let c = ctx.client();
+    ctx.register_solver();
+
+    // Submit and accept before pausing
+    let id = ctx.submit();
+    c.accept_intent(&ctx.solver, &id);
+
+    // Submit another intent to test that it can't be accepted while paused
+    let id2 = ctx.submit();
+
+    c.pause();
+    assert!(c.is_paused());
+
+    // Test blocked operations
+    let deadline: Option<u64> = None;
+    let res = c.try_submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "ethereum"),
+        &String::from_str(&ctx.env, "0xdef"),
+        &SRC_AMT,
+        &ctx.dst_token,
+        &MIN_DST,
+        &deadline,
+    );
+    assert_eq!(res, Err(Ok(Error::ContractPaused.into())));
+
+    let res = c.try_accept_intent(&ctx.solver, &id2);
+    assert_eq!(res, Err(Ok(Error::ContractPaused.into())));
+
+    let fee = FILL * 5 / 10_000;
+    ctx.dst_admin().mint(&ctx.solver, &(FILL + fee));
+    let res = c.try_fill_intent(&ctx.solver, &id, &FILL);
+    assert_eq!(res, Err(Ok(Error::ContractPaused.into())));
+
+    // Test allowed operations
+    let id3 = ctx.submit();
+    c.cancel_intent(&ctx.user, &id3);
+    assert!(c.get_intent(&id3).unwrap().state == IntentState::Cancelled);
+
+    ctx.pass_time(FILL_WINDOW + 1);
+    c.slash_solver(&id);
+    assert_eq!(c.get_solver(&ctx.solver).unwrap().fills_failed, 1);
+}
+
 // ─── Solver registration ────────────────────────────────────────────────────────
 
 #[test]
