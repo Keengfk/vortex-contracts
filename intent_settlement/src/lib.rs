@@ -21,6 +21,17 @@ const FILL_WINDOW: u64 = 300; // 5 minutes to fill after intent accepted
 const MIN_BOND: i128 = 50 * 10_000_000; // 50 USDC minimum solver bond
 const PROTOCOL_FEE_BPS: i128 = 5; // 0.05%
 
+// Upper sanity bound for src_amount and min_dst_amount.
+//
+// Largest realistic token amounts use 18-decimal ETH units.
+// 1e12 tokens × 1e18 units/token = 1e30, well within i128 range (~1.7e38),
+// but downstream arithmetic (fee = amount * 5 / 10_000) multiplies first and
+// then divides. To guarantee `amount * PROTOCOL_FEE_BPS` never overflows i128,
+// the bound is i128::MAX / PROTOCOL_FEE_BPS ≈ 3.4e37. We choose a round,
+// economically implausible threshold: 10^30 (one trillion 18-decimal tokens).
+// That is a comfortable safety margin while rejecting only fat-fingered inputs.
+pub const MAX_AMOUNT: i128 = 1_000_000_000_000_000_000_000_000_000_000i128; // 10^30
+
 // Soroban archives ledger entries that go too long without being touched.
 // Persistent Intent/Solver records get their TTL bumped on every write so
 // they don't need to be manually restored before later calls can read them.
@@ -133,6 +144,7 @@ pub enum Error {
     DeadlineNotReached = 19,
     InsufficientBond = 20,
     DstTokenNotAllowed = 21,
+    AmountTooLarge = 22,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -451,6 +463,10 @@ impl IntentSettlement {
 
         if src_amount <= 0 || min_dst_amount <= 0 {
             panic_with_error!(&env, Error::ZeroAmount);
+        }
+
+        if src_amount > MAX_AMOUNT || min_dst_amount > MAX_AMOUNT {
+            panic_with_error!(&env, Error::AmountTooLarge);
         }
 
         if Self::is_dst_allowlist_enabled(env.clone())

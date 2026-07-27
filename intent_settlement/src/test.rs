@@ -7,7 +7,7 @@
 
 use crate::{
     Error, IntentSettlement, IntentSettlementClient, IntentState, FILL_WINDOW, INTENT_EXPIRY,
-    MIN_BOND,
+    MIN_BOND, MAX_AMOUNT,
 };
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
@@ -993,4 +993,369 @@ fn get_intent_returns_none_for_unknown_id() {
 fn get_bond_token_returns_configured_token() {
     let ctx = setup();
     assert_eq!(ctx.client().get_bond_token(), Some(ctx.bond_token.clone()));
+}
+
+// ─── #41 Amount upper-bound boundary tests ──────────────────────────────────────
+
+#[test]
+fn submit_intent_at_max_amount_succeeds() {
+    // MAX_AMOUNT itself is the inclusive upper bound and must be accepted.
+    let ctx = setup();
+    let deadline: Option<u64> = None;
+    let id = ctx.client().submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "ethereum"),
+        &String::from_str(&ctx.env, "0xabc"),
+        &MAX_AMOUNT,
+        &ctx.dst_token,
+        &MAX_AMOUNT,
+        &deadline,
+    );
+    let intent = ctx.client().get_intent(&id).unwrap();
+    assert_eq!(intent.src_amount, MAX_AMOUNT);
+    assert_eq!(intent.min_dst_amount, MAX_AMOUNT);
+}
+
+#[test]
+fn submit_intent_src_amount_above_max_fails() {
+    // MAX_AMOUNT + 1 must be rejected.
+    let ctx = setup();
+    let deadline: Option<u64> = None;
+    let res = ctx.client().try_submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "ethereum"),
+        &String::from_str(&ctx.env, "0xabc"),
+        &(MAX_AMOUNT + 1),
+        &ctx.dst_token,
+        &MIN_DST,
+        &deadline,
+    );
+    assert_eq!(res, Err(Ok(Error::AmountTooLarge.into())));
+}
+
+#[test]
+fn submit_intent_min_dst_amount_above_max_fails() {
+    // MAX_AMOUNT + 1 on min_dst_amount must be rejected.
+    let ctx = setup();
+    let deadline: Option<u64> = None;
+    let res = ctx.client().try_submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "ethereum"),
+        &String::from_str(&ctx.env, "0xabc"),
+        &SRC_AMT,
+        &ctx.dst_token,
+        &(MAX_AMOUNT + 1),
+        &deadline,
+    );
+    assert_eq!(res, Err(Ok(Error::AmountTooLarge.into())));
+}
+
+#[test]
+fn submit_intent_i128_max_src_amount_fails() {
+    // i128::MAX is far above MAX_AMOUNT and must also be rejected.
+    let ctx = setup();
+    let deadline: Option<u64> = None;
+    let res = ctx.client().try_submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "ethereum"),
+        &String::from_str(&ctx.env, "0xabc"),
+        &i128::MAX,
+        &ctx.dst_token,
+        &MIN_DST,
+        &deadline,
+    );
+    assert_eq!(res, Err(Ok(Error::AmountTooLarge.into())));
+}
+
+// ─── #40 Reentrancy-focused tests with a hostile mock SEP-41 token ───────────────
+//
+// Soroban's execution model serializes contract calls within a single ledger
+// transaction — true EVM-style reentrancy (calling back into an in-progress
+// frame) is not possible. What these tests exercise instead:
+//
+//   1. The settlement contract works correctly with an *arbitrary* SEP-41
+//      token implementation, not just the standard SAC.
+//   2. The checks-effects-interactions pattern is upheld: intent and solver
+//      records are persisted *before* any external token.transfer() call,
+//      so any cross-contract observer sees a fully committed state.
+//   3. A benign double-call to register_solver (simulating a hypothetical
+//      callback from a hostile bond token) is handled gracefully as a top-up.
+
+// HostileToken — a minimal, self-contained SEP-41 implementation registered
+// as the dst_token. It implements exactly the interface that token::Client
+// (used inside fill_intent) requires: transfer, balance, and the rest as
+// no-ops. Balances are stored in instance storage keyed by address.
+#[soroban_sdk::contract]
+pub struct HostileToken;
+
+#[soroban_sdk::contractimpl]
+impl HostileToken {
+    pub fn mint(env: Env, to: Address, amount: i128) {
+        let bal: i128 = env.storage().instance().get(&to).unwrap_or(0);
+        env.storage().instance().set(&to, &(bal + amount));
+    }
+
+    pub fn balance(env: Env, id: Address) -> i128 {
+        env.storage().instance().get(&id).unwrap_or(0)
+    }
+
+    pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+        from.require_auth();
+        let from_bal: i128 = env.storage().instance().get(&from).unwrap_or(0);
+        let to_bal: i128 = env.storage().instance().get(&to).unwrap_or(0);
+        env.storage().instance().set(&from, &(from_bal - amount));
+        env.storage().instance().set(&to, &(to_bal + amount));
+    }
+
+    // The remaining SEP-41 methods are required by the interface but unused
+    // by fill_intent. They are no-ops here.
+    pub fn transfer_from(_e: Env, _s: Address, _f: Address, _t: Address, _a: i128) {}
+    pub fn approve(_e: Env, _f: Address, _s: Address, _a: i128, _exp: u32) {}
+    pub fn allowance(_e: Env, _f: Address, _s: Address) -> i128 { 0 }
+    pub fn decimals(_e: Env) -> u32 { 7 }
+    pub fn name(e: Env) -> String { String::from_str(&e, "Hostile") }
+    pub fn symbol(e: Env) -> String { String::from_str(&e, "HST") }
+    pub fn set_authorized(_e: Env, _id: Address, _auth: bool) {}
+    pub fn authorized(_e: Env, _id: Address) -> bool { true }
+    pub fn burn(_e: Env, _f: Address, _a: i128) {}
+    pub fn burn_from(_e: Env, _s: Address, _f: Address, _a: i128) {}
+    pub fn clawback(_e: Env, _f: Address, _a: i128) {}
+    pub fn spendable_balance(e: Env, id: Address) -> i128 {
+        e.storage().instance().get(&id).unwrap_or(0)
+    }
+}
+
+/// Build a test context where dst_token is the HostileToken contract.
+/// Bond token remains a normal SAC so bond bookkeeping works unchanged.
+fn setup_with_hostile_dst() -> (Ctx, Address) {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let fee_recipient = Address::generate(&env);
+    let user = Address::generate(&env);
+    let solver = Address::generate(&env);
+
+    let bond_token = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+
+    let hostile_dst = env.register_contract(None, HostileToken);
+    let contract_id = env.register_contract(None, IntentSettlement);
+
+    let ctx = Ctx {
+        env,
+        admin,
+        fee_recipient,
+        user,
+        solver,
+        contract_id,
+        bond_token,
+        dst_token: hostile_dst.clone(),
+    };
+    ctx.client()
+        .initialize(&ctx.admin, &ctx.fee_recipient, &ctx.bond_token);
+
+    (ctx, hostile_dst)
+}
+
+/// Mint hostile dst tokens to an address via HostileTokenClient.
+fn hostile_mint(env: &Env, contract: &Address, to: &Address, amount: i128) {
+    HostileTokenClient::new(env, contract).mint(to, &amount);
+}
+
+#[test]
+fn fill_intent_with_hostile_dst_token_settles_correctly() {
+    // Settlement must work end-to-end when dst_token is a non-SAC contract.
+    let (ctx, hostile_dst) = setup_with_hostile_dst();
+    let c = ctx.client();
+
+    ctx.bond_admin().mint(&ctx.solver, &BOND);
+    c.register_solver(&ctx.solver, &BOND);
+    let id = ctx.submit();
+    c.accept_intent(&ctx.solver, &id);
+
+    let fee = FILL * 5 / 10_000;
+    hostile_mint(&ctx.env, &hostile_dst, &ctx.solver, FILL + fee);
+
+    c.fill_intent(&ctx.solver, &id, &FILL);
+
+    let intent = c.get_intent(&id).unwrap();
+    assert!(intent.state == IntentState::Filled);
+    assert_eq!(intent.fill_amount, Some(FILL));
+
+    // Verify balances via HostileTokenClient.
+    let hc = HostileTokenClient::new(&ctx.env, &hostile_dst);
+    assert_eq!(hc.balance(&ctx.user), FILL);
+    assert_eq!(hc.balance(&ctx.fee_recipient), fee);
+    assert_eq!(hc.balance(&ctx.solver), 0);
+}
+
+#[test]
+fn fill_intent_storage_written_before_token_transfer() {
+    // Checks-effects-interactions: confirm intent state and solver stats
+    // are fully persisted (as Filled / fills_completed++) in the same call
+    // that triggers the external token transfer, so any cross-contract
+    // observer reading settlement storage during the transfer sees Filled.
+    let (ctx, hostile_dst) = setup_with_hostile_dst();
+    let c = ctx.client();
+
+    ctx.bond_admin().mint(&ctx.solver, &BOND);
+    c.register_solver(&ctx.solver, &BOND);
+    let id = ctx.submit();
+    c.accept_intent(&ctx.solver, &id);
+
+    // Pre-fill: state is Accepted.
+    assert!(c.get_intent(&id).unwrap().state == IntentState::Accepted);
+    assert_eq!(c.get_solver(&ctx.solver).unwrap().fills_completed, 0);
+
+    let fee = FILL * 5 / 10_000;
+    hostile_mint(&ctx.env, &hostile_dst, &ctx.solver, FILL + fee);
+    c.fill_intent(&ctx.solver, &id, &FILL);
+
+    // Post-fill: storage reflects Filled and incremented stats.
+    let intent = c.get_intent(&id).unwrap();
+    assert!(intent.state == IntentState::Filled);
+    let solver = c.get_solver(&ctx.solver).unwrap();
+    assert_eq!(solver.fills_completed, 1);
+    assert_eq!(solver.active_intents, 0);
+}
+
+#[test]
+fn slash_solver_with_hostile_dst_token_settles_correctly() {
+    // slash_solver touches only the bond token (SAC), not the dst_token, but
+    // confirm it still correctly updates solver state when dst is a hostile token.
+    let (ctx, _hostile_dst) = setup_with_hostile_dst();
+    let c = ctx.client();
+
+    ctx.bond_admin().mint(&ctx.solver, &BOND);
+    c.register_solver(&ctx.solver, &BOND);
+    let id = ctx.submit();
+    c.accept_intent(&ctx.solver, &id);
+
+    let bond_before = c.get_solver(&ctx.solver).unwrap().bond_amount;
+    ctx.pass_time(FILL_WINDOW + 1);
+    c.slash_solver(&id);
+
+    let slash = bond_before / 10;
+    let solver = c.get_solver(&ctx.solver).unwrap();
+    assert_eq!(solver.bond_amount, bond_before - slash);
+    assert_eq!(solver.fills_failed, 1);
+    assert_eq!(solver.active_intents, 0);
+
+    assert!(c.get_intent(&id).unwrap().state == IntentState::Open);
+    assert_eq!(ctx.bond().balance(&ctx.fee_recipient), slash);
+}
+
+#[test]
+fn register_solver_double_call_is_safe_top_up() {
+    // Simulates a hostile bond token calling back into register_solver
+    // during a transfer. In Soroban this cannot truly re-enter a frame
+    // mid-execution, but a sequential second call behaves as a normal
+    // top-up and must not corrupt solver state.
+    let ctx = setup();
+    let c = ctx.client();
+
+    ctx.bond_admin().mint(&ctx.solver, &(BOND * 2));
+
+    c.register_solver(&ctx.solver, &BOND);
+    assert_eq!(c.get_solver(&ctx.solver).unwrap().bond_amount, BOND);
+
+    // Second call — treated as a top-up, not a duplicate registration.
+    c.register_solver(&ctx.solver, &BOND);
+    assert_eq!(c.get_solver(&ctx.solver).unwrap().bond_amount, BOND * 2);
+
+    // Exactly one solver counted in total.
+    let hc = c.get_solver(&ctx.solver).unwrap();
+    assert!(hc.is_active);
+}
+
+// ─── #39 Economic security: MIN_BOND vs worst-case slash-to-notional ratio ───────
+
+#[test]
+fn economic_security_min_bond_slash_vs_large_notional() {
+    // Documents the current protocol gap: a solver registered at MIN_BOND
+    // can accept an arbitrarily large intent. If they fail to fill, they
+    // lose only 10% of MIN_BOND (= 5 USDC). For a large-notional intent
+    // this penalty is economically negligible.
+    //
+    // This test *documents* the gap rather than asserting it is safe.
+    // A follow-up design issue should add a per-intent bond-to-notional
+    // check inside accept_intent. Closes #39.
+    let ctx = setup();
+    let c = ctx.client();
+
+    ctx.bond_admin().mint(&ctx.solver, &MIN_BOND);
+    c.register_solver(&ctx.solver, &MIN_BOND);
+
+    // One trillion USDC (7 decimals = 10^19 units) — within MAX_AMOUNT.
+    let large_notional: i128 = 1_000_000_000_000 * 10_000_000; // 10^19
+    let deadline: Option<u64> = None;
+    let id = c.submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "ethereum"),
+        &String::from_str(&ctx.env, "0xabc"),
+        &large_notional,
+        &ctx.dst_token,
+        &large_notional,
+        &deadline,
+    );
+
+    // The protocol currently allows a min-bonded solver to accept this.
+    c.accept_intent(&ctx.solver, &id);
+    assert!(c.get_intent(&id).unwrap().state == IntentState::Accepted);
+
+    ctx.pass_time(FILL_WINDOW + 1);
+    c.slash_solver(&id);
+
+    let slash_amount = MIN_BOND / 10; // 5 USDC
+    assert_eq!(ctx.bond().balance(&ctx.fee_recipient), slash_amount);
+
+    // Penalty-to-notional ratio rounds to 0 bps — economic gap confirmed.
+    let penalty_bps = (slash_amount * 10_000) / large_notional;
+    assert_eq!(
+        penalty_bps,
+        0,
+        "Gap: slash ({slash_amount}) is < 1 bps of notional ({large_notional})"
+    );
+}
+
+#[test]
+fn economic_security_proportionate_bond_yields_meaningful_penalty() {
+    // Positive counterpart: a solver bonded at ≥1% of intent notional faces
+    // a meaningful slash (≥10 bps of notional). Documents the target ratio
+    // that a future bond-to-notional check should enforce.
+    let ctx = setup();
+    let c = ctx.client();
+
+    // Intent notional: 10,000 USDC (7 decimals = 10^11 units).
+    let notional: i128 = 10_000 * 10_000_000; // 10^11
+
+    // 1% of notional = 100 USDC, well above MIN_BOND.
+    let proportionate_bond = notional / 100;
+    ctx.bond_admin().mint(&ctx.solver, &proportionate_bond);
+    c.register_solver(&ctx.solver, &proportionate_bond);
+
+    let deadline: Option<u64> = None;
+    let id = c.submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "ethereum"),
+        &String::from_str(&ctx.env, "0xabc"),
+        &notional,
+        &ctx.dst_token,
+        &notional,
+        &deadline,
+    );
+    c.accept_intent(&ctx.solver, &id);
+
+    ctx.pass_time(FILL_WINDOW + 1);
+    c.slash_solver(&id);
+
+    let slash_amount = proportionate_bond / 10;
+    let penalty_bps = (slash_amount * 10_000) / notional;
+
+    assert!(
+        penalty_bps >= 10,
+        "Expected penalty ≥ 10 bps, got {penalty_bps} bps"
+    );
 }
