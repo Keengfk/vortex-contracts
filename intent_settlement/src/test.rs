@@ -311,6 +311,37 @@ fn register_solver_small_topup_below_minimum_succeeds() {
 }
 
 #[test]
+fn register_solver_new_with_exact_min_bond_succeeds() {
+    // New solver registering with exactly MIN_BOND (not above) should succeed.
+    let ctx = setup();
+    ctx.bond_admin().mint(&ctx.solver, &MIN_BOND);
+    let c = ctx.client();
+    c.register_solver(&ctx.solver, &MIN_BOND);
+
+    let record = c.get_solver(&ctx.solver).unwrap();
+    assert_eq!(record.bond_amount, MIN_BOND);
+    assert!(record.is_active);
+}
+
+#[test]
+fn register_solver_topup_to_exact_min_bond_succeeds() {
+    // Existing solver topping up to land exactly at MIN_BOND total should succeed.
+    // First: register with half of MIN_BOND
+    let ctx = setup();
+    let half_min = MIN_BOND / 2;
+    ctx.bond_admin().mint(&ctx.solver, &MIN_BOND);
+    let c = ctx.client();
+    c.register_solver(&ctx.solver, &half_min);
+
+    // Top up by another half to reach exactly MIN_BOND
+    c.register_solver(&ctx.solver, &half_min);
+
+    let record = c.get_solver(&ctx.solver).unwrap();
+    assert_eq!(record.bond_amount, MIN_BOND);
+    assert!(record.is_active);
+}
+
+#[test]
 fn register_solver_zero_amount_fails() {
     let ctx = setup();
     ctx.register_solver();
@@ -326,6 +357,37 @@ fn deregister_returns_bond() {
 
     assert!(ctx.client().get_solver(&ctx.solver).is_none());
     assert_eq!(ctx.bond().balance(&ctx.solver), BOND);
+    assert_eq!(ctx.bond().balance(&ctx.contract_id), 0);
+}
+
+#[test]
+fn deregister_returns_exact_bond_amount_after_topup() {
+    // Solver registers, then tops up with additional deposits.
+    // Deregistration should return the exact accumulated total.
+    let ctx = setup();
+    let topup1 = 100 * 10_000_000;
+    let topup2 = 200 * 10_000_000;
+    let total_expected = BOND + topup1 + topup2;
+
+    ctx.bond_admin().mint(&ctx.solver, &total_expected);
+    let c = ctx.client();
+
+    // First deposit
+    c.register_solver(&ctx.solver, &BOND);
+    // Top up with additional amounts
+    c.register_solver(&ctx.solver, &topup1);
+    c.register_solver(&ctx.solver, &topup2);
+
+    // Verify accumulated bond
+    assert_eq!(
+        c.get_solver(&ctx.solver).unwrap().bond_amount,
+        total_expected
+    );
+
+    // Deregister and verify exact return
+    c.deregister_solver(&ctx.solver);
+    assert!(c.get_solver(&ctx.solver).is_none());
+    assert_eq!(ctx.bond().balance(&ctx.solver), total_expected);
     assert_eq!(ctx.bond().balance(&ctx.contract_id), 0);
 }
 
@@ -851,6 +913,31 @@ fn slash_below_min_bond_deactivates_solver() {
 }
 
 #[test]
+fn slash_above_min_bond_keeps_solver_active() {
+    // Solver bonded well above MIN_BOND: a 10% slash still leaves >= MIN_BOND.
+    // Verify is_active remains true and solver can still accept intents.
+    let ctx = setup();
+    let c = ctx.client();
+
+    // BOND is 1000 * 10_000_000; MIN_BOND is 50 * 10_000_000.
+    // A 10% slash of BOND is 100 * 10_000_000, leaving 900 * 10_000_000 >> MIN_BOND.
+    ctx.register_solver();
+    let id = ctx.submit();
+    c.accept_intent(&ctx.solver, &id);
+    ctx.pass_time(FILL_WINDOW + 1);
+    c.slash_solver(&id);
+
+    let solver = c.get_solver(&ctx.solver).unwrap();
+    assert!(solver.bond_amount >= MIN_BOND);
+    assert!(solver.is_active);
+
+    // Active solver can accept new intents.
+    assert!(c.is_solver_eligible(&ctx.solver));
+    let id2 = ctx.submit();
+    c.accept_intent(&ctx.solver, &id2);
+}
+
+#[test]
 fn topping_up_after_slash_reactivates_solver() {
     let ctx = setup();
     let c = ctx.client();
@@ -993,4 +1080,74 @@ fn get_intent_returns_none_for_unknown_id() {
 fn get_bond_token_returns_configured_token() {
     let ctx = setup();
     assert_eq!(ctx.client().get_bond_token(), Some(ctx.bond_token.clone()));
+}
+
+// ─── Resource Usage Benchmarking ────────────────────────────────────────────
+
+#[test]
+fn benchmark_entrypoint_executions() {
+    // Validate that all major entrypoints execute without error under representative loads.
+    // Resource costs (CPU instructions, ledger I/O) should be measured via soroban-cli:
+    //   soroban contract invoke --... --fee 1000000 <entrypoint> <args>
+    //
+    // Key entrypoints and representative execution patterns:
+    //
+    // register_solver(new): first-time solver registration with MIN_BOND
+    //   - Reads: BondToken balance, TotalSolvers counter
+    //   - Writes: SolverRecord, TotalSolvers counter
+    //   - CPU: token transfer authorization + data encoding
+    //
+    // register_solver(topup): existing solver bonding additional funds
+    //   - Reads: existing SolverRecord, BondToken balance
+    //   - Writes: updated SolverRecord
+    //   - CPU: lower than new registration (no counter bump)
+    //
+    // submit_intent: user creates a cross-chain swap intent
+    //   - Reads: TotalIntents counter
+    //   - Writes: IntentRecord, TotalIntents counter
+    //   - CPU: intent_id hashing, metadata encoding
+    //
+    // accept_intent: solver claims exclusive fill right
+    //   - Reads: SolverRecord, IntentRecord
+    //   - Writes: both records (deadline update, active_intents bump)
+    //   - CPU: timestamp comparison, state machine logic
+    //
+    // fill_intent: solver delivers output + protocol fee
+    //   - Reads: IntentRecord, SolverRecord, FeeRecipient, BondToken
+    //   - Writes: IntentRecord, SolverRecord, TotalVolume counter
+    //   - CPU: two token transfers (output + fee), fee calculation
+    //
+    // slash_solver: penalize failed solver (permissionless)
+    //   - Reads: IntentRecord, SolverRecord, FeeRecipient, BondToken
+    //   - Writes: SolverRecord (bond reduced, is_active flag), IntentRecord (re-opened)
+    //   - CPU: 10% calculation, state transitions, token transfer
+    //
+    // withdraw_bond: solver reduces bond without deregistering
+    //   - Reads: SolverRecord
+    //   - Writes: SolverRecord
+    //   - CPU: simple arithmetic, one token transfer
+    //
+    // deregister_solver: fully exit, release bond
+    //   - Reads: SolverRecord, TotalSolvers counter, BondToken
+    //   - Writes: remove SolverRecord, decrement TotalSolvers
+    //   - CPU: token transfer, data cleanup
+    //
+    // Run representative paths to verify correct behavior:
+    let ctx = setup();
+    let c = ctx.client();
+
+    ctx.register_solver();
+    let id = ctx.submit();
+    c.accept_intent(&ctx.solver, &id);
+    let fee = FILL * 5 / 10_000;
+    ctx.dst_admin().mint(&ctx.solver, &(FILL + fee));
+    c.fill_intent(&ctx.solver, &id, &FILL);
+
+    let id2 = ctx.submit();
+    c.accept_intent(&ctx.solver, &id2);
+    ctx.pass_time(FILL_WINDOW + 1);
+    c.slash_solver(&id2);
+
+    c.withdraw_bond(&ctx.solver, &(BOND / 4));
+    c.deregister_solver(&ctx.solver);
 }
