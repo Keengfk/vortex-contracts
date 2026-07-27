@@ -11,7 +11,7 @@ use crate::{
 };
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
-    token, Address, BytesN, Env, String,
+    token, Address, BytesN, Env, String, Symbol,
 };
 
 // ─── Test fixture ───────────────────────────────────────────────────────────────
@@ -1217,4 +1217,244 @@ fn compute_intent_id_batch_no_collisions() {
             );
         }
     }
+}
+
+// ─── Event assertions ───────────────────────────────────────────────────────
+
+#[test]
+fn set_fee_recipient_emits_correct_event() {
+    let ctx = setup();
+    let new_recipient = Address::generate(&ctx.env);
+    ctx.client().set_fee_recipient(&new_recipient);
+
+    let events = ctx.env.events().all();
+    let event = events.last().unwrap();
+    assert_eq!(event.0.topics.len(), 1);
+    assert_eq!(
+        event.0.topics.get_unchecked(0),
+        &Symbol::new(&ctx.env, "fee_recipient_updated")
+    );
+}
+
+#[test]
+fn transfer_admin_emits_correct_event() {
+    let ctx = setup();
+    let new_admin = Address::generate(&ctx.env);
+    ctx.client().transfer_admin(&new_admin);
+
+    let events = ctx.env.events().all();
+    let event = events.last().unwrap();
+    assert_eq!(event.0.topics.len(), 1);
+    assert_eq!(
+        event.0.topics.get_unchecked(0),
+        &Symbol::new(&ctx.env, "admin_transferred")
+    );
+}
+
+#[test]
+fn add_allowed_dst_token_emits_correct_event() {
+    let ctx = setup();
+    ctx.client().add_allowed_dst_token(&ctx.dst_token);
+
+    let events = ctx.env.events().all();
+    let event = events.last().unwrap();
+    assert_eq!(event.0.topics.len(), 1);
+    assert_eq!(
+        event.0.topics.get_unchecked(0),
+        &Symbol::new(&ctx.env, "dst_token_allowed")
+    );
+}
+
+#[test]
+fn remove_allowed_dst_token_emits_correct_event() {
+    let ctx = setup();
+    ctx.client().add_allowed_dst_token(&ctx.dst_token);
+    ctx.client().remove_allowed_dst_token(&ctx.dst_token);
+
+    let events = ctx.env.events().all();
+    let event = events.last().unwrap();
+    assert_eq!(event.0.topics.len(), 1);
+    assert_eq!(
+        event.0.topics.get_unchecked(0),
+        &Symbol::new(&ctx.env, "dst_token_disallowed")
+    );
+}
+
+#[test]
+fn pause_emits_correct_event() {
+    let ctx = setup();
+    ctx.client().pause();
+
+    let events = ctx.env.events().all();
+    let event = events.last().unwrap();
+    assert_eq!(event.0.topics.len(), 1);
+    assert_eq!(
+        event.0.topics.get_unchecked(0),
+        &Symbol::new(&ctx.env, "paused")
+    );
+}
+
+#[test]
+fn unpause_emits_correct_event() {
+    let ctx = setup();
+    ctx.client().pause();
+    ctx.client().unpause();
+
+    let events = ctx.env.events().all();
+    let event = events.last().unwrap();
+    assert_eq!(event.0.topics.len(), 1);
+    assert_eq!(
+        event.0.topics.get_unchecked(0),
+        &Symbol::new(&ctx.env, "paused")
+    );
+}
+
+#[test]
+fn register_solver_emits_correct_event() {
+    let ctx = setup();
+    ctx.bond_admin().mint(&ctx.solver, &BOND);
+    ctx.client().register_solver(&ctx.solver, &BOND);
+
+    let events = ctx.env.events().all();
+    let event = events.last().unwrap();
+    assert_eq!(event.0.topics.len(), 2);
+    assert_eq!(
+        event.0.topics.get_unchecked(0),
+        &Symbol::new(&ctx.env, "solver_registered")
+    );
+}
+
+#[test]
+fn deregister_solver_emits_correct_event() {
+    let ctx = setup();
+    ctx.register_solver();
+    ctx.client().deregister_solver(&ctx.solver);
+
+    let events = ctx.env.events().all();
+    let event = events.last().unwrap();
+    assert_eq!(event.0.topics.len(), 2);
+    assert_eq!(
+        event.0.topics.get_unchecked(0),
+        &Symbol::new(&ctx.env, "solver_deregistered")
+    );
+}
+
+#[test]
+fn withdraw_bond_emits_correct_event() {
+    let ctx = setup();
+    ctx.register_solver();
+    let withdraw_amount = 100 * 10_000_000;
+    ctx.client().withdraw_bond(&ctx.solver, &withdraw_amount);
+
+    let events = ctx.env.events().all();
+    let event = events.last().unwrap();
+    assert_eq!(event.0.topics.len(), 2);
+    assert_eq!(
+        event.0.topics.get_unchecked(0),
+        &Symbol::new(&ctx.env, "bond_withdrawn")
+    );
+}
+
+#[test]
+fn submit_intent_emits_correct_event() {
+    let ctx = setup();
+    let id = ctx.submit();
+
+    let events = ctx.env.events().all();
+    let event = events.last().unwrap();
+    assert_eq!(event.0.topics.len(), 2);
+    assert_eq!(
+        event.0.topics.get_unchecked(0),
+        &Symbol::new(&ctx.env, "intent_submitted")
+    );
+}
+
+#[test]
+fn accept_intent_emits_correct_event() {
+    let ctx = setup();
+    ctx.register_solver();
+    let id = ctx.submit();
+    ctx.client().accept_intent(&ctx.solver, &id);
+
+    let events = ctx.env.events().all();
+    let event = events.last().unwrap();
+    assert_eq!(event.0.topics.len(), 2);
+    assert_eq!(
+        event.0.topics.get_unchecked(0),
+        &Symbol::new(&ctx.env, "intent_accepted")
+    );
+}
+
+#[test]
+fn fill_intent_emits_correct_event() {
+    let ctx = setup();
+    let c = ctx.client();
+    ctx.register_solver();
+    let id = ctx.submit();
+    c.accept_intent(&ctx.solver, &id);
+
+    let fee = FILL * 5 / 10_000;
+    ctx.dst_admin().mint(&ctx.solver, &(FILL + fee));
+    c.fill_intent(&ctx.solver, &id, &FILL);
+
+    let events = ctx.env.events().all();
+    let event = events.last().unwrap();
+    assert_eq!(event.0.topics.len(), 2);
+    assert_eq!(
+        event.0.topics.get_unchecked(0),
+        &Symbol::new(&ctx.env, "intent_filled")
+    );
+}
+
+#[test]
+fn cancel_intent_emits_correct_event() {
+    let ctx = setup();
+    let id = ctx.submit();
+    ctx.client().cancel_intent(&ctx.user, &id);
+
+    let events = ctx.env.events().all();
+    let event = events.last().unwrap();
+    assert_eq!(event.0.topics.len(), 2);
+    assert_eq!(
+        event.0.topics.get_unchecked(0),
+        &Symbol::new(&ctx.env, "intent_cancelled")
+    );
+}
+
+#[test]
+fn slash_solver_emits_correct_event() {
+    let ctx = setup();
+    let c = ctx.client();
+    ctx.register_solver();
+    let id = ctx.submit();
+    c.accept_intent(&ctx.solver, &id);
+
+    ctx.pass_time(FILL_WINDOW + 1);
+    c.slash_solver(&id);
+
+    let events = ctx.env.events().all();
+    let event = events.last().unwrap();
+    assert_eq!(event.0.topics.len(), 2);
+    assert_eq!(
+        event.0.topics.get_unchecked(0),
+        &Symbol::new(&ctx.env, "solver_slashed")
+    );
+}
+
+#[test]
+fn expire_intent_emits_correct_event() {
+    let ctx = setup();
+    let c = ctx.client();
+    let id = ctx.submit();
+
+    ctx.pass_time(INTENT_EXPIRY + 1);
+    c.expire_intent(&id);
+
+    let events = ctx.env.events().all();
+    let event = events.last().unwrap();
+    assert_eq!(event.0.topics.len(), 1);
+    assert_eq!(
+        event.0.topics.get_unchecked(0),
+        &Symbol::new(&ctx.env, "intent_expired")
+    );
 }
