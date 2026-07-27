@@ -793,6 +793,8 @@ fn cannot_cancel_someone_elses_intent() {
     let stranger = Address::generate(&ctx.env);
     let res = ctx.client().try_cancel_intent(&stranger, &id);
     assert_eq!(res, Err(Ok(Error::Unauthorized.into())));
+    // State remains unchanged after rejected cancellation attempt
+    assert!(ctx.client().get_intent(&id).unwrap().state == IntentState::Open);
 }
 
 // ─── Slashing ───────────────────────────────────────────────────────────────────
