@@ -721,6 +721,34 @@ fn cannot_accept_already_accepted_intent() {
     assert_eq!(res, Err(Ok(Error::IntentNotOpen.into())));
 }
 
+#[test]
+fn two_solver_race_on_same_intent_id() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    // Register two solvers
+    ctx.register_solver();
+    let solver2 = Address::generate(&ctx.env);
+    ctx.bond_admin().mint(&solver2, &BOND);
+    c.register_solver(&solver2, &BOND);
+
+    // Submit an intent
+    let id = ctx.submit();
+
+    // First solver accepts successfully
+    c.accept_intent(&ctx.solver, &id);
+    let solver1_record = c.get_solver(&ctx.solver).unwrap();
+    assert_eq!(solver1_record.active_intents, 1);
+
+    // Second solver tries to accept the same intent — should fail
+    let res = c.try_accept_intent(&solver2, &id);
+    assert_eq!(res, Err(Ok(Error::IntentNotOpen.into())));
+
+    // Verify second solver's active_intents was never incremented
+    let solver2_record = c.get_solver(&solver2).unwrap();
+    assert_eq!(solver2_record.active_intents, 0);
+}
+
 // ─── Fill guards ────────────────────────────────────────────────────────────────
 
 #[test]
