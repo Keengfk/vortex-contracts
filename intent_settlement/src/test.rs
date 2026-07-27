@@ -994,3 +994,30 @@ fn get_bond_token_returns_configured_token() {
     let ctx = setup();
     assert_eq!(ctx.client().get_bond_token(), Some(ctx.bond_token.clone()));
 }
+
+#[test]
+fn get_solver_count_tracks_registrations_and_deregistrations() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    // Initially zero solvers.
+    assert_eq!(c.get_solver_count(), 0);
+
+    // Register first solver.
+    ctx.register_solver();
+    assert_eq!(c.get_solver_count(), 1);
+
+    // Register second solver.
+    let other = Address::generate(&ctx.env);
+    ctx.bond_admin().mint(&other, &BOND);
+    c.register_solver(&other, &BOND);
+    assert_eq!(c.get_solver_count(), 2);
+
+    // Deregister first solver — count decrements.
+    c.deregister_solver(&ctx.solver);
+    assert_eq!(c.get_solver_count(), 1);
+
+    // Deregister second solver — count goes to zero.
+    c.deregister_solver(&other);
+    assert_eq!(c.get_solver_count(), 0);
+}

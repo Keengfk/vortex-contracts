@@ -847,6 +847,14 @@ impl IntentSettlement {
         (intents, volume)
     }
 
+    /// Total number of solvers ever registered.
+    pub fn get_solver_count(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::TotalSolvers)
+            .unwrap_or(0)
+    }
+
     // ── Internal ──────────────────────────────────────────────────────────────
 
     fn require_admin(env: &Env) {
