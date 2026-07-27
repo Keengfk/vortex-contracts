@@ -847,6 +847,11 @@ impl IntentSettlement {
         (intents, volume)
     }
 
+    /// Minimum bond required for solver registration.
+    pub fn get_min_bond(_env: Env) -> i128 {
+        MIN_BOND
+    }
+
     // ── Internal ──────────────────────────────────────────────────────────────
 
     fn require_admin(env: &Env) {

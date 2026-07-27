@@ -994,3 +994,9 @@ fn get_bond_token_returns_configured_token() {
     let ctx = setup();
     assert_eq!(ctx.client().get_bond_token(), Some(ctx.bond_token.clone()));
 }
+
+#[test]
+fn get_min_bond_returns_enforced_minimum() {
+    let ctx = setup();
+    assert_eq!(ctx.client().get_min_bond(), MIN_BOND);
+}
