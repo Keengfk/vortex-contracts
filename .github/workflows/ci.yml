@@ -37,6 +37,38 @@ jobs:
       - name: Build wasm
         run: cargo build --target wasm32-unknown-unknown --release
 
+  coverage:
+    name: Code coverage
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: intent_settlement
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: intent_settlement
+      - name: Install cargo-tarpaulin
+        run: cargo install cargo-tarpaulin
+      - name: Generate coverage report
+        run: cargo tarpaulin --out Xml --timeout 300 --exclude-files tests
+      - name: Check coverage threshold
+        run: |
+          COVERAGE=$(grep -oP 'line-rate="\K[^"]*' cobertura.xml | head -1)
+          THRESHOLD=0.70
+          if (( $(echo "$COVERAGE < $THRESHOLD" | bc -l) )); then
+            echo "Coverage $COVERAGE is below threshold $THRESHOLD"
+            exit 1
+          fi
+          echo "Coverage $COVERAGE meets minimum threshold of $THRESHOLD"
+      - name: Upload coverage report
+        uses: codecov/codecov-action@v3
+        with:
+          files: ./intent_settlement/cobertura.xml
+          fail_ci_if_error: false
+
   audit:
     name: Dependency audit
     runs-on: ubuntu-latest
