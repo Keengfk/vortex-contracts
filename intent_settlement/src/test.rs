@@ -683,6 +683,54 @@ fn full_lifecycle_submit_accept_fill() {
     assert_eq!(total_volume, FILL);
 }
 
+#[test]
+fn get_stats_reflects_cumulative_totals_across_multiple_fills() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    ctx.register_solver();
+
+    // First fill cycle
+    let id1 = ctx.submit();
+    c.accept_intent(&ctx.solver, &id1);
+    let fee1 = FILL * 5 / 10_000;
+    ctx.dst_admin().mint(&ctx.solver, &(FILL + fee1));
+    c.fill_intent(&ctx.solver, &id1, &FILL);
+
+    let (total_intents, total_volume) = c.get_stats();
+    assert_eq!(total_intents, 1);
+    assert_eq!(total_volume, FILL);
+
+    // Second fill cycle with a different amount
+    let id2 = ctx.submit();
+    c.accept_intent(&ctx.solver, &id2);
+    let fill2 = 200 * 10_000_000;
+    let fee2 = fill2 * 5 / 10_000;
+    ctx.dst_admin().mint(&ctx.solver, &(fill2 + fee2));
+    c.fill_intent(&ctx.solver, &id2, &fill2);
+
+    let (total_intents, total_volume) = c.get_stats();
+    assert_eq!(total_intents, 2);
+    assert_eq!(total_volume, FILL + fill2);
+
+    // Submit a cancelled intent (should increment TotalIntents but not TotalVolume)
+    let id3 = ctx.submit();
+    c.cancel_intent(&ctx.user, &id3);
+
+    let (total_intents, total_volume) = c.get_stats();
+    assert_eq!(total_intents, 3);
+    assert_eq!(total_volume, FILL + fill2);
+
+    // Submit an expired intent (should increment TotalIntents but not TotalVolume)
+    let id4 = ctx.submit();
+    ctx.pass_time(INTENT_EXPIRY + 1);
+    c.expire_intent(&id4);
+
+    let (total_intents, total_volume) = c.get_stats();
+    assert_eq!(total_intents, 4);
+    assert_eq!(total_volume, FILL + fill2);
+}
+
 // ─── Accept guards ──────────────────────────────────────────────────────────────
 
 #[test]
@@ -933,6 +981,22 @@ fn expire_intent_unknown_id_fails() {
     let unknown = BytesN::from_array(&ctx.env, &[0u8; 32]);
     let res = ctx.client().try_expire_intent(&unknown);
     assert_eq!(res, Err(Ok(Error::IntentNotFound.into())));
+}
+
+#[test]
+fn expire_intent_before_deadline_state_unchanged() {
+    let ctx = setup();
+    let c = ctx.client();
+    let id = ctx.submit();
+
+    let initial_state = c.get_intent(&id).unwrap().state;
+    assert!(initial_state == IntentState::Open);
+
+    let res = c.try_expire_intent(&id);
+    assert_eq!(res, Err(Ok(Error::DeadlineNotReached.into())));
+
+    let final_state = c.get_intent(&id).unwrap().state;
+    assert!(final_state == IntentState::Open);
 }
 
 // ─── Storage TTL ────────────────────────────────────────────────────────────────
