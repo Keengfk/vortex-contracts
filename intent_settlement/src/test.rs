@@ -611,6 +611,64 @@ fn dst_allowlist_removal_blocks_previously_allowed_token() {
 }
 
 #[test]
+fn dst_allowlist_toggled_mid_lifecycle_does_not_retroactively_affect_open_intent() {
+    let ctx = setup();
+    let c = ctx.client();
+    // Allowlist disabled by default, so any token is accepted
+    assert!(!c.is_dst_allowlist_enabled());
+    let id = ctx.submit();
+
+    // Enable allowlist without adding the dst_token
+    c.set_dst_allowlist_enabled(&true);
+    assert!(!c.is_dst_token_allowed(&ctx.dst_token));
+
+    // The already-open intent should still be readable/usable
+    let intent = c.get_intent(&id).unwrap();
+    assert!(intent.state == IntentState::Open);
+
+    // But new submissions with non-allowed tokens fail
+    let deadline: Option<u64> = None;
+    let res = c.try_submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "ethereum"),
+        &String::from_str(&ctx.env, "0xabc"),
+        &SRC_AMT,
+        &ctx.dst_token,
+        &MIN_DST,
+        &deadline,
+    );
+    assert_eq!(res, Err(Ok(Error::DstTokenNotAllowed.into())));
+}
+
+#[test]
+fn dst_allowlist_can_be_re_enabled_to_accept_previously_blocked_tokens() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    // Enable allowlist and block the token
+    c.set_dst_allowlist_enabled(&true);
+    assert!(!c.is_dst_token_allowed(&ctx.dst_token));
+
+    let deadline: Option<u64> = None;
+    let res = c.try_submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "ethereum"),
+        &String::from_str(&ctx.env, "0xabc"),
+        &SRC_AMT,
+        &ctx.dst_token,
+        &MIN_DST,
+        &deadline,
+    );
+    assert_eq!(res, Err(Ok(Error::DstTokenNotAllowed.into())));
+
+    // Disable the allowlist
+    c.set_dst_allowlist_enabled(&false);
+
+    // Now submissions with any token succeed again
+    ctx.submit();
+}
+
+#[test]
 fn submit_intent_zero_amount_fails() {
     let ctx = setup();
     let deadline: Option<u64> = None;
