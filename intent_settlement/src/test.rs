@@ -980,6 +980,114 @@ fn state_changing_calls_extend_instance_ttl() {
     assert!(instance_ttl >= crate::INSTANCE_TTL_EXTEND_TO - 1);
 }
 
+// ─── Deadline Boundary Tests ────────────────────────────────────────────────────
+
+#[test]
+fn accept_intent_at_exact_deadline_fails() {
+    // accept_intent uses `now >= intent.deadline`, making the deadline
+    // exclusive. At the boundary `now == deadline`, accept must fail.
+    let ctx = setup();
+    ctx.register_solver();
+    let now = ctx.env.ledger().timestamp();
+    let deadline = now + 100;
+    let id = ctx.client().submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "ethereum"),
+        &String::from_str(&ctx.env, "0xabc"),
+        &SRC_AMT,
+        &ctx.dst_token,
+        &MIN_DST,
+        &Some(deadline),
+    );
+    ctx.pass_time(100); // now == deadline exactly
+    let res = ctx.client().try_accept_intent(&ctx.solver, &id);
+    assert_eq!(res, Err(Ok(Error::IntentExpired.into())));
+}
+
+#[test]
+fn fill_intent_at_exact_deadline_fails() {
+    // fill_intent uses `now >= intent.deadline`, making the fill window
+    // deadline exclusive. At the boundary `now == deadline`, fill must fail.
+    let ctx = setup();
+    ctx.register_solver();
+    let id = ctx.submit();
+    ctx.client().accept_intent(&ctx.solver, &id);
+
+    // accept_intent sets deadline = now + FILL_WINDOW. Advance exactly
+    // FILL_WINDOW seconds so now == deadline.
+    ctx.pass_time(FILL_WINDOW);
+    let fee = FILL * 5 / 10_000;
+    ctx.dst_admin().mint(&ctx.solver, &(FILL + fee));
+    let res = ctx.client().try_fill_intent(&ctx.solver, &id, &FILL);
+    assert_eq!(res, Err(Ok(Error::FillWindowExpired.into())));
+}
+
+#[test]
+fn slash_solver_at_exact_deadline_fails() {
+    // slash_solver uses `now < intent.deadline` to guard against premature
+    // slashing, meaning the slash window opens at the deadline second itself
+    // (the comparison is strict-less-than). At the boundary `now == deadline`,
+    // the guard evaluates to false and slash SUCCEEDS — the deadline second is
+    // included in the slash window, not protected.
+    let ctx = setup();
+    ctx.register_solver();
+    let id = ctx.submit();
+    ctx.client().accept_intent(&ctx.solver, &id);
+
+    ctx.pass_time(FILL_WINDOW); // now == deadline exactly
+                                // Slash succeeds at the boundary because `now < deadline` is false.
+    ctx.client().slash_solver(&id);
+    assert_eq!(
+        ctx.client().get_solver(&ctx.solver).unwrap().fills_failed,
+        1
+    );
+}
+
+#[test]
+fn slash_solver_one_second_after_deadline_succeeds() {
+    // slash_solver becomes valid strictly after the fill-window deadline:
+    // the guard is `now < intent.deadline`, so `now > deadline` allows it.
+    let ctx = setup();
+    ctx.register_solver();
+    let id = ctx.submit();
+    ctx.client().accept_intent(&ctx.solver, &id);
+
+    ctx.pass_time(FILL_WINDOW + 1); // now > deadline
+    ctx.client().slash_solver(&id);
+    assert_eq!(
+        ctx.client().get_solver(&ctx.solver).unwrap().fills_failed,
+        1
+    );
+}
+
+#[test]
+fn expire_intent_at_exact_deadline_fails() {
+    // expire_intent uses `now < intent.deadline` to guard against premature
+    // expiry, meaning the expiry window opens at the deadline second itself
+    // (the comparison is strict-less-than). At the boundary `now == deadline`,
+    // the guard evaluates to false and expire SUCCEEDS — the deadline second is
+    // included in the expiry window, not protected.
+    let ctx = setup();
+    let id = ctx.submit();
+
+    ctx.pass_time(INTENT_EXPIRY); // now == deadline exactly
+                                  // Expire succeeds at the boundary because `now < deadline` is false.
+    ctx.client().expire_intent(&id);
+    assert!(ctx.client().get_intent(&id).unwrap().state == IntentState::Expired);
+}
+
+#[test]
+fn expire_intent_one_second_after_deadline_succeeds() {
+    // expire_intent becomes valid strictly after the intent deadline:
+    // the guard is `now < intent.deadline`, so `now > deadline` allows it.
+    let ctx = setup();
+    let id = ctx.submit();
+
+    ctx.pass_time(INTENT_EXPIRY + 1); // now > deadline
+    ctx.client().expire_intent(&id);
+    assert!(ctx.client().get_intent(&id).unwrap().state == IntentState::Expired);
+}
+
 // ─── Views ──────────────────────────────────────────────────────────────────────
 
 #[test]
