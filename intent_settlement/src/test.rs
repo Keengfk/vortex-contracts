@@ -1458,3 +1458,108 @@ fn expire_intent_emits_correct_event() {
         &Symbol::new(&ctx.env, "intent_expired")
     );
 }
+
+// ─── Full lifecycle: slash/reopen/refill ───────────────────────────────────
+
+#[test]
+fn full_lifecycle_slash_reopen_refill() {
+    // Complete multi-step integration test: submit → accept → advance ledger time
+    // past FILL_WINDOW → slash_solver reopens the intent → second solver accepts
+    // and fills the reopened intent. This exercises time-dependent branches
+    // together rather than in isolation.
+    let ctx = setup();
+    let c = ctx.client();
+
+    // ─── Step 1: User submits intent ───────────────────────────────────────
+    let intent_id = ctx.submit();
+    let intent = c.get_intent(&intent_id).unwrap();
+    assert_eq!(intent.state, IntentState::Open);
+    assert_eq!(intent.solver, None);
+    assert_eq!(intent.filled_at, None);
+
+    // ─── Step 2: First solver registers and accepts ───────────────────────
+    ctx.register_solver();
+    let original_solver = ctx.solver.clone();
+
+    c.accept_intent(&ctx.solver, &intent_id);
+    let intent = c.get_intent(&intent_id).unwrap();
+    assert_eq!(intent.state, IntentState::Accepted);
+    assert_eq!(intent.solver, Some(original_solver.clone()));
+
+    // Solver now has one active intent
+    let solver_record = c.get_solver(&ctx.solver).unwrap();
+    assert_eq!(solver_record.active_intents, 1);
+    assert_eq!(solver_record.fills_failed, 0);
+
+    // ─── Step 3: Advance ledger time past FILL_WINDOW ──────────────────────
+    let bond_before_slash = solver_record.bond_amount;
+    ctx.pass_time(FILL_WINDOW + 1);
+
+    // Intent is still in storage but now outside fill window
+    let intent = c.get_intent(&intent_id).unwrap();
+    assert_eq!(intent.state, IntentState::Accepted);
+
+    // ─── Step 4: Permissionless slash reopens the intent ──────────────────
+    c.slash_solver(&intent_id);
+
+    // Intent is back to Open, ready for a new solver
+    let intent = c.get_intent(&intent_id).unwrap();
+    assert_eq!(intent.state, IntentState::Open);
+    assert_eq!(intent.solver, None);
+    assert_eq!(intent.deadline, ctx.env.ledger().timestamp() + INTENT_EXPIRY);
+
+    // First solver was penalized
+    let original_solver_after = c.get_solver(&original_solver).unwrap();
+    let slash_amount = bond_before_slash / 10;
+    assert_eq!(
+        original_solver_after.bond_amount,
+        bond_before_slash - slash_amount
+    );
+    assert_eq!(original_solver_after.fills_failed, 1);
+    assert_eq!(original_solver_after.active_intents, 0); // obligation cleared by slash
+
+    // Slashed bond sent to fee recipient
+    assert_eq!(ctx.bond().balance(&ctx.fee_recipient), slash_amount);
+
+    // ─── Step 5: Second solver registers and accepts the reopened intent ──
+    let second_solver = Address::generate(&ctx.env);
+    ctx.bond_admin().mint(&second_solver, &BOND);
+    c.register_solver(&second_solver, &BOND);
+
+    c.accept_intent(&second_solver, &intent_id);
+    let intent = c.get_intent(&intent_id).unwrap();
+    assert_eq!(intent.state, IntentState::Accepted);
+    assert_eq!(intent.solver, Some(second_solver.clone()));
+
+    let second_solver_record = c.get_solver(&second_solver).unwrap();
+    assert_eq!(second_solver_record.active_intents, 1);
+    assert_eq!(second_solver_record.fills_completed, 0);
+
+    // ─── Step 6: Second solver fills the intent ──────────────────────────
+    let fee = FILL * 5 / 10_000;
+    ctx.dst_admin().mint(&second_solver, &(FILL + fee));
+    c.fill_intent(&second_solver, &intent_id, &FILL);
+
+    // Intent is now Filled
+    let intent = c.get_intent(&intent_id).unwrap();
+    assert_eq!(intent.state, IntentState::Filled);
+    assert_eq!(intent.solver, Some(second_solver.clone()));
+    assert_eq!(intent.fill_amount, Some(FILL));
+    assert!(intent.filled_at.is_some());
+
+    // Second solver stats updated
+    let second_solver_final = c.get_solver(&second_solver).unwrap();
+    assert_eq!(second_solver_final.fills_completed, 1);
+    assert_eq!(second_solver_final.fills_failed, 0);
+    assert_eq!(second_solver_final.active_intents, 0);
+    assert_eq!(second_solver_final.total_volume, FILL);
+
+    // User received the funds
+    assert_eq!(ctx.dst().balance(&ctx.user), FILL);
+    assert_eq!(ctx.dst().balance(&ctx.fee_recipient), fee);
+
+    // Overall protocol stats: 1 intent submitted, 1 volume filled
+    let (total_intents, total_volume) = c.get_stats();
+    assert_eq!(total_intents, 1);
+    assert_eq!(total_volume, FILL);
+}
