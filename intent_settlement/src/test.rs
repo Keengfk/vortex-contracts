@@ -7,7 +7,7 @@
 
 use crate::{
     Error, IntentSettlement, IntentSettlementClient, IntentState, FILL_WINDOW, INTENT_EXPIRY,
-    MIN_BOND,
+    MIN_BOND, MAX_BATCH_SIZE,
 };
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
@@ -1020,4 +1020,126 @@ fn get_solver_count_tracks_registrations_and_deregistrations() {
     // Deregister second solver — count goes to zero.
     c.deregister_solver(&other);
     assert_eq!(c.get_solver_count(), 0);
+}
+
+// ─── Batch Operations ───────────────────────────────────────────────────────
+
+#[test]
+fn batch_submit_intent_creates_multiple_intents() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    let mut intents = soroban_sdk::Vec::new(&ctx.env);
+    for i in 0..3 {
+        ctx.pass_time(1); // Ensure different timestamps for unique IDs
+        intents.push_back((
+            String::from_str(&ctx.env, "ethereum"),
+            String::from_str(&ctx.env, "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+            SRC_AMT,
+            ctx.dst_token.clone(),
+            MIN_DST,
+            None,
+        ));
+    }
+
+    let ids = c.batch_submit_intent(&ctx.user, &intents);
+
+    assert_eq!(ids.len(), 3);
+    for id in ids {
+        let intent = c.get_intent(&id).unwrap();
+        assert_eq!(intent.state, IntentState::Open);
+        assert_eq!(intent.user, ctx.user);
+    }
+}
+
+#[test]
+fn batch_accept_intent_accepts_multiple_intents() {
+    let ctx = setup();
+    let c = ctx.client();
+    ctx.register_solver();
+
+    // Submit 3 intents
+    let mut intent_ids = soroban_sdk::Vec::new(&ctx.env);
+    for i in 0..3 {
+        ctx.pass_time(1);
+        let id = ctx.submit();
+        intent_ids.push_back(id);
+    }
+
+    // Batch accept all of them
+    c.batch_accept_intent(&ctx.solver, &intent_ids);
+
+    // Verify all are accepted and solver's active_intents is correct
+    for id in intent_ids {
+        let intent = c.get_intent(&id).unwrap();
+        assert_eq!(intent.state, IntentState::Accepted);
+        assert_eq!(intent.solver, Some(ctx.solver.clone()));
+    }
+
+    assert_eq!(c.get_solver(&ctx.solver).unwrap().active_intents, 3);
+}
+
+#[test]
+fn batch_submit_intent_exceeding_max_size_fails() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    // Create batch larger than MAX_BATCH_SIZE
+    let mut intents = soroban_sdk::Vec::new(&ctx.env);
+    for _ in 0..(MAX_BATCH_SIZE + 1) as usize {
+        intents.push_back((
+            String::from_str(&ctx.env, "ethereum"),
+            String::from_str(&ctx.env, "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+            SRC_AMT,
+            ctx.dst_token.clone(),
+            MIN_DST,
+            None,
+        ));
+    }
+
+    let res = c.try_batch_submit_intent(&ctx.user, &intents);
+    assert!(res.is_err());
+}
+
+#[test]
+fn batch_accept_intent_exceeding_max_size_fails() {
+    let ctx = setup();
+    let c = ctx.client();
+    ctx.register_solver();
+
+    // Create batch larger than MAX_BATCH_SIZE
+    let mut intent_ids = soroban_sdk::Vec::new(&ctx.env);
+    for _ in 0..(MAX_BATCH_SIZE + 1) as usize {
+        intent_ids.push_back(BytesN::from_array(&ctx.env, &[0u8; 32]));
+    }
+
+    let res = c.try_batch_accept_intent(&ctx.solver, &intent_ids);
+    assert!(res.is_err());
+}
+
+#[test]
+fn batch_accept_intent_partial_failure_reverts_all() {
+    let ctx = setup();
+    let c = ctx.client();
+    ctx.register_solver();
+
+    // Submit first intent
+    let id1 = ctx.submit();
+
+    // Submit second intent but let it expire
+    ctx.pass_time(1);
+    let id2 = ctx.submit();
+    ctx.pass_time(INTENT_EXPIRY + 1);
+
+    // Try to batch accept both; second one will fail (expired),
+    // causing the entire batch to revert
+    let mut ids = soroban_sdk::Vec::new(&ctx.env);
+    ids.push_back(id1.clone());
+    ids.push_back(id2);
+
+    let res = c.try_batch_accept_intent(&ctx.solver, &ids);
+    assert!(res.is_err());
+
+    // Verify first intent was NOT accepted (batch reverted)
+    assert_eq!(c.get_intent(&id1).unwrap().state, IntentState::Open);
 }

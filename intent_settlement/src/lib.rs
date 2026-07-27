@@ -20,6 +20,7 @@ const INTENT_EXPIRY: u64 = 1800; // 30 minutes
 const FILL_WINDOW: u64 = 300; // 5 minutes to fill after intent accepted
 const MIN_BOND: i128 = 50 * 10_000_000; // 50 USDC minimum solver bond
 const PROTOCOL_FEE_BPS: i128 = 5; // 0.05%
+const MAX_BATCH_SIZE: u32 = 100; // Maximum items per batch operation
 
 // Soroban archives ledger entries that go too long without being touched.
 // Persistent Intent/Solver records get their TTL bumped on every write so
@@ -791,6 +792,56 @@ impl IntentSettlement {
 
         env.events()
             .publish((Symbol::new(&env, "intent_expired"),), intent_id);
+    }
+
+    // ── Batch Operations ──────────────────────────────────────────────────────
+
+    /// Submit multiple intents in a single transaction.
+    /// Processes all intents in the batch; a failure partway through will
+    /// revert the entire batch (Soroban transaction atomicity).
+    /// Bounded by MAX_BATCH_SIZE to prevent resource exhaustion.
+    pub fn batch_submit_intent(
+        env: Env,
+        user: Address,
+        intents: soroban_sdk::Vec<(String, String, i128, Address, i128, Option<u64>)>,
+    ) -> soroban_sdk::Vec<BytesN<32>> {
+        if intents.len() > MAX_BATCH_SIZE as usize {
+            panic_with_error!(&env, Error::ZeroAmount); // No dedicated error; reuse nearest
+        }
+
+        let mut result = soroban_sdk::Vec::new(&env);
+        for (src_chain, src_token, src_amount, dst_token, min_dst_amount, deadline) in intents {
+            let intent_id = Self::submit_intent(
+                env.clone(),
+                user.clone(),
+                src_chain,
+                src_token,
+                src_amount,
+                dst_token,
+                min_dst_amount,
+                deadline,
+            );
+            result.push_back(intent_id);
+        }
+        result
+    }
+
+    /// Accept multiple intents in a single transaction.
+    /// Processes all intents in the batch; a failure partway through will
+    /// revert the entire batch (Soroban transaction atomicity).
+    /// Bounded by MAX_BATCH_SIZE to prevent resource exhaustion.
+    pub fn batch_accept_intent(
+        env: Env,
+        solver: Address,
+        intent_ids: soroban_sdk::Vec<BytesN<32>>,
+    ) {
+        if intent_ids.len() > MAX_BATCH_SIZE as usize {
+            panic_with_error!(&env, Error::ZeroAmount); // No dedicated error; reuse nearest
+        }
+
+        for intent_id in intent_ids {
+            Self::accept_intent(env.clone(), solver.clone(), intent_id);
+        }
     }
 
     // ── Views ─────────────────────────────────────────────────────────────────
