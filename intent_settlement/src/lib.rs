@@ -219,6 +219,10 @@ impl IntentSettlement {
         if env.storage().instance().has(&DataKey::Admin) {
             panic_with_error!(&env, Error::AlreadyInitialized);
         }
+        // Auth audit: require_auth() is correct here. `admin` must sign the
+        // initialization tx to prove ownership of the address being recorded as
+        // admin. require_auth_for_args is not needed because there are no
+        // separate per-argument capabilities to scope — the signer IS the admin.
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage()
@@ -259,6 +263,9 @@ impl IntentSettlement {
             .instance()
             .get(&DataKey::Admin)
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        // Auth audit: require_auth() is correct. The stored admin address must
+        // sign. require_auth_for_args would add no security here — there's no
+        // meaningful sub-scope within "being admin".
         admin.require_auth();
 
         env.storage()
@@ -307,6 +314,11 @@ impl IntentSettlement {
             .instance()
             .get(&DataKey::Admin)
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        // Auth audit: require_auth() is correct on both the outgoing and
+        // incoming admin. Requiring both prevents accidentally handing the role
+        // to a typo'd or uncontrolled address. require_auth_for_args is not
+        // applicable — both signers ARE the principals, there's nothing to
+        // sub-scope.
         admin.require_auth();
         new_admin.require_auth();
 
@@ -568,6 +580,11 @@ impl IntentSettlement {
     /// with any positive amount -- the minimum is enforced on the resulting
     /// total, not on each individual deposit.
     pub fn register_solver(env: Env, solver: Address, bond_amount: i128) {
+        // Auth audit: require_auth() is correct. The solver must sign to
+        // consent to locking their own funds as bond. require_auth_for_args
+        // could theoretically scope to (solver, bond_amount) but adding that
+        // scope provides no real benefit — the solver is the tx signer and
+        // the bond amount is constrained by their token balance anyway.
         solver.require_auth();
         Self::require_not_paused(&env);
         Self::bump_instance_ttl(&env);
@@ -641,6 +658,9 @@ impl IntentSettlement {
     }
 
     pub fn deregister_solver(env: Env, solver: Address) {
+        // Auth audit: require_auth() is correct. Only the solver themselves
+        // may deregister and trigger bond return. require_auth_for_args is not
+        // useful — the sole action is "deregister this exact address".
         solver.require_auth();
         Self::require_not_paused(&env);
         Self::bump_instance_ttl(&env);
@@ -693,6 +713,10 @@ impl IntentSettlement {
     /// The remaining bond must still clear MIN_BOND -- to go below that,
     /// use deregister_solver instead (which also requires no active intents).
     pub fn withdraw_bond(env: Env, solver: Address, amount: i128) {
+        // Auth audit: require_auth() is correct. Only the solver may withdraw
+        // their own bond. require_auth_for_args could scope to the withdrawal
+        // amount, but the solver signature authorises the full withdrawal path;
+        // amount is validated against their stored balance immediately after.
         solver.require_auth();
         Self::require_not_paused(&env);
         Self::bump_instance_ttl(&env);
@@ -746,6 +770,12 @@ impl IntentSettlement {
         min_dst_amount: i128,
         deadline: Option<u64>,
     ) -> BytesN<32> {
+        // Auth audit: require_auth() is correct. The user must sign to assert
+        // ownership of the address receiving output tokens (dst). If a third-party
+        // contract were ever to call submit_intent on a user's behalf, switching to
+        // require_auth_for_args scoped to (user, dst_token, min_dst_amount) would
+        // limit the scope of delegated authorisation — noted as a future hardening
+        // opportunity if composable intent submission is added.
         user.require_auth();
         Self::require_not_paused(&env);
         Self::bump_instance_ttl(&env);
@@ -857,6 +887,11 @@ impl IntentSettlement {
 
     /// Solver claims an intent (exclusive fill right for FILL_WINDOW seconds)
     pub fn accept_intent(env: Env, solver: Address, intent_id: BytesN<32>) {
+        // Auth audit: require_auth() is correct. The solver must sign to
+        // voluntarily take on the fill obligation and bond risk associated with
+        // this intent. require_auth_for_args scoped to intent_id could prevent a
+        // malicious invoker contract from accepting an unintended intent on the
+        // solver's behalf; noted as a future hardening opportunity.
         solver.require_auth();
         Self::require_not_paused(&env);
         Self::bump_instance_ttl(&env);
@@ -926,6 +961,13 @@ impl IntentSettlement {
     /// The protocol fee is taken on each individual fill so the fee accounting
     /// stays consistent regardless of how many fills it takes.
     pub fn fill_intent(env: Env, solver: Address, intent_id: BytesN<32>, fill_amount: i128) {
+        // Auth audit: require_auth() is correct. The solver must sign to
+        // authorise the token transfer from their address to the user and fee
+        // recipient. This is the highest-value call site: the solver authorises
+        // a token transfer, so the auth is load-bearing. require_auth_for_args
+        // scoped to (solver, intent_id, fill_amount) would meaningfully tighten
+        // the scope if a delegated-execution pattern is ever introduced — noted
+        // as the strongest candidate for future hardening.
         solver.require_auth();
         Self::require_not_paused(&env);
         Self::bump_instance_ttl(&env);
@@ -1074,6 +1116,11 @@ impl IntentSettlement {
 
     /// User can cancel an Open intent (not yet accepted)
     pub fn cancel_intent(env: Env, user: Address, intent_id: BytesN<32>) {
+        // Auth audit: require_auth() is correct. Only the intent owner may
+        // cancel. An additional ownership check (`intent.user != user`) follows
+        // immediately after the intent is loaded, providing defence-in-depth.
+        // require_auth_for_args is not needed here — the action is simply
+        // "cancel intent for this user".
         user.require_auth();
         Self::bump_instance_ttl(&env);
 
@@ -1375,6 +1422,11 @@ impl IntentSettlement {
             .instance()
             .get(&DataKey::Admin)
             .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
+        // Auth audit: require_auth() is correct. All callers of require_admin
+        // are admin-only functions (pause, unpause, add/remove_allowed_dst_token,
+        // set_dst_allowlist_enabled). The admin is a single address with uniform
+        // authority over these functions; require_auth_for_args would add no
+        // meaningful scope reduction.
         admin.require_auth();
     }
 
