@@ -1231,6 +1231,13 @@ fn get_bond_token_returns_configured_token() {
     assert_eq!(ctx.client().get_bond_token(), Some(ctx.bond_token.clone()));
 }
 
+// ─── #29: slash_solver ordering ─────────────────────────────────────────────────
+
+/// Calling slash_solver twice on the same intent_id must fail on the second
+/// call with IntentNotAccepted — the first call flips the state to Open before
+/// the token transfer, so the second call hits the guard immediately.
+#[test]
+fn double_slash_second_call_rejected() {
 // ─── Issue #31: fee overflow boundary ────────────────────────────────────────────
 
 /// #31: fill_amount just above i128::MAX / PROTOCOL_FEE_BPS (5) overflows the
@@ -1246,6 +1253,126 @@ fn fill_intent_fee_overflow_returns_error() {
     let id = ctx.submit();
     c.accept_intent(&ctx.solver, &id);
 
+    ctx.pass_time(FILL_WINDOW + 1);
+
+    // First slash succeeds.
+    c.slash_solver(&id);
+    let intent = c.get_intent(&id).unwrap();
+    assert!(intent.state == IntentState::Open);
+
+    // Second slash on the same id must be rejected: the intent is now Open,
+    // not Accepted.
+    let res = c.try_slash_solver(&id);
+    assert_eq!(res, Err(Ok(crate::Error::IntentNotAccepted.into())));
+}
+
+// ─── #47: reputation score ───────────────────────────────────────────────────────
+
+use crate::{IntentSettlement, SolverRecord};
+
+/// Helper: build a SolverRecord with just the fields that affect scoring.
+fn make_record(
+    env: &soroban_sdk::Env,
+    solver: &soroban_sdk::Address,
+    fills_completed: u32,
+    fills_failed: u32,
+    total_volume: i128,
+) -> SolverRecord {
+    SolverRecord {
+        address: solver.clone(),
+        bond_amount: MIN_BOND,
+        fills_completed,
+        fills_failed,
+        total_volume,
+        is_active: true,
+        registered_at: env.ledger().timestamp(),
+        active_intents: 0,
+    }
+}
+
+/// A solver that has never attempted any fill has score 0.
+#[test]
+fn reputation_score_zero_fills_returns_zero() {
+    let ctx = setup();
+    let r = make_record(&ctx.env, &ctx.solver, 0, 0, 0);
+    assert_eq!(IntentSettlement::compute_reputation_score(&r), 0);
+}
+
+/// A solver that has only failures has score 0 regardless of volume.
+#[test]
+fn reputation_score_all_failures_returns_zero() {
+    let ctx = setup();
+    let r = make_record(&ctx.env, &ctx.solver, 0, 50, 0);
+    assert_eq!(IntentSettlement::compute_reputation_score(&r), 0);
+}
+
+/// A perfect solver with no volume scores 9_000 (= 90% × 10_000 bps).
+#[test]
+fn reputation_score_perfect_rate_no_volume_is_nine_thousand() {
+    let ctx = setup();
+    let r = make_record(&ctx.env, &ctx.solver, 100, 0, 0);
+    // At zero volume, decay_bps ≈ 10_000, multiplier = 9_000.
+    let score = IntentSettlement::compute_reputation_score(&r);
+    assert_eq!(score, 9_000);
+}
+
+/// A perfect solver with very high volume scores close to (but below) 10_000.
+#[test]
+fn reputation_score_perfect_rate_high_volume_approaches_ten_thousand() {
+    let ctx = setup();
+    // volume = 100 × VOLUME_SCALE makes decay negligible.
+    let high_vol: i128 = 100 * 1_000 * 100 * 10_000_000;
+    let r = make_record(&ctx.env, &ctx.solver, 1_000, 0, high_vol);
+    let score = IntentSettlement::compute_reputation_score(&r);
+    // Must be strictly greater than 9_000 and less than 10_000.
+    assert!(score > 9_000, "score {score} should be > 9_000");
+    assert!(score < 10_000, "score {score} should be < 10_000");
+}
+
+/// A mixed solver (some failures) scores strictly less than a perfect solver
+/// with the same volume.
+#[test]
+fn reputation_score_partial_failures_lower_than_perfect() {
+    let ctx = setup();
+    let vol = 100 * 10_000_000i128;
+    let perfect = make_record(&ctx.env, &ctx.solver, 90, 0, vol);
+    let mixed = make_record(&ctx.env, &ctx.solver, 90, 10, vol);
+    assert!(
+        IntentSettlement::compute_reputation_score(&perfect)
+            > IntentSettlement::compute_reputation_score(&mixed)
+    );
+}
+
+/// get_reputation_score returns None for an unregistered solver.
+#[test]
+fn get_reputation_score_unregistered_returns_none() {
+    let ctx = setup();
+    let stranger = soroban_sdk::Address::generate(&ctx.env);
+    assert!(ctx.client().get_reputation_score(&stranger).is_none());
+}
+
+/// get_reputation_score returns Some(0) for a registered but never-filled solver.
+#[test]
+fn get_reputation_score_registered_no_fills_returns_zero() {
+    let ctx = setup();
+    ctx.register_solver();
+    assert_eq!(ctx.client().get_reputation_score(&ctx.solver), Some(0));
+}
+
+/// After a successful fill the score should be non-zero.
+#[test]
+fn get_reputation_score_after_fill_is_nonzero() {
+    let ctx = setup();
+    let c = ctx.client();
+    ctx.register_solver();
+    let id = ctx.submit();
+    c.accept_intent(&ctx.solver, &id);
+    let fee = FILL * 5 / 10_000;
+    ctx.dst_admin().mint(&ctx.solver, &(FILL + fee));
+    c.fill_intent(&ctx.solver, &id, &FILL);
+
+    let score = c.get_reputation_score(&ctx.solver).unwrap();
+    assert!(score > 0, "score after fill should be > 0");
     // Smallest fill_amount that overflows: (i128::MAX / 5) + 1.
     // We satisfy min_dst_amount by keeping fill_amount >> MIN_DST.
     let overflow_fill: i128 = i128::MAX / 5 + 1;
