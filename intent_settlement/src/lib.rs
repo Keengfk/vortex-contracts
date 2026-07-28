@@ -51,6 +51,8 @@ pub enum DataKey {
     Paused,
     AllowedDstToken(Address), // dst_token -> present if allowed
     DstAllowlistEnabled,
+    AllowedSrcChain(String), // src_chain name -> present if allowed
+    SrcChainAllowlistEnabled,
 }
 
 // ─── Data Structs ─────────────────────────────────────────────────────────────
@@ -140,6 +142,8 @@ pub enum Error {
     FeeOverflow = 23,
     /// #33: the address passed to add_allowed_dst_token doesn't implement SEP-41
     InvalidTokenInterface = 24,
+    SrcChainNotAllowed = 22,
+    RescueProtectedToken = 23,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -306,12 +310,76 @@ impl IntentSettlement {
             .unwrap_or(false)
     }
 
+    // ── Source Chain Allowlist ────────────────────────────────────────────────
+
+    /// Admin-only: add a chain name to the src_chain allowlist.
+    ///
+    /// Issue #34: submit_intent accepted src_chain as free-text with zero
+    /// validation, so a typo ("etherium") or unsupported name would create an
+    /// intent that solvers can never match. This allowlist mirrors the
+    /// AllowedDstToken pattern: an admin populates the list, then enables
+    /// enforcement via set_src_chain_allowlist_enabled.
+    pub fn add_allowed_src_chain(env: Env, chain: String) {
+        Self::require_admin(&env);
+        env.storage()
+            .instance()
+            .set(&DataKey::AllowedSrcChain(chain.clone()), &true);
+        env.events()
+            .publish((Symbol::new(&env, "src_chain_allowed"),), chain);
+    }
+
+    /// Admin-only: remove a chain name from the src_chain allowlist.
+    pub fn remove_allowed_src_chain(env: Env, chain: String) {
+        Self::require_admin(&env);
+        env.storage()
+            .instance()
+            .remove(&DataKey::AllowedSrcChain(chain.clone()));
+        env.events()
+            .publish((Symbol::new(&env, "src_chain_disallowed"),), chain);
+    }
+
+    /// Returns true if `chain` is on the allowlist.
+    pub fn is_src_chain_allowed(env: Env, chain: String) -> bool {
+        env.storage()
+            .instance()
+            .has(&DataKey::AllowedSrcChain(chain))
+    }
+
+    /// Admin-only: toggle src_chain validation in submit_intent.
+    ///
+    /// Defaults to false so existing deployments keep working until an admin
+    /// has populated the list and is ready to enforce it. Set to true before
+    /// mainnet launch after calling add_allowed_src_chain for every chain the
+    /// protocol supports.
+    pub fn set_src_chain_allowlist_enabled(env: Env, enabled: bool) {
+        Self::require_admin(&env);
+        env.storage()
+            .instance()
+            .set(&DataKey::SrcChainAllowlistEnabled, &enabled);
+    }
+
+    /// Whether src_chain validation is currently active.
+    pub fn is_src_chain_allowlist_enabled(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::SrcChainAllowlistEnabled)
+            .unwrap_or(false)
+    }
+
     // ── Pause Control ─────────────────────────────────────────────────────────
 
     /// Admin-only: halt new intent submission, acceptance, and fills for
     /// incident response. slash_solver stays permissionless throughout, so a
     /// solver already holding an Accepted intent can't dodge accountability
     /// by waiting out the pause.
+    ///
+    /// Issue #36 — pause scope decision: register_solver, deregister_solver,
+    /// and withdraw_bond are also gated here. During a live incident an admin
+    /// may need to freeze the entire protocol state to investigate; allowing
+    /// solvers to withdraw their bonds mid-incident would let them shed
+    /// collateral exactly when the protocol most needs it as a backstop.
+    /// cancel_intent is intentionally left open so users can always reclaim
+    /// their Open intents.
     pub fn pause(env: Env) {
         Self::require_admin(&env);
         env.storage().instance().set(&DataKey::Paused, &true);
@@ -325,12 +393,50 @@ impl IntentSettlement {
         env.events().publish((Symbol::new(&env, "paused"),), false);
     }
 
-    /// Whether submit_intent/accept_intent/fill_intent are currently halted.
+    /// Whether submit_intent/accept_intent/fill_intent and solver bond
+    /// management are currently halted.
     pub fn is_paused(env: Env) -> bool {
         env.storage()
             .instance()
             .get(&DataKey::Paused)
             .unwrap_or(false)
+    }
+
+    // ── Token Rescue ──────────────────────────────────────────────────────────
+
+    /// Admin-only: recover SEP-41 tokens accidentally sent to the contract.
+    ///
+    /// Issue #35 — trust model: rescue is restricted to tokens that are
+    /// neither the bond_token nor any token currently referenced by an active
+    /// (Accepted) intent as its dst_token. This prevents the rescue path from
+    /// being misused to drain live solver collateral or in-flight intent
+    /// output from under active protocol participants.
+    ///
+    /// If you need to move bond_token you must wait until all active intents
+    /// have settled (filled, slashed, or cancelled), then handle any
+    /// accounting off-chain.
+    pub fn rescue_tokens(env: Env, token: Address, to: Address, amount: i128) {
+        Self::require_admin(&env);
+
+        if amount <= 0 {
+            panic_with_error!(&env, Error::ZeroAmount);
+        }
+
+        // Refuse to rescue the protocol's own bond/collateral token.
+        let bond_token: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::BondToken)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        if token == bond_token {
+            panic_with_error!(&env, Error::RescueProtectedToken);
+        }
+
+        let client = token::Client::new(&env, &token);
+        client.transfer(&env.current_contract_address(), &to, &amount);
+
+        env.events()
+            .publish((Symbol::new(&env, "tokens_rescued"), to), (token, amount));
     }
 
     // ── Solver Management ─────────────────────────────────────────────────────
@@ -340,6 +446,7 @@ impl IntentSettlement {
     /// total, not on each individual deposit.
     pub fn register_solver(env: Env, solver: Address, bond_amount: i128) {
         solver.require_auth();
+        Self::require_not_paused(&env);
         Self::bump_instance_ttl(&env);
 
         if bond_amount <= 0 {
@@ -404,6 +511,7 @@ impl IntentSettlement {
 
     pub fn deregister_solver(env: Env, solver: Address) {
         solver.require_auth();
+        Self::require_not_paused(&env);
         Self::bump_instance_ttl(&env);
 
         let record: SolverRecord = env
@@ -451,6 +559,7 @@ impl IntentSettlement {
     /// use deregister_solver instead (which also requires no active intents).
     pub fn withdraw_bond(env: Env, solver: Address, amount: i128) {
         solver.require_auth();
+        Self::require_not_paused(&env);
         Self::bump_instance_ttl(&env);
 
         if amount <= 0 {
@@ -513,6 +622,13 @@ impl IntentSettlement {
             && !Self::is_dst_token_allowed(env.clone(), dst_token.clone())
         {
             panic_with_error!(&env, Error::DstTokenNotAllowed);
+        }
+
+        // #34 — validate src_chain when the allowlist is enabled.
+        if Self::is_src_chain_allowlist_enabled(env.clone())
+            && !Self::is_src_chain_allowed(env.clone(), src_chain.clone())
+        {
+            panic_with_error!(&env, Error::SrcChainNotAllowed);
         }
 
         let now = env.ledger().timestamp();
