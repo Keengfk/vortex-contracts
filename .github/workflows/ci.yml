@@ -53,4 +53,34 @@ jobs:
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
       - name: Audit dependencies
-        run: cargo audit
+        id: audit
+        # Run cargo-audit and capture output regardless of exit code so we can
+        # always write to the step summary before propagating the failure.
+        run: |
+          set +e
+          AUDIT_OUTPUT=$(cargo audit --color never 2>&1)
+          AUDIT_EXIT=$?
+          set -e
+
+          # ── GitHub Actions step summary ──────────────────────────────────
+          {
+            if [ $AUDIT_EXIT -eq 0 ]; then
+              echo "## ✅ Dependency Audit — Clean"
+              echo ""
+              echo "No advisories found in the RustSec database."
+            else
+              echo "## ❌ Dependency Audit — Advisories Found"
+              echo ""
+              echo "One or more advisories were reported by \`cargo audit\`."
+              echo "Review the findings below and update or patch the affected crates."
+            fi
+            echo ""
+            echo "### cargo audit output"
+            echo ""
+            echo '```'
+            echo "$AUDIT_OUTPUT"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Propagate the original exit code so the job still fails on findings.
+          exit $AUDIT_EXIT
