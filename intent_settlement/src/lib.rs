@@ -58,17 +58,49 @@ const INSTANCE_TTL_EXTEND_TO: u32 = DAY_IN_LEDGERS * 60;
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
+    /// **Instance storage.** The admin `Address` that may call privileged
+    /// functions (`pause`, `unpause`, `set_fee_recipient`, `transfer_admin`,
+    /// `add_allowed_dst_token`, etc.).  Written once by `initialize` and
+    /// rotated by `transfer_admin`.  Lives as long as the contract instance.
     Admin,
+
+    /// **Instance storage.** The `Address` that receives protocol fees
+    /// (collected in `fill_intent`) and slashed bond amounts (collected in
+    /// `slash_solver`).  Written by `initialize` and updated by
+    /// `set_fee_recipient`.  Lives as long as the contract instance.
     FeeRecipient,
     PendingFeeRecipient, // proposed-but-not-yet-accepted new fee recipient (issue #30)
     BondToken,          // USDC address for bonds
     Intent(BytesN<32>), // intent_id -> IntentRecord
     Solver(Address),    // address -> SolverRecord
     TotalIntents,
+
+    /// **Instance storage.** Cumulative `dst_token` volume (`i128`) across
+    /// all successfully filled intents.  Incremented by `fill_intent`.
     TotalVolume,
+
+    /// **Instance storage.** Count of currently registered solvers (`u32`).
+    /// Incremented by `register_solver` on first registration, decremented
+    /// by `deregister_solver`.
     TotalSolvers,
+
+    /// **Instance storage.** Boolean flag (`true` = paused).  Set by
+    /// `pause()` and cleared by `unpause()`.  When `true`,
+    /// `submit_intent`, `accept_intent`, and `fill_intent` reject all
+    /// calls.  Absent until first `pause()` call (defaults to `false`).
     Paused,
-    AllowedDstToken(Address), // dst_token -> present if allowed
+
+    /// **Instance storage.** Presence-flag (value `true`) indicating that
+    /// `token` is on the allowed-destination list.  Added by
+    /// `add_allowed_dst_token` and removed by `remove_allowed_dst_token`.
+    /// Only checked by `submit_intent` when `DstAllowlistEnabled` is `true`.
+    AllowedDstToken(Address),
+
+    /// **Instance storage.** Boolean toggle (`true` = enforced).  Set via
+    /// `set_dst_allowlist_enabled`.  When `false` (the default), the
+    /// `AllowedDstToken` list is populated but not enforced by
+    /// `submit_intent`, letting an admin pre-populate the list before
+    /// switching enforcement on.
     DstAllowlistEnabled,
     UserNonce(Address),       // per-user submit counter to widen intent_id preimage
     AllowedSrcChain(String), // src_chain name -> present if allowed
@@ -185,26 +217,107 @@ pub struct BestBidRecord {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum Error {
+    /// `initialize` was called on a contract that already has an `Admin` key
+    /// in instance storage. Raised exclusively by `initialize`.
     AlreadyInitialized = 1,
+
+    /// A privileged operation was attempted by a caller who is not the
+    /// required authority.  Raised by `fill_intent` when the caller is not
+    /// the solver that accepted the intent, and by `cancel_intent` when the
+    /// caller is not the intent's owner.
     Unauthorized = 2,
+
+    /// The supplied `intent_id` has no corresponding `IntentRecord` in
+    /// persistent storage.  Raised by `accept_intent`, `fill_intent`,
+    /// `cancel_intent`, `slash_solver`, and `expire_intent`.
     IntentNotFound = 3,
+
+    /// The intent's `state` is not `Open` at a point where `Open` is
+    /// required.  Raised by `cancel_intent` (non-`Open`/non-`Accepted`
+    /// guard) and by `expire_intent` (which only operates on `Open` intents).
     IntentNotOpen = 4,
+
+    /// The current ledger timestamp has reached or passed the intent's
+    /// `deadline` when a solver tries to accept it via `accept_intent`.
+    /// The intent's state is lazily updated to `Expired` before the panic.
     IntentExpired = 5,
+
+    /// `fill_intent` or `slash_solver` requires the intent to be in state
+    /// `Accepted`, but it is in a different terminal or intermediate state.
+    /// Also raised by `slash_solver` when `intent.state != Accepted`.
     IntentNotAccepted = 6,
+
+    /// An operation that requires a registered solver (e.g. `deregister_solver`,
+    /// `withdraw_bond`, `accept_intent`) was called for an address that has no
+    /// `SolverRecord` in persistent storage.
     SolverNotRegistered = 7,
+
+    /// `register_solver` was called with a `bond_amount` that, when added to
+    /// any existing bond, does not reach `MIN_BOND` (500_000_000 stroops /
+    /// 50 USDC).  Also raised by `withdraw_bond` when the post-withdrawal
+    /// balance would fall below `MIN_BOND`.
     SolverBondTooLow = 8,
+
+    /// `fill_intent` was called with a `fill_amount` less than the intent's
+    /// `min_dst_amount`.  Raised only in `fill_intent`.
     InsufficientOutput = 9,
+
+    /// `fill_intent` was called after the intent's `deadline` (i.e. the fill
+    /// window that starts when the solver calls `accept_intent` and lasts
+    /// `FILL_WINDOW` seconds) has already elapsed.  Also (confusingly) used
+    /// in `slash_solver` as a guard label when the fill window has *not yet*
+    /// expired — the intent cannot be slashed before its deadline.
     FillWindowExpired = 10,
+
+    /// `cancel_intent` was called on an intent in state `Accepted`.  Users
+    /// may only cancel `Open` intents; once a solver has accepted, the
+    /// `slash_solver` path must be used if the solver fails to fill.
     CannotCancelAccepted = 11,
+
+    /// `accept_intent` was called for a solver whose `is_active` flag is
+    /// `false` (set when the bond falls below `MIN_BOND` after a slash, or
+    /// after calling `deregister_solver`).
     SolverInactive = 12,
+
+    /// A numeric input that must be strictly positive was zero or negative.
+    /// Raised by `submit_intent` (`src_amount` or `min_dst_amount ≤ 0`) and
+    /// by `register_solver` / `withdraw_bond` (`bond_amount ≤ 0`).
     ZeroAmount = 13,
+
+    /// `submit_intent` was called with a `deadline` that is already in the
+    /// past (i.e. `deadline ≤ env.ledger().timestamp()`).
     InvalidDeadline = 14,
+
+    /// `fill_intent` was called on an intent that is already in state
+    /// `Filled`.
     IntentAlreadyFilled = 15,
+
+    /// An operation that requires the contract to be initialized (i.e. needs
+    /// `Admin` in instance storage) was called before `initialize`.  Raised
+    /// by `require_admin` and by `set_fee_recipient` / `transfer_admin`.
     NotInitialized = 16,
+
+    /// `deregister_solver` was called while the solver's `active_intents`
+    /// counter is greater than zero, meaning at least one intent is currently
+    /// in state `Accepted` by this solver.  The solver must wait for those
+    /// intents to reach a terminal state first.
     SolverHasActiveIntents = 17,
+
+    /// `submit_intent`, `accept_intent`, or `fill_intent` was called while
+    /// the contract's `Paused` flag is `true`.  Raised by
+    /// `require_not_paused`.
     ContractPaused = 18,
+
+    /// `expire_intent` was called before the intent's `deadline` has been
+    /// reached (i.e. `env.ledger().timestamp() < intent.deadline`).
     DeadlineNotReached = 19,
+
+    /// `withdraw_bond` was called with an `amount` greater than the solver's
+    /// current `bond_amount`.
     InsufficientBond = 20,
+
+    /// `submit_intent` was called with a `dst_token` that is not present in
+    /// the `AllowedDstToken` allowlist while `DstAllowlistEnabled` is `true`.
     DstTokenNotAllowed = 21,
     IntentAlreadyExists = 22,
     /// #30: no pending fee-recipient proposal to accept
