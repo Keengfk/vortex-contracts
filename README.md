@@ -28,6 +28,8 @@ Core protocol logic (`intent_settlement/src/lib.rs`):
 - `set_fee_recipient()` / `transfer_admin()` — admin key management
 - `pause()` / `unpause()` — admin-only incident response
 - `add_allowed_dst_token()` / `remove_allowed_dst_token()` / `set_dst_allowlist_enabled()` — optional dst_token allowlist
+- `add_allowed_src_chain()` / `remove_allowed_src_chain()` / `set_src_chain_allowlist_enabled()` — optional src_chain allowlist (#34)
+- `rescue_tokens()` — admin-only recovery of non-bond tokens accidentally sent to the contract (#35)
 
 #### Usage examples
 
@@ -167,6 +169,36 @@ Settlement relies on two primitives:
 2. **Fill-window enforcement** — once a solver accepts, the intent is locked for
    5 minutes. If they fail to fill, the intent reverts to `open` and is
    re-auctioned, and the bond is slashed permissionlessly via `slash_solver()`.
+
+### Pause scope (issue #36)
+
+`pause()` halts `submit_intent`, `accept_intent`, `fill_intent`, **and** the
+solver bond management functions (`register_solver`, `deregister_solver`,
+`withdraw_bond`). The rationale:
+
+- During a live incident an admin needs to freeze the full protocol state to
+  investigate. Allowing solvers to withdraw bonds while paused would let them
+  shed collateral exactly when the protocol needs it most as a backstop.
+- `slash_solver()` remains **permissionless and unpauseable** — a solver who
+  already accepted an intent cannot dodge accountability by waiting out the
+  pause.
+- `cancel_intent()` remains **open during a pause** — users should always be
+  able to reclaim their Open intents without needing admin cooperation.
+
+### Destination token allowlist default (issue #37)
+
+`is_dst_allowlist_enabled` defaults to **`false`** on a fresh deployment,
+meaning `submit_intent` accepts any `dst_token` address until an admin opts in.
+
+**Pre-launch action required:** before going live on mainnet, call
+`add_allowed_dst_token()` for every supported output token, then call
+`set_dst_allowlist_enabled(true)` to enforce validation. This prevents users
+from accidentally targeting an unsupported or malicious token contract.
+
+The same pattern applies to the **source-chain allowlist** (`is_src_chain_allowlist_enabled`,
+also off by default). Call `add_allowed_src_chain()` for every supported source
+chain (e.g. `"ethereum"`, `"base"`, `"polygon"`), then enable enforcement with
+`set_src_chain_allowlist_enabled(true)`.
 
 To report a vulnerability, see the org
 [SECURITY.md](https://github.com/vortex-protocol/.github/blob/main/SECURITY.md).
