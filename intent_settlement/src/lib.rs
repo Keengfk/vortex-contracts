@@ -23,6 +23,11 @@ const INTENT_EXPIRY: u64 = 1800; // 30 minutes
 const FILL_WINDOW: u64 = 300; // 5 minutes to fill after intent accepted
 const MIN_BOND: i128 = 50 * 10_000_000; // 50 USDC minimum solver bond
 const PROTOCOL_FEE_BPS: i128 = 5; // 0.05%
+/// Duration of the competitive bid-collection window when bid-window mode is
+/// enabled.  Solvers have this many seconds after `submit_intent` to submit
+/// competing quotes via `bid_intent`; the best quote wins once the window
+/// closes.
+const BID_WINDOW: u64 = 120; // 2 minutes
 
 // Soroban archives ledger entries that go too long without being touched.
 // Persistent Intent/Solver records get their TTL bumped on every write so
@@ -122,6 +127,16 @@ pub struct SolverRecord {
     /// Number of intents currently Accepted by this solver (not yet filled or slashed).
     /// Bond stays locked behind these obligations, so it must be zero before deregistration.
     pub active_intents: u32,
+}
+
+/// Tracks the leading bid for an intent that is in the `Bidding` state.
+/// Only the current best bid is kept — a new submission replaces it only
+/// if it quotes a strictly higher `quoted_dst_amount`.
+#[contracttype]
+#[derive(Clone)]
+pub struct BestBidRecord {
+    pub solver: Address,
+    pub quoted_dst_amount: i128,
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -699,9 +714,25 @@ impl IntentSettlement {
             dst_token,
             min_dst_amount,
             solver: None,
-            state: IntentState::Open,
+            // When bid-window mode is active, the intent opens in Bidding state
+            // so solvers can compete before one is assigned exclusive fill rights.
+            // The bid-window deadline is BID_WINDOW seconds from now, not the
+            // full intent expiry — settle_bids extends it to FILL_WINDOW once a
+            // winner is picked.  The original expiry is stored separately in
+            // deadline and reset after settlement.
+            state: if Self::is_bid_window_enabled(env.clone()) {
+                IntentState::Bidding
+            } else {
+                IntentState::Open
+            },
             created_at: now,
-            deadline: expiry,
+            // In bidding mode, deadline tracks the end of the bid window.
+            // In first-accept-wins mode, deadline tracks the intent expiry.
+            deadline: if Self::is_bid_window_enabled(env.clone()) {
+                now + BID_WINDOW
+            } else {
+                expiry
+            },
             filled_at: None,
             fill_amount: None,
             total_filled: 0,
