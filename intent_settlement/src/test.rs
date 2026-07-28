@@ -409,6 +409,35 @@ fn withdraw_bond_below_min_bond_fails() {
 }
 
 #[test]
+fn withdraw_bond_leaving_exactly_min_bond_succeeds() {
+    let ctx = setup();
+    let c = ctx.client();
+    ctx.register_solver();
+
+    // Withdraw exactly the amount that leaves MIN_BOND remaining
+    let withdraw_amount = BOND - MIN_BOND;
+    c.withdraw_bond(&ctx.solver, &withdraw_amount);
+
+    let record = c.get_solver(&ctx.solver).unwrap();
+    assert_eq!(record.bond_amount, MIN_BOND);
+    assert!(record.is_active);
+    assert_eq!(ctx.bond().balance(&ctx.solver), withdraw_amount);
+    assert_eq!(ctx.bond().balance(&ctx.contract_id), MIN_BOND);
+}
+
+#[test]
+fn withdraw_bond_below_exact_min_bond_fails() {
+    let ctx = setup();
+    let c = ctx.client();
+    ctx.register_solver();
+
+    // Attempt to leave one unit less than MIN_BOND
+    let too_much = BOND - MIN_BOND + 1;
+    let res = c.try_withdraw_bond(&ctx.solver, &too_much);
+    assert_eq!(res, Err(Ok(Error::SolverBondTooLow.into())));
+}
+
+#[test]
 fn withdraw_bond_more_than_balance_fails() {
     let ctx = setup();
     let c = ctx.client();
@@ -845,6 +874,34 @@ fn cannot_accept_already_accepted_intent() {
 
     let res = ctx.client().try_accept_intent(&solver2, &id);
     assert_eq!(res, Err(Ok(Error::IntentNotOpen.into())));
+}
+
+#[test]
+fn two_solver_race_on_same_intent_id() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    // Register two solvers
+    ctx.register_solver();
+    let solver2 = Address::generate(&ctx.env);
+    ctx.bond_admin().mint(&solver2, &BOND);
+    c.register_solver(&solver2, &BOND);
+
+    // Submit an intent
+    let id = ctx.submit();
+
+    // First solver accepts successfully
+    c.accept_intent(&ctx.solver, &id);
+    let solver1_record = c.get_solver(&ctx.solver).unwrap();
+    assert_eq!(solver1_record.active_intents, 1);
+
+    // Second solver tries to accept the same intent — should fail
+    let res = c.try_accept_intent(&solver2, &id);
+    assert_eq!(res, Err(Ok(Error::IntentNotOpen.into())));
+
+    // Verify second solver's active_intents was never incremented
+    let solver2_record = c.get_solver(&solver2).unwrap();
+    assert_eq!(solver2_record.active_intents, 0);
 }
 
 // ─── Fill guards ────────────────────────────────────────────────────────────────
