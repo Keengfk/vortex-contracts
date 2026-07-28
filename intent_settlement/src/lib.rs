@@ -41,6 +41,7 @@ const INSTANCE_TTL_EXTEND_TO: u32 = DAY_IN_LEDGERS * 60;
 pub enum DataKey {
     Admin,
     FeeRecipient,
+    PendingFeeRecipient, // proposed-but-not-yet-accepted new fee recipient (issue #30)
     BondToken,          // USDC address for bonds
     Intent(BytesN<32>), // intent_id -> IntentRecord
     Solver(Address),    // address -> SolverRecord
@@ -135,6 +136,12 @@ pub enum Error {
     DeadlineNotReached = 19,
     InsufficientBond = 20,
     DstTokenNotAllowed = 21,
+    /// #30: no pending fee-recipient proposal to accept
+    NoPendingFeeRecipient = 22,
+    /// #31: fee arithmetic overflowed (fill_amount is astronomically large)
+    FeeOverflow = 23,
+    /// #33: the address passed to add_allowed_dst_token doesn't implement SEP-41
+    InvalidTokenInterface = 24,
     SrcChainNotAllowed = 22,
     RescueProtectedToken = 23,
 }
@@ -168,9 +175,14 @@ impl IntentSettlement {
 
     // ── Admin ──────────────────────────────────────────────────────────────────
 
-    /// Admin-only: rotate the address that receives protocol fees and slashed
-    /// bonds. There's no other way to change this once `initialize` runs.
-    pub fn set_fee_recipient(env: Env, new_fee_recipient: Address) {
+    /// Admin-only: propose a new fee recipient address. The proposal is stored
+    /// but not yet active. The new address must call `accept_fee_recipient` to
+    /// confirm, mirroring `transfer_admin`'s two-step pattern so a typo'd or
+    /// unreachable address can never silently misroute protocol fees.
+    ///
+    /// A new proposal overwrites any prior pending proposal, so the admin can
+    /// correct a mistake before the recipient has accepted.
+    pub fn propose_fee_recipient(env: Env, new_fee_recipient: Address) {
         let admin: Address = env
             .storage()
             .instance()
@@ -180,7 +192,34 @@ impl IntentSettlement {
 
         env.storage()
             .instance()
+            .set(&DataKey::PendingFeeRecipient, &new_fee_recipient);
+
+        env.events().publish(
+            (Symbol::new(&env, "fee_recipient_proposed"),),
+            new_fee_recipient,
+        );
+    }
+
+    /// The pending fee recipient confirms the handover. Until this is called
+    /// the current fee recipient remains unchanged.
+    pub fn accept_fee_recipient(env: Env, new_fee_recipient: Address) {
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingFeeRecipient)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoPendingFeeRecipient));
+
+        if pending != new_fee_recipient {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+        new_fee_recipient.require_auth();
+
+        env.storage()
+            .instance()
             .set(&DataKey::FeeRecipient, &new_fee_recipient);
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingFeeRecipient);
 
         env.events().publish(
             (Symbol::new(&env, "fee_recipient_updated"),),
@@ -212,8 +251,25 @@ impl IntentSettlement {
     /// submit_intent had no validation on dst_token at all -- any address,
     /// including a bogus or malicious "token" contract, could be named as
     /// the destination.
+    ///
+    /// Before storing the allowance we call `decimals()` on the candidate
+    /// address as a lightweight SEP-41 interface probe (issue #33). If the
+    /// address doesn't implement the token interface the call traps and the
+    /// transaction reverts, surfacing the error at admin time rather than
+    /// silently allowing a non-token that would only fail later inside
+    /// fill_intent's transfer call.
+    ///
+    /// Note: `decimals()` is a read-only view, so this probe has no side
+    /// effects on the token's state.
     pub fn add_allowed_dst_token(env: Env, token: Address) {
         Self::require_admin(&env);
+
+        // Probe the SEP-41 interface: if `token` isn't a real token contract
+        // this will trap and revert the transaction before we store anything.
+        let token_client = token::Client::new(&env, &token);
+        // decimals() is a pure view with no side-effects; we discard the value.
+        let _decimals = token_client.decimals();
+
         env.storage()
             .instance()
             .set(&DataKey::AllowedDstToken(token.clone()), &true);
@@ -720,7 +776,15 @@ impl IntentSettlement {
         // fee from the solver — rather than clawing it back from the user — keeps
         // the user's received amount at or above `min_dst_amount`, and keeps every
         // token transfer authorized by the solver who signed this call.
-        let fee = fill_amount * PROTOCOL_FEE_BPS / 10_000;
+        //
+        // Explicit checked_mul/checked_div makes the overflow-safety property
+        // visible in code, rather than relying solely on the Cargo.toml
+        // overflow-checks = true release-profile setting (issue #31).
+        let fee = fill_amount
+            .checked_mul(PROTOCOL_FEE_BPS)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::FeeOverflow))
+            .checked_div(10_000)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::FeeOverflow));
         if fee > 0 {
             let fee_recipient: Address = env
                 .storage()
@@ -829,8 +893,10 @@ impl IntentSettlement {
             .get(&DataKey::Solver(solver_addr.clone()))
             .unwrap();
 
-        // Slash 10% of bond
-        let slash_amount = solver_record.bond_amount / 10;
+        // Slash 10% of bond, with a floor of 1 so that a non-zero bond is never
+        // economically unpunished due to integer division rounding to zero
+        // (issue #32: tiny bonds below 10 would otherwise yield slash_amount = 0).
+        let slash_amount = (solver_record.bond_amount / 10).max(1);
         solver_record.bond_amount -= slash_amount;
         solver_record.fills_failed += 1;
         solver_record.active_intents = solver_record.active_intents.saturating_sub(1);
@@ -938,6 +1004,10 @@ impl IntentSettlement {
 
     pub fn get_fee_recipient(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::FeeRecipient)
+    }
+
+    pub fn get_pending_fee_recipient(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::PendingFeeRecipient)
     }
 
     pub fn get_bond_token(env: Env) -> Option<Address> {
