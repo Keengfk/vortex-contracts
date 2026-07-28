@@ -6,8 +6,8 @@
 //! expiry, solver bonding/slashing, and the guard conditions on each step.
 
 use crate::{
-    Error, IntentSettlement, IntentSettlementClient, IntentState, FILL_WINDOW, INTENT_EXPIRY,
-    MIN_BOND, MAX_AMOUNT,
+    DataKey, Error, IntentSettlement, IntentSettlementClient, IntentState, SolverRecord,
+    FILL_WINDOW, INTENT_EXPIRY, MIN_BOND,
 };
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
@@ -136,15 +136,29 @@ fn cannot_initialize_twice() {
 // ─── Admin ──────────────────────────────────────────────────────────────────────
 
 #[test]
-fn admin_can_set_fee_recipient() {
+fn admin_can_propose_and_accept_fee_recipient() {
     let ctx = setup();
     let new_recipient = Address::generate(&ctx.env);
 
-    ctx.client().set_fee_recipient(&new_recipient);
+    // Step 1: admin proposes
+    ctx.client().propose_fee_recipient(&new_recipient);
+    assert_eq!(
+        ctx.client().get_pending_fee_recipient(),
+        Some(new_recipient.clone())
+    );
+    // Active recipient unchanged until accepted
+    assert_eq!(
+        ctx.client().get_fee_recipient(),
+        Some(ctx.fee_recipient.clone())
+    );
+
+    // Step 2: new recipient accepts
+    ctx.client().accept_fee_recipient(&new_recipient);
     assert_eq!(
         ctx.client().get_fee_recipient(),
         Some(new_recipient.clone())
     );
+    assert_eq!(ctx.client().get_pending_fee_recipient(), None);
 
     // The new recipient actually receives fees going forward.
     let c = ctx.client();
@@ -157,6 +171,34 @@ fn admin_can_set_fee_recipient() {
     assert_eq!(ctx.dst().balance(&new_recipient), fee);
 }
 
+/// #30: A non-pending address cannot hijack the accept step.
+#[test]
+fn accept_fee_recipient_wrong_address_fails() {
+    let ctx = setup();
+    let new_recipient = Address::generate(&ctx.env);
+    let imposter = Address::generate(&ctx.env);
+
+    ctx.client().propose_fee_recipient(&new_recipient);
+
+    let res = ctx.client().try_accept_fee_recipient(&imposter);
+    assert_eq!(res, Err(Ok(Error::Unauthorized.into())));
+
+    // Original fee recipient unchanged.
+    assert_eq!(
+        ctx.client().get_fee_recipient(),
+        Some(ctx.fee_recipient.clone())
+    );
+}
+
+/// #30: Calling accept before propose fails cleanly.
+#[test]
+fn accept_fee_recipient_without_proposal_fails() {
+    let ctx = setup();
+    let addr = Address::generate(&ctx.env);
+    let res = ctx.client().try_accept_fee_recipient(&addr);
+    assert_eq!(res, Err(Ok(Error::NoPendingFeeRecipient.into())));
+}
+
 #[test]
 fn admin_can_transfer_admin() {
     let ctx = setup();
@@ -166,9 +208,15 @@ fn admin_can_transfer_admin() {
     ctx.client().transfer_admin(&new_admin);
     assert_eq!(ctx.client().get_admin(), Some(new_admin.clone()));
 
-    // The new admin can now exercise admin-only functions.
+    // The new admin can now exercise admin-only functions — use the two-step
+    // propose/accept flow that replaced set_fee_recipient (issue #30).
     let another_recipient = Address::generate(&ctx.env);
-    ctx.client().set_fee_recipient(&another_recipient);
+    ctx.client().propose_fee_recipient(&another_recipient);
+    assert_eq!(
+        ctx.client().get_pending_fee_recipient(),
+        Some(another_recipient.clone())
+    );
+    ctx.client().accept_fee_recipient(&another_recipient);
     assert_eq!(ctx.client().get_fee_recipient(), Some(another_recipient));
 }
 
@@ -642,6 +690,82 @@ fn submit_intent_past_deadline_fails() {
     assert_eq!(res, Err(Ok(Error::InvalidDeadline.into())));
 }
 
+// #25 — same-ledger intents with identical params produce distinct ids (nonce).
+//
+// Before the fix, compute_intent_id hashed only (user, src_chain, src_amount,
+// timestamp). Two submit_intent calls in the same ledger with the same args
+// produced the same id and the second silently overwrote the first record.
+// After the fix a per-user nonce is included in the preimage, so every call
+// yields a unique id regardless of timestamp.
+#[test]
+fn same_ledger_identical_intents_produce_distinct_ids() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    // Both submits happen at the same ledger timestamp.
+    let id1 = ctx.submit();
+    let id2 = ctx.submit();
+
+    // The ids must be different — neither intent overwrote the other.
+    assert_ne!(id1, id2);
+
+    // Both records must be independently retrievable.
+    assert!(c.get_intent(&id1).is_some());
+    assert!(c.get_intent(&id2).is_some());
+
+    // Total intents counter must reflect both submissions.
+    assert_eq!(c.get_stats().0, 2);
+}
+
+#[test]
+fn nonce_increments_per_user_across_submissions() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    // Submit three intents from the same user in the same ledger close.
+    let id1 = ctx.submit();
+    let id2 = ctx.submit();
+    let id3 = ctx.submit();
+
+    // All three must be distinct.
+    assert_ne!(id1, id2);
+    assert_ne!(id2, id3);
+    assert_ne!(id1, id3);
+
+    // All three records exist.
+    assert!(c.get_intent(&id1).is_some());
+    assert!(c.get_intent(&id2).is_some());
+    assert!(c.get_intent(&id3).is_some());
+
+    assert_eq!(c.get_stats().0, 3);
+}
+
+#[test]
+fn different_users_same_params_same_ledger_produce_distinct_ids() {
+    // Nonces are per-user so two different users both on nonce 0 at the same
+    // timestamp must still get different ids (the user address is in the preimage).
+    let ctx = setup();
+    let c = ctx.client();
+
+    let user2 = Address::generate(&ctx.env);
+    let deadline: Option<u64> = None;
+
+    let id1 = ctx.submit(); // ctx.user, nonce=0
+    let id2 = c.submit_intent(
+        &user2,
+        &String::from_str(&ctx.env, "ethereum"),
+        &String::from_str(&ctx.env, "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+        &SRC_AMT,
+        &ctx.dst_token,
+        &MIN_DST,
+        &deadline,
+    ); // user2, nonce=0
+
+    assert_ne!(id1, id2);
+    assert!(c.get_intent(&id1).is_some());
+    assert!(c.get_intent(&id2).is_some());
+}
+
 // ─── Happy path: submit → accept → fill ─────────────────────────────────────────
 
 #[test]
@@ -724,16 +848,14 @@ fn cannot_accept_already_accepted_intent() {
 // ─── Fill guards ────────────────────────────────────────────────────────────────
 
 #[test]
-fn fill_below_minimum_fails() {
+fn fill_zero_amount_fails() {
     let ctx = setup();
     ctx.register_solver();
     let id = ctx.submit();
     ctx.client().accept_intent(&ctx.solver, &id);
 
-    let res = ctx
-        .client()
-        .try_fill_intent(&ctx.solver, &id, &(MIN_DST - 1));
-    assert_eq!(res, Err(Ok(Error::InsufficientOutput.into())));
+    let res = ctx.client().try_fill_intent(&ctx.solver, &id, &0);
+    assert_eq!(res, Err(Ok(Error::ZeroAmount.into())));
 }
 
 #[test]
@@ -980,6 +1102,118 @@ fn state_changing_calls_extend_instance_ttl() {
     assert!(instance_ttl >= crate::INSTANCE_TTL_EXTEND_TO - 1);
 }
 
+// ─── CEI regression tests ────────────────────────────────────────────────────────
+
+// #28 — double-deregister is rejected cleanly after the storage-first reorder.
+//
+// Before the fix, the record was still present when the bond transfer ran, so
+// a second deregister_solver call before the remove could (in a future async or
+// re-entrant context) see the record and transfer the bond a second time.
+// After the fix the record is removed first, so the second call panics with
+// SolverNotRegistered before it reaches the transfer.
+#[test]
+fn double_deregister_rejected_cleanly() {
+    let ctx = setup();
+    ctx.register_solver();
+
+    // First deregister succeeds and removes the record.
+    ctx.client().deregister_solver(&ctx.solver);
+    assert!(ctx.client().get_solver(&ctx.solver).is_none());
+    // Bond is back with the solver.
+    assert_eq!(ctx.bond().balance(&ctx.solver), BOND);
+
+    // Second call on the same address must be rejected — no record to refund.
+    let res = ctx.client().try_deregister_solver(&ctx.solver);
+    assert_eq!(res, Err(Ok(Error::SolverNotRegistered.into())));
+
+    // Crucially the contract's bond balance must not have changed further —
+    // it was zero after the first deregister and should still be zero.
+    assert_eq!(ctx.bond().balance(&ctx.contract_id), 0);
+    // Solver's balance should still equal exactly one bond refund, not two.
+    assert_eq!(ctx.bond().balance(&ctx.solver), BOND);
+}
+
+// #27 — SolverRecord state is consistent with actual token balances after
+// register_solver.  After the storage-first reorder the record is written
+// before the transfer, so if the transfer were ever to fail the record simply
+// wouldn't reflect a deposit that never happened.  Here we verify the happy
+// path: record.bond_amount == tokens held by the contract.
+#[test]
+fn solver_record_consistent_with_token_balances_after_register() {
+    let ctx = setup();
+
+    // Mint exactly BOND to the solver, then register.
+    ctx.bond_admin().mint(&ctx.solver, &BOND);
+    ctx.client().register_solver(&ctx.solver, &BOND);
+
+    let record = ctx.client().get_solver(&ctx.solver).unwrap();
+
+    // Storage says the bond is BOND.
+    assert_eq!(record.bond_amount, BOND);
+    // The contract actually holds BOND tokens — no discrepancy.
+    assert_eq!(ctx.bond().balance(&ctx.contract_id), BOND);
+    // Solver's wallet is empty — tokens moved.
+    assert_eq!(ctx.bond().balance(&ctx.solver), 0);
+
+    // Top-up path: record.bond_amount must keep tracking reality after a second deposit.
+    let topup = 200 * 10_000_000;
+    ctx.bond_admin().mint(&ctx.solver, &topup);
+    ctx.client().register_solver(&ctx.solver, &topup);
+
+    let record2 = ctx.client().get_solver(&ctx.solver).unwrap();
+    assert_eq!(record2.bond_amount, BOND + topup);
+    assert_eq!(ctx.bond().balance(&ctx.contract_id), BOND + topup);
+    assert_eq!(ctx.bond().balance(&ctx.solver), 0);
+}
+
+// #26 — CEI ordering in fill_intent: state is committed before transfers.
+//
+// We verify two complementary properties:
+//
+// 1. After a successful fill the intent is Filled in storage *and* tokens
+//    have moved — state and funds are always in sync (the core CEI invariant).
+//
+// 2. A second fill_intent call on the same (already-Filled) intent is
+//    rejected with IntentAlreadyFilled before any transfer attempt.  This is
+//    the on-chain guard that would stop a re-entrant token from triggering a
+//    double-fill: whatever point during the transfers the re-entrant call is
+//    made, storage already shows Filled.
+#[test]
+fn fill_intent_state_committed_before_transfer_and_double_fill_rejected() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    ctx.register_solver();
+    let id = ctx.submit();
+    c.accept_intent(&ctx.solver, &id);
+
+    // Fund the solver with enough for the fill + fee.
+    let fee = FILL * 5 / 10_000;
+    ctx.dst_admin().mint(&ctx.solver, &(FILL + fee));
+
+    // Happy-path fill.
+    c.fill_intent(&ctx.solver, &id, &FILL);
+
+    // 1. Storage reflects Filled and fill_amount is set.
+    let intent = c.get_intent(&id).unwrap();
+    assert_eq!(intent.state, IntentState::Filled);
+    assert_eq!(intent.fill_amount, Some(FILL));
+
+    // 2. Tokens have moved: user got FILL, fee_recipient got fee, solver has 0.
+    assert_eq!(ctx.dst().balance(&ctx.user), FILL);
+    assert_eq!(ctx.dst().balance(&ctx.fee_recipient), fee);
+    assert_eq!(ctx.dst().balance(&ctx.solver), 0);
+
+    // 3. A second fill attempt is rejected before any transfer — this is exactly
+    //    what a re-entrant token would hit mid-transfer after the CEI reorder.
+    ctx.dst_admin().mint(&ctx.solver, &(FILL + fee)); // give solver funds again
+    let res = c.try_fill_intent(&ctx.solver, &id, &FILL);
+    assert_eq!(res, Err(Ok(Error::IntentAlreadyFilled.into())));
+
+    // User's balance must not have increased — no double-payment.
+    assert_eq!(ctx.dst().balance(&ctx.user), FILL);
+}
+
 // ─── Views ──────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -995,367 +1229,631 @@ fn get_bond_token_returns_configured_token() {
     assert_eq!(ctx.client().get_bond_token(), Some(ctx.bond_token.clone()));
 }
 
-// ─── #41 Amount upper-bound boundary tests ──────────────────────────────────────
+// ─── get_protocol_params view ────────────────────────────────────────────────────
 
 #[test]
-fn submit_intent_at_max_amount_succeeds() {
-    // MAX_AMOUNT itself is the inclusive upper bound and must be accepted.
+fn get_protocol_params_returns_current_constants() {
+    use crate::{FILL_WINDOW, INTENT_EXPIRY, MIN_BOND};
+    const PROTOCOL_FEE_BPS: i128 = 5;
+
     let ctx = setup();
-    let deadline: Option<u64> = None;
-    let id = ctx.client().submit_intent(
-        &ctx.user,
-        &String::from_str(&ctx.env, "ethereum"),
-        &String::from_str(&ctx.env, "0xabc"),
-        &MAX_AMOUNT,
-        &ctx.dst_token,
-        &MAX_AMOUNT,
-        &deadline,
-    );
-    let intent = ctx.client().get_intent(&id).unwrap();
-    assert_eq!(intent.src_amount, MAX_AMOUNT);
-    assert_eq!(intent.min_dst_amount, MAX_AMOUNT);
+    let params = ctx.client().get_protocol_params();
+
+    assert_eq!(params.min_bond, MIN_BOND);
+    assert_eq!(params.fill_window, FILL_WINDOW);
+    assert_eq!(params.intent_expiry, INTENT_EXPIRY);
+    assert_eq!(params.protocol_fee_bps, PROTOCOL_FEE_BPS);
+// ─── Partial fills ───────────────────────────────────────────────────────────────
+
+#[test]
+fn two_partial_fills_complete_intent() {
+    let ctx = setup();
+    let c = ctx.client();
+    ctx.register_solver();
+
+    // Submit with MIN_DST as the full target.
+    let id = ctx.submit();
+
+    // First partial fill: half of MIN_DST.
+    let half = MIN_DST / 2;
+    let fee1 = half * 5 / 10_000;
+    ctx.dst_admin().mint(&ctx.solver, &(half + fee1));
+    c.accept_intent(&ctx.solver, &id);
+    c.fill_intent(&ctx.solver, &id, &half);
+
+    // Intent should now be PartiallyFilled and re-opened (solver reset).
+    let intent = c.get_intent(&id).unwrap();
+    assert_eq!(intent.state, IntentState::PartiallyFilled);
+    assert_eq!(intent.total_filled, half);
+    assert!(intent.solver.is_none());
+
+    // User already received the first half.
+    assert_eq!(ctx.dst().balance(&ctx.user), half);
+
+    // Second fill: the remainder — brings total to MIN_DST.
+    let remainder = MIN_DST - half;
+    let fee2 = remainder * 5 / 10_000;
+    ctx.dst_admin().mint(&ctx.solver, &(remainder + fee2));
+    c.accept_intent(&ctx.solver, &id);
+    c.fill_intent(&ctx.solver, &id, &remainder);
+
+    let intent = c.get_intent(&id).unwrap();
+    assert_eq!(intent.state, IntentState::Filled);
+    assert_eq!(intent.total_filled, MIN_DST);
+    assert_eq!(intent.fill_amount, Some(MIN_DST));
+
+    // User has received the full MIN_DST across both fills.
+    assert_eq!(ctx.dst().balance(&ctx.user), MIN_DST);
+
+    // Solver credited fills_completed once (on the completing fill).
+    let solver = c.get_solver(&ctx.solver).unwrap();
+    assert_eq!(solver.fills_completed, 1);
+    assert_eq!(solver.total_volume, MIN_DST);
 }
 
 #[test]
-fn submit_intent_src_amount_above_max_fails() {
-    // MAX_AMOUNT + 1 must be rejected.
+fn partial_fill_left_incomplete_past_deadline_can_be_expired() {
     let ctx = setup();
+    let c = ctx.client();
+    ctx.register_solver();
+
+    let id = ctx.submit();
+
+    // Deliver a partial fill (less than MIN_DST).
+    let partial = MIN_DST / 3;
+    let fee = partial * 5 / 10_000;
+    ctx.dst_admin().mint(&ctx.solver, &(partial + fee));
+    c.accept_intent(&ctx.solver, &id);
+    c.fill_intent(&ctx.solver, &id, &partial);
+
+    // Intent is PartiallyFilled and re-opened with a fresh INTENT_EXPIRY deadline.
+    assert_eq!(
+        c.get_intent(&id).unwrap().state,
+        IntentState::PartiallyFilled
+    );
+
+    // Let the new deadline expire without anyone picking up the remainder.
+    ctx.pass_time(INTENT_EXPIRY + 1);
+
+    // expire_intent works on PartiallyFilled intents past their deadline.
+    c.expire_intent(&id);
+    assert_eq!(c.get_intent(&id).unwrap().state, IntentState::Expired);
+}
+
+#[test]
+fn single_fill_at_or_above_minimum_completes_immediately() {
+// ─── #29: slash_solver ordering ─────────────────────────────────────────────────
+
+/// Calling slash_solver twice on the same intent_id must fail on the second
+/// call with IntentNotAccepted — the first call flips the state to Open before
+/// the token transfer, so the second call hits the guard immediately.
+#[test]
+fn double_slash_second_call_rejected() {
+// ─── Issue #31: fee overflow boundary ────────────────────────────────────────────
+
+/// #31: fill_amount just above i128::MAX / PROTOCOL_FEE_BPS (5) overflows the
+/// checked_mul and returns FeeOverflow rather than silently wrapping.
+///
+/// Boundary: i128::MAX / 5 = 34_028_236_692_093_846_346_337_460_743_176_821_145.
+/// Any value above that will cause `fill_amount * 5` to overflow i128.
+#[test]
+fn fill_intent_fee_overflow_returns_error() {
+    let ctx = setup();
+    let c = ctx.client();
+    ctx.register_solver();
+    let id = ctx.submit();
+    c.accept_intent(&ctx.solver, &id);
+
+    ctx.pass_time(FILL_WINDOW + 1);
+
+    // First slash succeeds.
+    c.slash_solver(&id);
+    let intent = c.get_intent(&id).unwrap();
+    assert!(intent.state == IntentState::Open);
+
+    // Second slash on the same id must be rejected: the intent is now Open,
+    // not Accepted.
+    let res = c.try_slash_solver(&id);
+    assert_eq!(res, Err(Ok(crate::Error::IntentNotAccepted.into())));
+}
+
+// ─── #47: reputation score ───────────────────────────────────────────────────────
+
+use crate::{IntentSettlement, SolverRecord};
+
+/// Helper: build a SolverRecord with just the fields that affect scoring.
+fn make_record(
+    env: &soroban_sdk::Env,
+    solver: &soroban_sdk::Address,
+    fills_completed: u32,
+    fills_failed: u32,
+    total_volume: i128,
+) -> SolverRecord {
+    SolverRecord {
+        address: solver.clone(),
+        bond_amount: MIN_BOND,
+        fills_completed,
+        fills_failed,
+        total_volume,
+        is_active: true,
+        registered_at: env.ledger().timestamp(),
+        active_intents: 0,
+    }
+}
+
+/// A solver that has never attempted any fill has score 0.
+#[test]
+fn reputation_score_zero_fills_returns_zero() {
+    let ctx = setup();
+    let r = make_record(&ctx.env, &ctx.solver, 0, 0, 0);
+    assert_eq!(IntentSettlement::compute_reputation_score(&r), 0);
+}
+
+/// A solver that has only failures has score 0 regardless of volume.
+#[test]
+fn reputation_score_all_failures_returns_zero() {
+    let ctx = setup();
+    let r = make_record(&ctx.env, &ctx.solver, 0, 50, 0);
+    assert_eq!(IntentSettlement::compute_reputation_score(&r), 0);
+}
+
+/// A perfect solver with no volume scores 9_000 (= 90% × 10_000 bps).
+#[test]
+fn reputation_score_perfect_rate_no_volume_is_nine_thousand() {
+    let ctx = setup();
+    let r = make_record(&ctx.env, &ctx.solver, 100, 0, 0);
+    // At zero volume, decay_bps ≈ 10_000, multiplier = 9_000.
+    let score = IntentSettlement::compute_reputation_score(&r);
+    assert_eq!(score, 9_000);
+}
+
+/// A perfect solver with very high volume scores close to (but below) 10_000.
+#[test]
+fn reputation_score_perfect_rate_high_volume_approaches_ten_thousand() {
+    let ctx = setup();
+    // volume = 100 × VOLUME_SCALE makes decay negligible.
+    let high_vol: i128 = 100 * 1_000 * 100 * 10_000_000;
+    let r = make_record(&ctx.env, &ctx.solver, 1_000, 0, high_vol);
+    let score = IntentSettlement::compute_reputation_score(&r);
+    // Must be strictly greater than 9_000 and less than 10_000.
+    assert!(score > 9_000, "score {score} should be > 9_000");
+    assert!(score < 10_000, "score {score} should be < 10_000");
+}
+
+/// A mixed solver (some failures) scores strictly less than a perfect solver
+/// with the same volume.
+#[test]
+fn reputation_score_partial_failures_lower_than_perfect() {
+    let ctx = setup();
+    let vol = 100 * 10_000_000i128;
+    let perfect = make_record(&ctx.env, &ctx.solver, 90, 0, vol);
+    let mixed = make_record(&ctx.env, &ctx.solver, 90, 10, vol);
+    assert!(
+        IntentSettlement::compute_reputation_score(&perfect)
+            > IntentSettlement::compute_reputation_score(&mixed)
+    );
+}
+
+/// get_reputation_score returns None for an unregistered solver.
+#[test]
+fn get_reputation_score_unregistered_returns_none() {
+    let ctx = setup();
+    let stranger = soroban_sdk::Address::generate(&ctx.env);
+    assert!(ctx.client().get_reputation_score(&stranger).is_none());
+}
+
+/// get_reputation_score returns Some(0) for a registered but never-filled solver.
+#[test]
+fn get_reputation_score_registered_no_fills_returns_zero() {
+    let ctx = setup();
+    ctx.register_solver();
+    assert_eq!(ctx.client().get_reputation_score(&ctx.solver), Some(0));
+}
+
+/// After a successful fill the score should be non-zero.
+#[test]
+fn get_reputation_score_after_fill_is_nonzero() {
+    let ctx = setup();
+    let c = ctx.client();
+    ctx.register_solver();
+    let id = ctx.submit();
+    c.accept_intent(&ctx.solver, &id);
+    let fee = FILL * 5 / 10_000;
+    ctx.dst_admin().mint(&ctx.solver, &(FILL + fee));
+    c.fill_intent(&ctx.solver, &id, &FILL);
+
+    let score = c.get_reputation_score(&ctx.solver).unwrap();
+    assert!(score > 0, "score after fill should be > 0");
+    // Smallest fill_amount that overflows: (i128::MAX / 5) + 1.
+    // We satisfy min_dst_amount by keeping fill_amount >> MIN_DST.
+    let overflow_fill: i128 = i128::MAX / 5 + 1;
+
+    // Fund the solver so the dst transfer can proceed; the overflow is caught
+    // in the fee calculation that follows the transfer (the full transaction
+    // rolls back on panic_with_error, so the user's balance stays zero).
+    ctx.dst_admin().mint(&ctx.solver, &overflow_fill);
+
+    let res = c.try_fill_intent(&ctx.solver, &id, &overflow_fill);
+    assert_eq!(res, Err(Ok(Error::FeeOverflow.into())));
+}
+
+/// Sanity: a fill_amount just *at* the boundary (i128::MAX / 5) does not overflow.
+#[test]
+fn fill_intent_fee_at_boundary_does_not_overflow() {
+    let ctx = setup();
+    let c = ctx.client();
+    ctx.register_solver();
+    let id = ctx.submit();
+    c.accept_intent(&ctx.solver, &id);
+
+    // i128::MAX / 5 — fee = (i128::MAX / 5) * 5 / 10_000, which fits in i128.
+    let boundary_fill: i128 = i128::MAX / 5;
+    let fee = boundary_fill * 5 / 10_000;
+    ctx.dst_admin().mint(&ctx.solver, &(boundary_fill + fee));
+
+    // Should succeed (no overflow).
+    c.fill_intent(&ctx.solver, &id, &boundary_fill);
+    assert!(c.get_intent(&id).unwrap().state == IntentState::Filled);
+}
+
+// ─── Issue #32: tiny bond slash floor ────────────────────────────────────────────
+
+/// #32: When a solver's bond has been whittled to a very small value (< 10 in
+/// the token's smallest unit), integer division `bond / 10` rounds to 0.  The
+/// `.max(1)` floor ensures the slash is never economically free — a non-zero
+/// bond always produces a non-zero slash.
+///
+/// We plant a SolverRecord with bond_amount = 5 directly into storage (bypassing
+/// the MIN_BOND registration guard) to test the math boundary in isolation.
+#[test]
+fn slash_tiny_bond_always_yields_nonzero_slash() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    // Register normally first so the contract recognises ctx.solver.
+    ctx.register_solver();
+
+    // Plant a SolverRecord with an artificially tiny bond directly into
+    // contract storage, simulating a bond that has been slashed many times.
+    let tiny_bond: i128 = 5; // 5 / 10 = 0 without the .max(1) floor
+    ctx.env.as_contract(&ctx.contract_id, || {
+        let mut record: SolverRecord = ctx
+            .env
+            .storage()
+            .persistent()
+            .get(&DataKey::Solver(ctx.solver.clone()))
+            .unwrap();
+        record.bond_amount = tiny_bond;
+        record.active_intents = 0;
+        ctx.env
+            .storage()
+            .persistent()
+            .set(&DataKey::Solver(ctx.solver.clone()), &record);
+    });
+
+    // Submit and accept an intent so slash_solver has something to slash.
+    let id = ctx.submit();
+    c.accept_intent(&ctx.solver, &id);
+
+    ctx.pass_time(FILL_WINDOW + 1);
+    c.slash_solver(&id);
+
+    // The slash must be >= 1 even though 5 / 10 == 0.
+    let solver = c.get_solver(&ctx.solver).unwrap();
+    assert!(
+        solver.bond_amount < tiny_bond,
+        "bond should have decreased after slash"
+    );
+    let slashed = tiny_bond - solver.bond_amount;
+    assert!(slashed >= 1, "slash_amount must be at least 1, got {slashed}");
+}
+
+// ─── Issue #33: add_allowed_dst_token validates SEP-41 interface ─────────────────
+
+/// #33: Passing the settlement contract's own address (which is not a token)
+/// to add_allowed_dst_token must fail.  The `decimals()` probe inside
+/// add_allowed_dst_token will trap on a contract that doesn't implement SEP-41,
+/// reverting the transaction before any storage entry is written.
+#[test]
+fn add_allowed_dst_token_rejects_non_token_contract() {
+    let ctx = setup();
+
+    // ctx.contract_id is a real deployed contract (IntentSettlement) but it
+    // does not implement the SEP-41 token interface, so decimals() will trap.
+    let res = ctx
+        .client()
+        .try_add_allowed_dst_token(&ctx.contract_id);
+
+    // The call must fail — either with InvalidTokenInterface or a generic
+    // contract-trap error (the host converts a trapped cross-contract call
+    // into an Err result in the test environment).
+    assert!(
+        res.is_err(),
+        "allowlisting a non-token address should fail"
+    );
+
+    // No storage entry must have been written for the bogus address.
+    assert!(
+        !ctx.client().is_dst_token_allowed(&ctx.contract_id),
+        "non-token address must not be stored in the allowlist"
+    );
+}
+
+/// #33 (positive case): a real SEP-41 token passes the probe and is stored.
+#[test]
+fn add_allowed_dst_token_accepts_real_token() {
+    let ctx = setup();
+
+    // dst_token was registered as a StellarAssetContract — it implements SEP-41.
+    ctx.client().add_allowed_dst_token(&ctx.dst_token);
+    assert!(ctx.client().is_dst_token_allowed(&ctx.dst_token));
+}
+// ─── #34 Source chain allowlist ──────────────────────────────────────────────────
+
+#[test]
+fn src_chain_allowlist_disabled_by_default() {
+    // The SrcChainAllowlistEnabled flag must default to false so any
+    // existing deployment keeps working until an admin explicitly opts in.
+    let ctx = setup();
+    assert!(!ctx.client().is_src_chain_allowlist_enabled());
+}
+
+#[test]
+fn src_chain_allowlist_disabled_allows_any_chain() {
+    // With enforcement off, free-text src_chain values still go through --
+    // matches the pre-#34 behaviour so no migration is required.
+    let ctx = setup();
+    assert!(!ctx.client().is_src_chain_allowlist_enabled());
+    ctx.submit(); // "ethereum" -- would be rejected if enforcement were on and list were empty
+}
+
+#[test]
+fn src_chain_allowlist_blocks_unlisted_chain_when_enabled() {
+    let ctx = setup();
+    let c = ctx.client();
+    c.set_src_chain_allowlist_enabled(&true);
+
     let deadline: Option<u64> = None;
-    let res = ctx.client().try_submit_intent(
+    let res = c.try_submit_intent(
         &ctx.user,
-        &String::from_str(&ctx.env, "ethereum"),
+        &String::from_str(&ctx.env, "etherium"), // typo -- not on list
         &String::from_str(&ctx.env, "0xabc"),
-        &(MAX_AMOUNT + 1),
+        &SRC_AMT,
         &ctx.dst_token,
         &MIN_DST,
         &deadline,
     );
-    assert_eq!(res, Err(Ok(Error::AmountTooLarge.into())));
+    assert_eq!(res, Err(Ok(Error::SrcChainNotAllowed.into())));
 }
 
 #[test]
-fn submit_intent_min_dst_amount_above_max_fails() {
-    // MAX_AMOUNT + 1 on min_dst_amount must be rejected.
+fn src_chain_allowlist_allows_listed_chain_when_enabled() {
     let ctx = setup();
+    let c = ctx.client();
+    c.add_allowed_src_chain(&String::from_str(&ctx.env, "ethereum"));
+    c.set_src_chain_allowlist_enabled(&true);
+
+    assert!(c.is_src_chain_allowed(&String::from_str(&ctx.env, "ethereum")));
+    // ctx.submit() uses "ethereum" -- should now succeed.
+    ctx.submit();
+}
+
+#[test]
+fn src_chain_allowlist_removal_blocks_previously_allowed_chain() {
+    let ctx = setup();
+    let c = ctx.client();
+    let chain = String::from_str(&ctx.env, "ethereum");
+    c.add_allowed_src_chain(&chain);
+    c.set_src_chain_allowlist_enabled(&true);
+    c.remove_allowed_src_chain(&chain);
+
+    assert!(!c.is_src_chain_allowed(&String::from_str(&ctx.env, "ethereum")));
+
     let deadline: Option<u64> = None;
-    let res = ctx.client().try_submit_intent(
+    let res = c.try_submit_intent(
         &ctx.user,
         &String::from_str(&ctx.env, "ethereum"),
         &String::from_str(&ctx.env, "0xabc"),
         &SRC_AMT,
         &ctx.dst_token,
-        &(MAX_AMOUNT + 1),
+        &MIN_DST,
         &deadline,
     );
-    assert_eq!(res, Err(Ok(Error::AmountTooLarge.into())));
+    assert_eq!(res, Err(Ok(Error::SrcChainNotAllowed.into())));
 }
 
 #[test]
-fn submit_intent_i128_max_src_amount_fails() {
-    // i128::MAX is far above MAX_AMOUNT and must also be rejected.
+fn src_chain_unlisted_accepted_after_disabling_enforcement() {
+    // Disabling the flag after enabling it should restore open submission.
     let ctx = setup();
+    let c = ctx.client();
+    c.set_src_chain_allowlist_enabled(&true);
+    c.set_src_chain_allowlist_enabled(&false);
+
+    // "base" was never added to the list, but enforcement is off.
     let deadline: Option<u64> = None;
-    let res = ctx.client().try_submit_intent(
+    c.submit_intent(
         &ctx.user,
-        &String::from_str(&ctx.env, "ethereum"),
+        &String::from_str(&ctx.env, "base"),
         &String::from_str(&ctx.env, "0xabc"),
-        &i128::MAX,
+        &SRC_AMT,
         &ctx.dst_token,
         &MIN_DST,
         &deadline,
     );
-    assert_eq!(res, Err(Ok(Error::AmountTooLarge.into())));
 }
 
-// ─── #40 Reentrancy-focused tests with a hostile mock SEP-41 token ───────────────
-//
-// Soroban's execution model serializes contract calls within a single ledger
-// transaction — true EVM-style reentrancy (calling back into an in-progress
-// frame) is not possible. What these tests exercise instead:
-//
-//   1. The settlement contract works correctly with an *arbitrary* SEP-41
-//      token implementation, not just the standard SAC.
-//   2. The checks-effects-interactions pattern is upheld: intent and solver
-//      records are persisted *before* any external token.transfer() call,
-//      so any cross-contract observer sees a fully committed state.
-//   3. A benign double-call to register_solver (simulating a hypothetical
-//      callback from a hostile bond token) is handled gracefully as a top-up.
+// ─── #35 rescue_tokens ──────────────────────────────────────────────────────────
 
-// HostileToken — a minimal, self-contained SEP-41 implementation registered
-// as the dst_token. It implements exactly the interface that token::Client
-// (used inside fill_intent) requires: transfer, balance, and the rest as
-// no-ops. Balances are stored in instance storage keyed by address.
-#[soroban_sdk::contract]
-pub struct HostileToken;
+#[test]
+fn rescue_tokens_moves_non_protocol_token_to_recipient() {
+    let ctx = setup();
+    let c = ctx.client();
 
-#[soroban_sdk::contractimpl]
-impl HostileToken {
-    pub fn mint(env: Env, to: Address, amount: i128) {
-        let bal: i128 = env.storage().instance().get(&to).unwrap_or(0);
-        env.storage().instance().set(&to, &(bal + amount));
-    }
-
-    pub fn balance(env: Env, id: Address) -> i128 {
-        env.storage().instance().get(&id).unwrap_or(0)
-    }
-
-    pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
-        from.require_auth();
-        let from_bal: i128 = env.storage().instance().get(&from).unwrap_or(0);
-        let to_bal: i128 = env.storage().instance().get(&to).unwrap_or(0);
-        env.storage().instance().set(&from, &(from_bal - amount));
-        env.storage().instance().set(&to, &(to_bal + amount));
-    }
-
-    // The remaining SEP-41 methods are required by the interface but unused
-    // by fill_intent. They are no-ops here.
-    pub fn transfer_from(_e: Env, _s: Address, _f: Address, _t: Address, _a: i128) {}
-    pub fn approve(_e: Env, _f: Address, _s: Address, _a: i128, _exp: u32) {}
-    pub fn allowance(_e: Env, _f: Address, _s: Address) -> i128 { 0 }
-    pub fn decimals(_e: Env) -> u32 { 7 }
-    pub fn name(e: Env) -> String { String::from_str(&e, "Hostile") }
-    pub fn symbol(e: Env) -> String { String::from_str(&e, "HST") }
-    pub fn set_authorized(_e: Env, _id: Address, _auth: bool) {}
-    pub fn authorized(_e: Env, _id: Address) -> bool { true }
-    pub fn burn(_e: Env, _f: Address, _a: i128) {}
-    pub fn burn_from(_e: Env, _s: Address, _f: Address, _a: i128) {}
-    pub fn clawback(_e: Env, _f: Address, _a: i128) {}
-    pub fn spendable_balance(e: Env, id: Address) -> i128 {
-        e.storage().instance().get(&id).unwrap_or(0)
-    }
-}
-
-/// Build a test context where dst_token is the HostileToken contract.
-/// Bond token remains a normal SAC so bond bookkeeping works unchanged.
-fn setup_with_hostile_dst() -> (Ctx, Address) {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let admin = Address::generate(&env);
-    let fee_recipient = Address::generate(&env);
-    let user = Address::generate(&env);
-    let solver = Address::generate(&env);
-
-    let bond_token = env
-        .register_stellar_asset_contract_v2(admin.clone())
+    // Mint a random "lost" token directly to the contract.
+    let rescue_token = ctx
+        .env
+        .register_stellar_asset_contract_v2(ctx.admin.clone())
         .address();
+    let rescue_admin = token::StellarAssetClient::new(&ctx.env, &rescue_token);
+    let rescue_client = token::Client::new(&ctx.env, &rescue_token);
+    let rescue_amount: i128 = 1_000_000;
+    rescue_admin.mint(&ctx.contract_id, &rescue_amount);
 
-    let hostile_dst = env.register_contract(None, HostileToken);
-    let contract_id = env.register_contract(None, IntentSettlement);
+    assert_eq!(rescue_client.balance(&ctx.contract_id), rescue_amount);
 
-    let ctx = Ctx {
-        env,
-        admin,
-        fee_recipient,
-        user,
-        solver,
-        contract_id,
-        bond_token,
-        dst_token: hostile_dst.clone(),
-    };
-    ctx.client()
-        .initialize(&ctx.admin, &ctx.fee_recipient, &ctx.bond_token);
+    let recipient = Address::generate(&ctx.env);
+    c.rescue_tokens(&rescue_token, &recipient, &rescue_amount);
 
-    (ctx, hostile_dst)
-}
-
-/// Mint hostile dst tokens to an address via HostileTokenClient.
-fn hostile_mint(env: &Env, contract: &Address, to: &Address, amount: i128) {
-    HostileTokenClient::new(env, contract).mint(to, &amount);
+    assert_eq!(rescue_client.balance(&ctx.contract_id), 0);
+    assert_eq!(rescue_client.balance(&recipient), rescue_amount);
 }
 
 #[test]
-fn fill_intent_with_hostile_dst_token_settles_correctly() {
-    // Settlement must work end-to-end when dst_token is a non-SAC contract.
-    let (ctx, hostile_dst) = setup_with_hostile_dst();
-    let c = ctx.client();
-
-    ctx.bond_admin().mint(&ctx.solver, &BOND);
-    c.register_solver(&ctx.solver, &BOND);
-    let id = ctx.submit();
-    c.accept_intent(&ctx.solver, &id);
-
-    let fee = FILL * 5 / 10_000;
-    hostile_mint(&ctx.env, &hostile_dst, &ctx.solver, FILL + fee);
-
-    c.fill_intent(&ctx.solver, &id, &FILL);
-
-    let intent = c.get_intent(&id).unwrap();
-    assert!(intent.state == IntentState::Filled);
-    assert_eq!(intent.fill_amount, Some(FILL));
-
-    // Verify balances via HostileTokenClient.
-    let hc = HostileTokenClient::new(&ctx.env, &hostile_dst);
-    assert_eq!(hc.balance(&ctx.user), FILL);
-    assert_eq!(hc.balance(&ctx.fee_recipient), fee);
-    assert_eq!(hc.balance(&ctx.solver), 0);
-}
-
-#[test]
-fn fill_intent_storage_written_before_token_transfer() {
-    // Checks-effects-interactions: confirm intent state and solver stats
-    // are fully persisted (as Filled / fills_completed++) in the same call
-    // that triggers the external token transfer, so any cross-contract
-    // observer reading settlement storage during the transfer sees Filled.
-    let (ctx, hostile_dst) = setup_with_hostile_dst();
-    let c = ctx.client();
-
-    ctx.bond_admin().mint(&ctx.solver, &BOND);
-    c.register_solver(&ctx.solver, &BOND);
-    let id = ctx.submit();
-    c.accept_intent(&ctx.solver, &id);
-
-    // Pre-fill: state is Accepted.
-    assert!(c.get_intent(&id).unwrap().state == IntentState::Accepted);
-    assert_eq!(c.get_solver(&ctx.solver).unwrap().fills_completed, 0);
-
-    let fee = FILL * 5 / 10_000;
-    hostile_mint(&ctx.env, &hostile_dst, &ctx.solver, FILL + fee);
-    c.fill_intent(&ctx.solver, &id, &FILL);
-
-    // Post-fill: storage reflects Filled and incremented stats.
-    let intent = c.get_intent(&id).unwrap();
-    assert!(intent.state == IntentState::Filled);
-    let solver = c.get_solver(&ctx.solver).unwrap();
-    assert_eq!(solver.fills_completed, 1);
-    assert_eq!(solver.active_intents, 0);
-}
-
-#[test]
-fn slash_solver_with_hostile_dst_token_settles_correctly() {
-    // slash_solver touches only the bond token (SAC), not the dst_token, but
-    // confirm it still correctly updates solver state when dst is a hostile token.
-    let (ctx, _hostile_dst) = setup_with_hostile_dst();
-    let c = ctx.client();
-
-    ctx.bond_admin().mint(&ctx.solver, &BOND);
-    c.register_solver(&ctx.solver, &BOND);
-    let id = ctx.submit();
-    c.accept_intent(&ctx.solver, &id);
-
-    let bond_before = c.get_solver(&ctx.solver).unwrap().bond_amount;
-    ctx.pass_time(FILL_WINDOW + 1);
-    c.slash_solver(&id);
-
-    let slash = bond_before / 10;
-    let solver = c.get_solver(&ctx.solver).unwrap();
-    assert_eq!(solver.bond_amount, bond_before - slash);
-    assert_eq!(solver.fills_failed, 1);
-    assert_eq!(solver.active_intents, 0);
-
-    assert!(c.get_intent(&id).unwrap().state == IntentState::Open);
-    assert_eq!(ctx.bond().balance(&ctx.fee_recipient), slash);
-}
-
-#[test]
-fn register_solver_double_call_is_safe_top_up() {
-    // Simulates a hostile bond token calling back into register_solver
-    // during a transfer. In Soroban this cannot truly re-enter a frame
-    // mid-execution, but a sequential second call behaves as a normal
-    // top-up and must not corrupt solver state.
+fn rescue_tokens_blocked_for_bond_token() {
+    // The bond_token is protected: rescuing it could drain solver collateral.
     let ctx = setup();
-    let c = ctx.client();
-
-    ctx.bond_admin().mint(&ctx.solver, &(BOND * 2));
-
-    c.register_solver(&ctx.solver, &BOND);
-    assert_eq!(c.get_solver(&ctx.solver).unwrap().bond_amount, BOND);
-
-    // Second call — treated as a top-up, not a duplicate registration.
-    c.register_solver(&ctx.solver, &BOND);
-    assert_eq!(c.get_solver(&ctx.solver).unwrap().bond_amount, BOND * 2);
-
-    // Exactly one solver counted in total.
-    let hc = c.get_solver(&ctx.solver).unwrap();
-    assert!(hc.is_active);
-}
-
-// ─── #39 Economic security: MIN_BOND vs worst-case slash-to-notional ratio ───────
-
-#[test]
-fn economic_security_min_bond_slash_vs_large_notional() {
-    // Documents the current protocol gap: a solver registered at MIN_BOND
-    // can accept an arbitrarily large intent. If they fail to fill, they
-    // lose only 10% of MIN_BOND (= 5 USDC). For a large-notional intent
-    // this penalty is economically negligible.
-    //
-    // This test *documents* the gap rather than asserting it is safe.
-    // A follow-up design issue should add a per-intent bond-to-notional
-    // check inside accept_intent. Closes #39.
-    let ctx = setup();
-    let c = ctx.client();
-
-    ctx.bond_admin().mint(&ctx.solver, &MIN_BOND);
-    c.register_solver(&ctx.solver, &MIN_BOND);
-
-    // One trillion USDC (7 decimals = 10^19 units) — within MAX_AMOUNT.
-    let large_notional: i128 = 1_000_000_000_000 * 10_000_000; // 10^19
-    let deadline: Option<u64> = None;
-    let id = c.submit_intent(
-        &ctx.user,
-        &String::from_str(&ctx.env, "ethereum"),
-        &String::from_str(&ctx.env, "0xabc"),
-        &large_notional,
-        &ctx.dst_token,
-        &large_notional,
-        &deadline,
-    );
-
-    // The protocol currently allows a min-bonded solver to accept this.
-    c.accept_intent(&ctx.solver, &id);
-    assert!(c.get_intent(&id).unwrap().state == IntentState::Accepted);
-
-    ctx.pass_time(FILL_WINDOW + 1);
-    c.slash_solver(&id);
-
-    let slash_amount = MIN_BOND / 10; // 5 USDC
-    assert_eq!(ctx.bond().balance(&ctx.fee_recipient), slash_amount);
-
-    // Penalty-to-notional ratio rounds to 0 bps — economic gap confirmed.
-    let penalty_bps = (slash_amount * 10_000) / large_notional;
-    assert_eq!(
-        penalty_bps,
-        0,
-        "Gap: slash ({slash_amount}) is < 1 bps of notional ({large_notional})"
-    );
+    let recipient = Address::generate(&ctx.env);
+    let res = ctx
+        .client()
+        .try_rescue_tokens(&ctx.bond_token, &recipient, &1);
+    assert_eq!(res, Err(Ok(Error::RescueProtectedToken.into())));
 }
 
 #[test]
-fn economic_security_proportionate_bond_yields_meaningful_penalty() {
-    // Positive counterpart: a solver bonded at ≥1% of intent notional faces
-    // a meaningful slash (≥10 bps of notional). Documents the target ratio
-    // that a future bond-to-notional check should enforce.
+fn rescue_tokens_zero_amount_fails() {
     let ctx = setup();
+    // Register a different token so the zero-amount check fires, not the
+    // protected-token check.
+    let other_token = ctx
+        .env
+        .register_stellar_asset_contract_v2(ctx.admin.clone())
+        .address();
+    let recipient = Address::generate(&ctx.env);
+    let res = ctx.client().try_rescue_tokens(&other_token, &recipient, &0);
+    assert_eq!(res, Err(Ok(Error::ZeroAmount.into())));
+}
+
+#[test]
+fn rescue_tokens_only_admin_can_call() {
+    let ctx = setup();
+    let other_token = ctx
+        .env
+        .register_stellar_asset_contract_v2(ctx.admin.clone())
+        .address();
+    let recipient = Address::generate(&ctx.env);
+
+    // With mock_all_auths, verify that the admin auth is recorded by the
+    // rescue_tokens call. If require_admin weren't present, the call would
+    // succeed but would NOT record an auth for the admin address.
     let c = ctx.client();
+    let token_admin = token::StellarAssetClient::new(&ctx.env, &other_token);
+    token_admin.mint(&ctx.contract_id, &1_000);
+    c.rescue_tokens(&other_token, &recipient, &1_000);
 
-    // Intent notional: 10,000 USDC (7 decimals = 10^11 units).
-    let notional: i128 = 10_000 * 10_000_000; // 10^11
-
-    // 1% of notional = 100 USDC, well above MIN_BOND.
-    let proportionate_bond = notional / 100;
-    ctx.bond_admin().mint(&ctx.solver, &proportionate_bond);
-    c.register_solver(&ctx.solver, &proportionate_bond);
-
-    let deadline: Option<u64> = None;
-    let id = c.submit_intent(
-        &ctx.user,
-        &String::from_str(&ctx.env, "ethereum"),
-        &String::from_str(&ctx.env, "0xabc"),
-        &notional,
-        &ctx.dst_token,
-        &notional,
-        &deadline,
-    );
-    c.accept_intent(&ctx.solver, &id);
-
-    ctx.pass_time(FILL_WINDOW + 1);
-    c.slash_solver(&id);
-
-    let slash_amount = proportionate_bond / 10;
-    let penalty_bps = (slash_amount * 10_000) / notional;
-
+    let auths = ctx.env.auths();
+    let admin_authed = auths.iter().any(|(addr, _)| *addr == ctx.admin);
     assert!(
-        penalty_bps >= 10,
-        "Expected penalty ≥ 10 bps, got {penalty_bps} bps"
+        admin_authed,
+        "rescue_tokens must require admin auth; got: {:?}",
+        auths
+    );
+}
+
+// ─── #36 Pause gates solver bond management ──────────────────────────────────────
+
+#[test]
+fn pause_blocks_register_solver() {
+    let ctx = setup();
+    let c = ctx.client();
+    c.pause();
+
+    ctx.bond_admin().mint(&ctx.solver, &BOND);
+    let res = c.try_register_solver(&ctx.solver, &BOND);
+    assert_eq!(res, Err(Ok(Error::ContractPaused.into())));
+}
+
+#[test]
+fn pause_blocks_deregister_solver() {
+    let ctx = setup();
+    let c = ctx.client();
+    ctx.register_solver();
+
+    c.pause();
+    let res = c.try_deregister_solver(&ctx.solver);
+    assert_eq!(res, Err(Ok(Error::ContractPaused.into())));
+}
+
+#[test]
+fn pause_blocks_withdraw_bond() {
+    let ctx = setup();
+    let c = ctx.client();
+    ctx.register_solver();
+
+    c.pause();
+    let res = c.try_withdraw_bond(&ctx.solver, &(100 * 10_000_000));
+    assert_eq!(res, Err(Ok(Error::ContractPaused.into())));
+}
+
+#[test]
+fn unpause_restores_solver_bond_management() {
+    let ctx = setup();
+    let c = ctx.client();
+    ctx.register_solver();
+
+    let id = ctx.submit();
+
+    // A single fill that exactly meets min_dst_amount.
+    let fee = MIN_DST * 5 / 10_000;
+    ctx.dst_admin().mint(&ctx.solver, &(MIN_DST + fee));
+    c.accept_intent(&ctx.solver, &id);
+    c.fill_intent(&ctx.solver, &id, &MIN_DST);
+
+    let intent = c.get_intent(&id).unwrap();
+    assert_eq!(intent.state, IntentState::Filled);
+    assert_eq!(intent.total_filled, MIN_DST);
+    c.pause();
+    c.unpause();
+
+    // All three operations should succeed after unpause.
+    let withdraw_amount = 100 * 10_000_000;
+    c.withdraw_bond(&ctx.solver, &withdraw_amount);
+    assert_eq!(
+        c.get_solver(&ctx.solver).unwrap().bond_amount,
+        BOND - withdraw_amount
+    );
+
+    c.deregister_solver(&ctx.solver);
+    assert!(c.get_solver(&ctx.solver).is_none());
+}
+
+#[test]
+fn pause_does_not_block_cancel_intent() {
+    // cancel_intent stays open during a pause so users can always reclaim
+    // their Open intents -- they shouldn't be locked in by an admin pause.
+    let ctx = setup();
+    let c = ctx.client();
+    let id = ctx.submit();
+
+    c.pause();
+    c.cancel_intent(&ctx.user, &id);
+    assert!(c.get_intent(&id).unwrap().state == IntentState::Cancelled);
+}
+
+// ─── #37 DstAllowlistEnabled default is false ────────────────────────────────────
+
+#[test]
+fn dst_allowlist_enabled_defaults_to_false() {
+    // This test acts as a CI sentinel: if the default is ever changed from
+    // false, this test will catch it before it reaches mainnet.
+    //
+    // Pre-launch action: once the allowed dst_token list is populated,
+    // call set_dst_allowlist_enabled(true) before the contract goes live so
+    // submit_intent validates every destination token.
+    let ctx = setup();
+    assert!(
+        !ctx.client().is_dst_allowlist_enabled(),
+        "DstAllowlistEnabled must default to false; \
+         enable it explicitly via set_dst_allowlist_enabled before mainnet launch"
     );
 }

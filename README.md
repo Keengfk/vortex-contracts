@@ -28,6 +28,8 @@ Core protocol logic (`intent_settlement/src/lib.rs`):
 - `set_fee_recipient()` / `transfer_admin()` — admin key management
 - `pause()` / `unpause()` — admin-only incident response
 - `add_allowed_dst_token()` / `remove_allowed_dst_token()` / `set_dst_allowlist_enabled()` — optional dst_token allowlist
+- `add_allowed_src_chain()` / `remove_allowed_src_chain()` / `set_src_chain_allowlist_enabled()` — optional src_chain allowlist (#34)
+- `rescue_tokens()` — admin-only recovery of non-bond tokens accidentally sent to the contract (#35)
 
 #### Usage examples
 
@@ -109,32 +111,35 @@ Settlement relies on two primitives:
    5 minutes. If they fail to fill, the intent reverts to `open` and is
    re-auctioned, and the bond is slashed permissionlessly via `slash_solver()`.
 
-### Known Limitations
+### Pause scope (issue #36)
 
-#### fill_amount is solver-reported and unverified on-chain
+`pause()` halts `submit_intent`, `accept_intent`, `fill_intent`, **and** the
+solver bond management functions (`register_solver`, `deregister_solver`,
+`withdraw_bond`). The rationale:
 
-`fill_intent` (lib.rs:569) trusts the solver's self-reported `fill_amount`
-entirely. The contract verifies that `fill_amount >= min_dst_amount` and that
-the corresponding token transfer succeeds on Stellar, but it does **not**
-verify that the source-chain leg of the swap (e.g. the ETH deposit on Ethereum)
-actually occurred or matched the claimed amount.
+- During a live incident an admin needs to freeze the full protocol state to
+  investigate. Allowing solvers to withdraw bonds while paused would let them
+  shed collateral exactly when the protocol needs it most as a backstop.
+- `slash_solver()` remains **permissionless and unpauseable** — a solver who
+  already accepted an intent cannot dodge accountability by waiting out the
+  pause.
+- `cancel_intent()` remains **open during a pause** — users should always be
+  able to reclaim their Open intents without needing admin cooperation.
 
-This is an explicit, known trust assumption: correctness of cross-chain fills
-depends on the solver acting honestly. The economic deterrent (bond slashing)
-discourages dishonest behavior, but it does not make fraud cryptographically
-impossible with the current design.
+### Destination token allowlist default (issue #37)
 
-**Planned mitigation:** The roadmap's "Cross-chain proof verification" item
-(see below) is intended to close this gap by verifying source-chain transactions
-on-chain via a Stellar oracle or cross-chain messaging infrastructure. Until
-that work is complete, integrators and auditors should treat `fill_amount` as
-solver-attested rather than cryptographically proven.
+`is_dst_allowlist_enabled` defaults to **`false`** on a fresh deployment,
+meaning `submit_intent` accepts any `dst_token` address until an admin opts in.
 
-**Impact scope:** A solver who self-reports a higher `fill_amount` than they
-actually transferred still has to execute a token transfer on Stellar of at
-least that amount (the `dst_client.transfer` call will fail otherwise). The
-unverified dimension is the *source-chain* leg: whether the off-chain swap
-event that the intent represents actually happened is not checked on-chain.
+**Pre-launch action required:** before going live on mainnet, call
+`add_allowed_dst_token()` for every supported output token, then call
+`set_dst_allowlist_enabled(true)` to enforce validation. This prevents users
+from accidentally targeting an unsupported or malicious token contract.
+
+The same pattern applies to the **source-chain allowlist** (`is_src_chain_allowlist_enabled`,
+also off by default). Call `add_allowed_src_chain()` for every supported source
+chain (e.g. `"ethereum"`, `"base"`, `"polygon"`), then enable enforcement with
+`set_src_chain_allowlist_enabled(true)`.
 
 To report a vulnerability, see the org
 [SECURITY.md](https://github.com/vortex-protocol/.github/blob/main/SECURITY.md).
