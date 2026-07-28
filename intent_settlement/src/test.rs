@@ -690,6 +690,82 @@ fn submit_intent_past_deadline_fails() {
     assert_eq!(res, Err(Ok(Error::InvalidDeadline.into())));
 }
 
+// #25 — same-ledger intents with identical params produce distinct ids (nonce).
+//
+// Before the fix, compute_intent_id hashed only (user, src_chain, src_amount,
+// timestamp). Two submit_intent calls in the same ledger with the same args
+// produced the same id and the second silently overwrote the first record.
+// After the fix a per-user nonce is included in the preimage, so every call
+// yields a unique id regardless of timestamp.
+#[test]
+fn same_ledger_identical_intents_produce_distinct_ids() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    // Both submits happen at the same ledger timestamp.
+    let id1 = ctx.submit();
+    let id2 = ctx.submit();
+
+    // The ids must be different — neither intent overwrote the other.
+    assert_ne!(id1, id2);
+
+    // Both records must be independently retrievable.
+    assert!(c.get_intent(&id1).is_some());
+    assert!(c.get_intent(&id2).is_some());
+
+    // Total intents counter must reflect both submissions.
+    assert_eq!(c.get_stats().0, 2);
+}
+
+#[test]
+fn nonce_increments_per_user_across_submissions() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    // Submit three intents from the same user in the same ledger close.
+    let id1 = ctx.submit();
+    let id2 = ctx.submit();
+    let id3 = ctx.submit();
+
+    // All three must be distinct.
+    assert_ne!(id1, id2);
+    assert_ne!(id2, id3);
+    assert_ne!(id1, id3);
+
+    // All three records exist.
+    assert!(c.get_intent(&id1).is_some());
+    assert!(c.get_intent(&id2).is_some());
+    assert!(c.get_intent(&id3).is_some());
+
+    assert_eq!(c.get_stats().0, 3);
+}
+
+#[test]
+fn different_users_same_params_same_ledger_produce_distinct_ids() {
+    // Nonces are per-user so two different users both on nonce 0 at the same
+    // timestamp must still get different ids (the user address is in the preimage).
+    let ctx = setup();
+    let c = ctx.client();
+
+    let user2 = Address::generate(&ctx.env);
+    let deadline: Option<u64> = None;
+
+    let id1 = ctx.submit(); // ctx.user, nonce=0
+    let id2 = c.submit_intent(
+        &user2,
+        &String::from_str(&ctx.env, "ethereum"),
+        &String::from_str(&ctx.env, "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+        &SRC_AMT,
+        &ctx.dst_token,
+        &MIN_DST,
+        &deadline,
+    ); // user2, nonce=0
+
+    assert_ne!(id1, id2);
+    assert!(c.get_intent(&id1).is_some());
+    assert!(c.get_intent(&id2).is_some());
+}
+
 // ─── Happy path: submit → accept → fill ─────────────────────────────────────────
 
 #[test]
@@ -1026,6 +1102,118 @@ fn state_changing_calls_extend_instance_ttl() {
         .as_contract(&ctx.contract_id, || ctx.env.storage().instance().get_ttl());
 
     assert!(instance_ttl >= crate::INSTANCE_TTL_EXTEND_TO - 1);
+}
+
+// ─── CEI regression tests ────────────────────────────────────────────────────────
+
+// #28 — double-deregister is rejected cleanly after the storage-first reorder.
+//
+// Before the fix, the record was still present when the bond transfer ran, so
+// a second deregister_solver call before the remove could (in a future async or
+// re-entrant context) see the record and transfer the bond a second time.
+// After the fix the record is removed first, so the second call panics with
+// SolverNotRegistered before it reaches the transfer.
+#[test]
+fn double_deregister_rejected_cleanly() {
+    let ctx = setup();
+    ctx.register_solver();
+
+    // First deregister succeeds and removes the record.
+    ctx.client().deregister_solver(&ctx.solver);
+    assert!(ctx.client().get_solver(&ctx.solver).is_none());
+    // Bond is back with the solver.
+    assert_eq!(ctx.bond().balance(&ctx.solver), BOND);
+
+    // Second call on the same address must be rejected — no record to refund.
+    let res = ctx.client().try_deregister_solver(&ctx.solver);
+    assert_eq!(res, Err(Ok(Error::SolverNotRegistered.into())));
+
+    // Crucially the contract's bond balance must not have changed further —
+    // it was zero after the first deregister and should still be zero.
+    assert_eq!(ctx.bond().balance(&ctx.contract_id), 0);
+    // Solver's balance should still equal exactly one bond refund, not two.
+    assert_eq!(ctx.bond().balance(&ctx.solver), BOND);
+}
+
+// #27 — SolverRecord state is consistent with actual token balances after
+// register_solver.  After the storage-first reorder the record is written
+// before the transfer, so if the transfer were ever to fail the record simply
+// wouldn't reflect a deposit that never happened.  Here we verify the happy
+// path: record.bond_amount == tokens held by the contract.
+#[test]
+fn solver_record_consistent_with_token_balances_after_register() {
+    let ctx = setup();
+
+    // Mint exactly BOND to the solver, then register.
+    ctx.bond_admin().mint(&ctx.solver, &BOND);
+    ctx.client().register_solver(&ctx.solver, &BOND);
+
+    let record = ctx.client().get_solver(&ctx.solver).unwrap();
+
+    // Storage says the bond is BOND.
+    assert_eq!(record.bond_amount, BOND);
+    // The contract actually holds BOND tokens — no discrepancy.
+    assert_eq!(ctx.bond().balance(&ctx.contract_id), BOND);
+    // Solver's wallet is empty — tokens moved.
+    assert_eq!(ctx.bond().balance(&ctx.solver), 0);
+
+    // Top-up path: record.bond_amount must keep tracking reality after a second deposit.
+    let topup = 200 * 10_000_000;
+    ctx.bond_admin().mint(&ctx.solver, &topup);
+    ctx.client().register_solver(&ctx.solver, &topup);
+
+    let record2 = ctx.client().get_solver(&ctx.solver).unwrap();
+    assert_eq!(record2.bond_amount, BOND + topup);
+    assert_eq!(ctx.bond().balance(&ctx.contract_id), BOND + topup);
+    assert_eq!(ctx.bond().balance(&ctx.solver), 0);
+}
+
+// #26 — CEI ordering in fill_intent: state is committed before transfers.
+//
+// We verify two complementary properties:
+//
+// 1. After a successful fill the intent is Filled in storage *and* tokens
+//    have moved — state and funds are always in sync (the core CEI invariant).
+//
+// 2. A second fill_intent call on the same (already-Filled) intent is
+//    rejected with IntentAlreadyFilled before any transfer attempt.  This is
+//    the on-chain guard that would stop a re-entrant token from triggering a
+//    double-fill: whatever point during the transfers the re-entrant call is
+//    made, storage already shows Filled.
+#[test]
+fn fill_intent_state_committed_before_transfer_and_double_fill_rejected() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    ctx.register_solver();
+    let id = ctx.submit();
+    c.accept_intent(&ctx.solver, &id);
+
+    // Fund the solver with enough for the fill + fee.
+    let fee = FILL * 5 / 10_000;
+    ctx.dst_admin().mint(&ctx.solver, &(FILL + fee));
+
+    // Happy-path fill.
+    c.fill_intent(&ctx.solver, &id, &FILL);
+
+    // 1. Storage reflects Filled and fill_amount is set.
+    let intent = c.get_intent(&id).unwrap();
+    assert_eq!(intent.state, IntentState::Filled);
+    assert_eq!(intent.fill_amount, Some(FILL));
+
+    // 2. Tokens have moved: user got FILL, fee_recipient got fee, solver has 0.
+    assert_eq!(ctx.dst().balance(&ctx.user), FILL);
+    assert_eq!(ctx.dst().balance(&ctx.fee_recipient), fee);
+    assert_eq!(ctx.dst().balance(&ctx.solver), 0);
+
+    // 3. A second fill attempt is rejected before any transfer — this is exactly
+    //    what a re-entrant token would hit mid-transfer after the CEI reorder.
+    ctx.dst_admin().mint(&ctx.solver, &(FILL + fee)); // give solver funds again
+    let res = c.try_fill_intent(&ctx.solver, &id, &FILL);
+    assert_eq!(res, Err(Ok(Error::IntentAlreadyFilled.into())));
+
+    // User's balance must not have increased — no double-payment.
+    assert_eq!(ctx.dst().balance(&ctx.user), FILL);
 }
 
 // ─── Views ──────────────────────────────────────────────────────────────────────

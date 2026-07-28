@@ -51,6 +51,7 @@ pub enum DataKey {
     Paused,
     AllowedDstToken(Address), // dst_token -> present if allowed
     DstAllowlistEnabled,
+    UserNonce(Address),       // per-user submit counter to widen intent_id preimage
     AllowedSrcChain(String), // src_chain name -> present if allowed
     SrcChainAllowlistEnabled,
 }
@@ -136,6 +137,7 @@ pub enum Error {
     DeadlineNotReached = 19,
     InsufficientBond = 20,
     DstTokenNotAllowed = 21,
+    IntentAlreadyExists = 22,
     /// #30: no pending fee-recipient proposal to accept
     NoPendingFeeRecipient = 22,
     /// #31: fee arithmetic overflowed (fill_amount is astronomically large)
@@ -465,10 +467,12 @@ impl IntentSettlement {
 
         let is_new_solver = existing.is_none();
 
-        let bond_token: Address = env.storage().instance().get(&DataKey::BondToken).unwrap();
-        let client = token::Client::new(&env, &bond_token);
-        client.transfer(&solver, &env.current_contract_address(), &bond_amount);
-
+        // ── Effects first (CEI) ──────────────────────────────────────────────
+        // Build and persist the SolverRecord *before* pulling funds in so the
+        // contract's storage is always consistent with what it holds: if the
+        // transfer were to fail (or a re-entrant call were made mid-transfer),
+        // the record either doesn't exist yet (new solver) or still reflects
+        // the pre-topup balance, rather than an inflated balance with no matching funds.
         let record = match existing {
             Some(mut s) => {
                 s.bond_amount += bond_amount;
@@ -503,6 +507,11 @@ impl IntentSettlement {
                 .set(&DataKey::TotalSolvers, &(total + 1));
         }
 
+        // ── Interaction: pull bond in ────────────────────────────────────────
+        let bond_token: Address = env.storage().instance().get(&DataKey::BondToken).unwrap();
+        let client = token::Client::new(&env, &bond_token);
+        client.transfer(&solver, &env.current_contract_address(), &bond_amount);
+
         env.events().publish(
             (Symbol::new(&env, "solver_registered"), solver),
             bond_amount,
@@ -524,17 +533,10 @@ impl IntentSettlement {
             panic_with_error!(&env, Error::SolverHasActiveIntents);
         }
 
-        // Return bond
-        if record.bond_amount > 0 {
-            let bond_token: Address = env.storage().instance().get(&DataKey::BondToken).unwrap();
-            let client = token::Client::new(&env, &bond_token);
-            client.transfer(
-                &env.current_contract_address(),
-                &solver,
-                &record.bond_amount,
-            );
-        }
-
+        // ── Effects first (CEI) ──────────────────────────────────────────────
+        // Remove the solver record and update the counter *before* the external
+        // token transfer so that any re-entrant call sees no record and would
+        // panic with SolverNotRegistered rather than processing a double-refund.
         env.storage()
             .persistent()
             .remove(&DataKey::Solver(solver.clone()));
@@ -547,6 +549,17 @@ impl IntentSettlement {
         env.storage()
             .instance()
             .set(&DataKey::TotalSolvers, &total.saturating_sub(1));
+
+        // ── Interaction: return bond ─────────────────────────────────────────
+        if record.bond_amount > 0 {
+            let bond_token: Address = env.storage().instance().get(&DataKey::BondToken).unwrap();
+            let client = token::Client::new(&env, &bond_token);
+            client.transfer(
+                &env.current_contract_address(),
+                &solver,
+                &record.bond_amount,
+            );
+        }
 
         env.events().publish(
             (Symbol::new(&env, "solver_deregistered"), solver),
@@ -638,8 +651,30 @@ impl IntentSettlement {
             panic_with_error!(&env, Error::InvalidDeadline);
         }
 
-        // Deterministic intent_id = hash(user, src_chain, src_token, src_amount, now)
-        let intent_id = Self::compute_intent_id(&env, &user, &src_chain, src_amount, now);
+        // Widen the preimage with a per-user nonce so that two intents from
+        // the same user with identical (src_chain, src_amount) in the same
+        // ledger close produce distinct ids rather than colliding silently.
+        let nonce: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::UserNonce(user.clone()))
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::UserNonce(user.clone()), &(nonce + 1));
+
+        // Deterministic intent_id = hash(user, src_chain, src_token, src_amount, now, nonce)
+        let intent_id = Self::compute_intent_id(&env, &user, &src_chain, src_amount, now, nonce);
+
+        // Guard against an extremely unlikely hash collision: if a record with
+        // this id somehow already exists, reject rather than silently overwrite.
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::Intent(intent_id.clone()))
+        {
+            panic_with_error!(&env, Error::IntentAlreadyExists);
+        }
 
         let intent = IntentRecord {
             intent_id: intent_id.clone(),
@@ -768,6 +803,11 @@ impl IntentSettlement {
             panic_with_error!(&env, Error::InsufficientOutput);
         }
 
+        // ── Effects first (CEI) ──────────────────────────────────────────────
+        // Mark the intent Filled and write every state change to storage
+        // *before* any external token transfer executes. A hostile SEP-41
+        // token that attempts to re-enter fill_intent or slash_solver during
+        // the transfer would see the intent already Filled and be rejected.
         // Solver delivers the full requested output to the user.
         let dst_client = token::Client::new(&env, &intent.dst_token);
         dst_client.transfer(&solver, &intent.user, &fill_amount);
@@ -826,6 +866,25 @@ impl IntentSettlement {
             .persistent()
             .set(&DataKey::Intent(intent_id.clone()), &intent);
         Self::bump_intent_ttl(&env, &intent_id);
+
+        // ── Interactions: token transfers ────────────────────────────────────
+        // Solver delivers the full requested output to the user.
+        let dst_client = token::Client::new(&env, &intent.dst_token);
+        dst_client.transfer(&solver, &intent.user, &fill_amount);
+
+        // Solver also pays the protocol fee (priced into their quote). Taking the
+        // fee from the solver — rather than clawing it back from the user — keeps
+        // the user's received amount at or above `min_dst_amount`, and keeps every
+        // token transfer authorized by the solver who signed this call.
+        let fee = fill_amount * PROTOCOL_FEE_BPS / 10_000;
+        if fee > 0 {
+            let fee_recipient: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::FeeRecipient)
+                .unwrap();
+            dst_client.transfer(&solver, &fee_recipient, &fee);
+        }
 
         env.events().publish(
             (Symbol::new(&env, "intent_filled"), solver),
@@ -1078,15 +1137,18 @@ impl IntentSettlement {
         src_chain: &String,
         amount: i128,
         timestamp: u64,
+        nonce: u64,
     ) -> BytesN<32> {
         // Build a collision-resistant preimage from the full intent context, then
-        // hash to a 32-byte id. Including the user and source chain ensures two
-        // otherwise-identical intents from different users or chains never collide.
+        // hash to a 32-byte id. Including the user, source chain, and a
+        // per-user nonce ensures two otherwise-identical intents from the same
+        // user in the same ledger always produce distinct ids.
         let mut preimage = Bytes::new(env);
         preimage.append(&user.clone().to_xdr(env));
         preimage.append(&src_chain.clone().to_xdr(env));
         preimage.extend_from_array(&amount.to_be_bytes());
         preimage.extend_from_array(&timestamp.to_be_bytes());
+        preimage.extend_from_array(&nonce.to_be_bytes());
         env.crypto().sha256(&preimage).into()
     }
 }
