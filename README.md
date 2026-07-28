@@ -35,6 +35,10 @@ All examples use the [Stellar CLI](https://developers.stellar.org/docs/tools/dev
 against a deployed contract. Swap `<CONTRACT_ID>` and `<SECRET_KEY>` for your
 deployment; addresses shown are placeholders.
 
+For a complete guide on building an off-chain solver bot (event subscription,
+eligibility checks, accept/fill flow), see
+[`docs/solver-integration-guide.md`](./docs/solver-integration-guide.md).
+
 ```bash
 # User submits a swap intent: 1 ETH on Ethereum for at least 3500 USDC on Stellar
 stellar contract invoke --id <CONTRACT_ID> --source <SECRET_KEY> --network testnet -- \
@@ -97,6 +101,10 @@ stellar contract deploy \
   --network testnet
 ```
 
+For a step-by-step mainnet promotion checklist (initialize parameters, bond
+token verification, post-deploy sanity checks, rollback procedures), see
+[`docs/mainnet-deployment-runbook.md`](./docs/mainnet-deployment-runbook.md).
+
 ---
 
 ## Security Model
@@ -126,7 +134,9 @@ To report a vulnerability, see the org
 
 ## Contributing
 
-See the org-wide
+See the repo-specific [`CONTRIBUTING.md`](./CONTRIBUTING.md) for Rust/Soroban
+toolchain setup, test conventions, and PR requirements. For org-wide process,
+see the org-wide
 [CONTRIBUTING.md](https://github.com/vortex-protocol/.github/blob/main/CONTRIBUTING.md).
 
 ## License
