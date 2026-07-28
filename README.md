@@ -79,6 +79,32 @@ Tiered solver staking with reputation scores. See the roadmap below.
 
 - Rust 1.78+ with the `wasm32-unknown-unknown` target
 - [Stellar CLI](https://developers.stellar.org/docs/tools/developer-tools/cli/stellar-cli)
+- [GNU Make](https://www.gnu.org/software/make/) or [`just`](https://just.systems/) (optional shortcuts)
+
+### Shortcut commands (recommended)
+
+A `Makefile` and `justfile` are provided at the repo root so you can run the
+full pre-push check with a single command:
+
+```bash
+make all          # fmt + lint + test + build
+# or, with just:
+just all
+```
+
+Individual targets:
+
+```bash
+make fmt          # cargo fmt --all
+make lint         # cargo clippy --all-targets -- -D warnings
+make test         # cargo test
+make build        # cargo build --target wasm32-unknown-unknown --release
+make help         # list all targets
+```
+
+### Raw commands
+
+If you prefer to run commands directly (or don't have Make/just installed):
 
 ```bash
 cd intent_settlement
@@ -90,9 +116,20 @@ stellar contract build
 
 ### Deploy (testnet)
 
+Using the Makefile shortcut:
+
+```bash
+export STELLAR_SOURCE=<SECRET_KEY>
+make deploy-testnet
+# or:
+just deploy-testnet STELLAR_SOURCE=<SECRET_KEY>
+```
+
+Or run the raw command directly:
+
 ```bash
 stellar contract deploy \
-  --wasm target/wasm32-unknown-unknown/release/vortex_intent_settlement.wasm \
+  --wasm intent_settlement/target/wasm32-unknown-unknown/release/vortex_intent_settlement.wasm \
   --source <SECRET_KEY> \
   --network testnet
 ```
@@ -126,8 +163,12 @@ To report a vulnerability, see the org
 
 ## Contributing
 
-See the org-wide
-[CONTRIBUTING.md](https://github.com/vortex-protocol/.github/blob/main/CONTRIBUTING.md).
+See [CONTRIBUTING.md](./CONTRIBUTING.md) for contributor and maintainer
+guidelines, including local dev commands, the pre-push checklist, and the
+branch-protection / required-checks maintainer guide.
+
+For org-wide policies see the
+[org CONTRIBUTING.md](https://github.com/vortex-protocol/.github/blob/main/CONTRIBUTING.md).
 
 ## License
 
