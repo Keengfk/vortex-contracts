@@ -848,16 +848,14 @@ fn cannot_accept_already_accepted_intent() {
 // ─── Fill guards ────────────────────────────────────────────────────────────────
 
 #[test]
-fn fill_below_minimum_fails() {
+fn fill_zero_amount_fails() {
     let ctx = setup();
     ctx.register_solver();
     let id = ctx.submit();
     ctx.client().accept_intent(&ctx.solver, &id);
 
-    let res = ctx
-        .client()
-        .try_fill_intent(&ctx.solver, &id, &(MIN_DST - 1));
-    assert_eq!(res, Err(Ok(Error::InsufficientOutput.into())));
+    let res = ctx.client().try_fill_intent(&ctx.solver, &id, &0);
+    assert_eq!(res, Err(Ok(Error::ZeroAmount.into())));
 }
 
 #[test]
@@ -1231,6 +1229,85 @@ fn get_bond_token_returns_configured_token() {
     assert_eq!(ctx.client().get_bond_token(), Some(ctx.bond_token.clone()));
 }
 
+// ─── Partial fills ───────────────────────────────────────────────────────────────
+
+#[test]
+fn two_partial_fills_complete_intent() {
+    let ctx = setup();
+    let c = ctx.client();
+    ctx.register_solver();
+
+    // Submit with MIN_DST as the full target.
+    let id = ctx.submit();
+
+    // First partial fill: half of MIN_DST.
+    let half = MIN_DST / 2;
+    let fee1 = half * 5 / 10_000;
+    ctx.dst_admin().mint(&ctx.solver, &(half + fee1));
+    c.accept_intent(&ctx.solver, &id);
+    c.fill_intent(&ctx.solver, &id, &half);
+
+    // Intent should now be PartiallyFilled and re-opened (solver reset).
+    let intent = c.get_intent(&id).unwrap();
+    assert_eq!(intent.state, IntentState::PartiallyFilled);
+    assert_eq!(intent.total_filled, half);
+    assert!(intent.solver.is_none());
+
+    // User already received the first half.
+    assert_eq!(ctx.dst().balance(&ctx.user), half);
+
+    // Second fill: the remainder — brings total to MIN_DST.
+    let remainder = MIN_DST - half;
+    let fee2 = remainder * 5 / 10_000;
+    ctx.dst_admin().mint(&ctx.solver, &(remainder + fee2));
+    c.accept_intent(&ctx.solver, &id);
+    c.fill_intent(&ctx.solver, &id, &remainder);
+
+    let intent = c.get_intent(&id).unwrap();
+    assert_eq!(intent.state, IntentState::Filled);
+    assert_eq!(intent.total_filled, MIN_DST);
+    assert_eq!(intent.fill_amount, Some(MIN_DST));
+
+    // User has received the full MIN_DST across both fills.
+    assert_eq!(ctx.dst().balance(&ctx.user), MIN_DST);
+
+    // Solver credited fills_completed once (on the completing fill).
+    let solver = c.get_solver(&ctx.solver).unwrap();
+    assert_eq!(solver.fills_completed, 1);
+    assert_eq!(solver.total_volume, MIN_DST);
+}
+
+#[test]
+fn partial_fill_left_incomplete_past_deadline_can_be_expired() {
+    let ctx = setup();
+    let c = ctx.client();
+    ctx.register_solver();
+
+    let id = ctx.submit();
+
+    // Deliver a partial fill (less than MIN_DST).
+    let partial = MIN_DST / 3;
+    let fee = partial * 5 / 10_000;
+    ctx.dst_admin().mint(&ctx.solver, &(partial + fee));
+    c.accept_intent(&ctx.solver, &id);
+    c.fill_intent(&ctx.solver, &id, &partial);
+
+    // Intent is PartiallyFilled and re-opened with a fresh INTENT_EXPIRY deadline.
+    assert_eq!(
+        c.get_intent(&id).unwrap().state,
+        IntentState::PartiallyFilled
+    );
+
+    // Let the new deadline expire without anyone picking up the remainder.
+    ctx.pass_time(INTENT_EXPIRY + 1);
+
+    // expire_intent works on PartiallyFilled intents past their deadline.
+    c.expire_intent(&id);
+    assert_eq!(c.get_intent(&id).unwrap().state, IntentState::Expired);
+}
+
+#[test]
+fn single_fill_at_or_above_minimum_completes_immediately() {
 // ─── #29: slash_solver ordering ─────────────────────────────────────────────────
 
 /// Calling slash_solver twice on the same intent_id must fail on the second
@@ -1710,6 +1787,17 @@ fn unpause_restores_solver_bond_management() {
     let c = ctx.client();
     ctx.register_solver();
 
+    let id = ctx.submit();
+
+    // A single fill that exactly meets min_dst_amount.
+    let fee = MIN_DST * 5 / 10_000;
+    ctx.dst_admin().mint(&ctx.solver, &(MIN_DST + fee));
+    c.accept_intent(&ctx.solver, &id);
+    c.fill_intent(&ctx.solver, &id, &MIN_DST);
+
+    let intent = c.get_intent(&id).unwrap();
+    assert_eq!(intent.state, IntentState::Filled);
+    assert_eq!(intent.total_filled, MIN_DST);
     c.pause();
     c.unpause();
 

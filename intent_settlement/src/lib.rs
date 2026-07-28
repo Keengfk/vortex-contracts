@@ -75,7 +75,7 @@ pub struct IntentRecord {
 
     /// Destination (always Stellar)
     pub dst_token: Address, // SAC/SEP-41 token on Stellar
-    pub min_dst_amount: i128, // minimum acceptable output
+    pub min_dst_amount: i128, // minimum acceptable output per fill (floor per partial)
 
     pub solver: Option<Address>, // assigned solver
     pub state: IntentState,
@@ -83,18 +83,29 @@ pub struct IntentRecord {
     pub created_at: u64,
     pub deadline: u64,
     pub filled_at: Option<u64>,
-    pub fill_amount: Option<i128>, // actual amount received
+    pub fill_amount: Option<i128>, // cumulative dst tokens received across all fills
+
+    /// Cumulative dst tokens delivered so far; intent completes when this
+    /// reaches or exceeds `min_dst_amount * num_fills_needed`, but in the
+    /// partial-fill model the intent is fully settled once the solver
+    /// delivering a fill brings `total_filled` to at least `min_dst_amount`.
+    ///
+    /// More precisely: each individual partial fill must be > 0, and the
+    /// intent transitions to `Filled` as soon as `total_filled` satisfies
+    /// the user's `min_dst_amount` requirement.
+    pub total_filled: i128,
 }
 
 #[contracttype]
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Debug)]
 pub enum IntentState {
-    Open,      // awaiting solver
-    Accepted,  // solver claimed it
-    Filled,    // user received output
-    Cancelled, // user cancelled before fill
-    Expired,   // deadline passed, no fill
-    Slashed,   // solver failed to fill after accepting
+    Open,            // awaiting solver
+    Accepted,        // solver claimed it
+    PartiallyFilled, // one or more partial fills delivered; still open for more
+    Filled,          // user received total output >= min_dst_amount
+    Cancelled,       // user cancelled before fill
+    Expired,         // deadline passed, no fill
+    Slashed,         // solver failed to fill after accepting
 }
 
 /// A registered solver (market maker)
@@ -693,6 +704,7 @@ impl IntentSettlement {
             deadline: expiry,
             filled_at: None,
             fill_amount: None,
+            total_filled: 0,
         };
 
         env.storage()
@@ -749,7 +761,7 @@ impl IntentSettlement {
             panic_with_error!(&env, Error::IntentExpired);
         }
 
-        if intent.state != IntentState::Open {
+        if intent.state != IntentState::Open && intent.state != IntentState::PartiallyFilled {
             panic_with_error!(&env, Error::IntentNotOpen);
         }
 
@@ -774,8 +786,16 @@ impl IntentSettlement {
         );
     }
 
-    /// Solver fills the intent by sending dst_token to the user
-    /// The solver provides cross-chain proof (stored off-chain; on-chain we trust solver's bond)
+    /// Solver fills the intent by sending dst_token to the user.
+    ///
+    /// Partial fills are supported: `fill_amount` must be > 0 but may be less
+    /// than `min_dst_amount`.  The intent transitions to `PartiallyFilled` after
+    /// each sub-fill and is re-opened so another solver (or the same one) can
+    /// accept and deliver the remainder.  Once the cumulative `total_filled`
+    /// reaches or exceeds `min_dst_amount` the intent transitions to `Filled`.
+    ///
+    /// The protocol fee is taken on each individual fill so the fee accounting
+    /// stays consistent regardless of how many fills it takes.
     pub fn fill_intent(env: Env, solver: Address, intent_id: BytesN<32>, fill_amount: i128) {
         solver.require_auth();
         Self::require_not_paused(&env);
@@ -802,10 +822,16 @@ impl IntentSettlement {
             panic_with_error!(&env, Error::Unauthorized);
         }
 
-        if fill_amount < intent.min_dst_amount {
-            panic_with_error!(&env, Error::InsufficientOutput);
+        if fill_amount <= 0 {
+            panic_with_error!(&env, Error::ZeroAmount);
         }
 
+        // Deliver this fill's tokens to the user.
+        let dst_client = token::Client::new(&env, &intent.dst_token);
+        dst_client.transfer(&solver, &intent.user, &fill_amount);
+
+        // Solver also pays the protocol fee on each fill.
+        let fee = fill_amount * PROTOCOL_FEE_BPS / 10_000;
         // ── Effects first (CEI) ──────────────────────────────────────────────
         // Mark the intent Filled and write every state change to storage
         // *before* any external token transfer executes. A hostile SEP-41
@@ -837,19 +863,37 @@ impl IntentSettlement {
             dst_client.transfer(&solver, &fee_recipient, &fee);
         }
 
-        intent.state = IntentState::Filled;
-        intent.filled_at = Some(now);
-        intent.fill_amount = Some(fill_amount);
+        // Accumulate the fill.
+        intent.total_filled += fill_amount;
+        let cumulative = intent.total_filled;
 
-        // Update solver stats
+        // Update fill_amount to reflect the running total for backward-compatible reads.
+        intent.fill_amount = Some(cumulative);
+
+        // Update solver stats for this partial fill.
         let mut solver_record: SolverRecord = env
             .storage()
             .persistent()
             .get(&DataKey::Solver(solver.clone()))
             .unwrap();
-        solver_record.fills_completed += 1;
         solver_record.total_volume += fill_amount;
-        solver_record.active_intents = solver_record.active_intents.saturating_sub(1);
+
+        if cumulative >= intent.min_dst_amount {
+            // Intent is fully satisfied — close it out.
+            intent.state = IntentState::Filled;
+            intent.filled_at = Some(now);
+            solver_record.fills_completed += 1;
+            solver_record.active_intents = solver_record.active_intents.saturating_sub(1);
+        } else {
+            // Partial fill: re-open so another solver (or the same) can claim the
+            // remaining amount.  Reset solver assignment and deadline back to the
+            // full intent expiry window so the rest of the intent can be picked up.
+            intent.state = IntentState::PartiallyFilled;
+            intent.solver = None;
+            intent.deadline = now + INTENT_EXPIRY;
+            solver_record.active_intents = solver_record.active_intents.saturating_sub(1);
+        }
+
         env.storage()
             .persistent()
             .set(&DataKey::Solver(solver.clone()), &solver_record);
@@ -914,7 +958,7 @@ impl IntentSettlement {
             panic_with_error!(&env, Error::CannotCancelAccepted);
         }
 
-        if intent.state != IntentState::Open {
+        if intent.state != IntentState::Open && intent.state != IntentState::PartiallyFilled {
             panic_with_error!(&env, Error::IntentNotOpen);
         }
 
@@ -969,8 +1013,12 @@ impl IntentSettlement {
             solver_record.is_active = false;
         }
 
-        // Re-open the intent
-        intent.state = IntentState::Open;
+        // Re-open the intent, preserving partial-fill progress if any.
+        intent.state = if intent.total_filled > 0 {
+            IntentState::PartiallyFilled
+        } else {
+            IntentState::Open
+        };
         intent.solver = None;
         intent.deadline = now + INTENT_EXPIRY;
 
@@ -1021,7 +1069,7 @@ impl IntentSettlement {
             .get(&DataKey::Intent(intent_id.clone()))
             .unwrap_or_else(|| panic_with_error!(&env, Error::IntentNotFound));
 
-        if intent.state != IntentState::Open {
+        if intent.state != IntentState::Open && intent.state != IntentState::PartiallyFilled {
             panic_with_error!(&env, Error::IntentNotOpen);
         }
 
