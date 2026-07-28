@@ -185,6 +185,8 @@ pub struct SolverRecord {
     /// Number of intents currently Accepted by this solver (not yet filled or slashed).
     /// Bond stays locked behind these obligations, so it must be zero before deregistration.
     pub active_intents: u32,
+    /// Timestamp of last slash; cooldown applies after a slash.
+    pub last_slash_time: u64,
 }
 
 /// Return type for `get_protocol_params`.
@@ -569,7 +571,55 @@ impl IntentSettlement {
             .unwrap_or(false)
     }
 
+    // ── Per-Token Bond Multiplier ──────────────────────────────────────────────
+
+    /// Admin-only: set a custom bond multiplier for a dst_token.
+    /// Multiplier is stored as i128 where 10 = 1.0x, 15 = 1.5x, 20 = 2.0x.
+    /// Unset tokens default to 10 (1.0x).
+    pub fn set_min_bond_multiplier(env: Env, token: Address, multiplier: i128) {
+        Self::require_admin(&env);
+        if multiplier <= 0 {
+            panic_with_error!(&env, Error::ZeroAmount);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::MinBondMultiplier(token.clone()), &multiplier);
+        env.events().publish(
+            (Symbol::new(&env, "bond_multiplier_set"),),
+            (token, multiplier),
+        );
+    }
+
+    /// Get the bond multiplier for a dst_token, or 10 (1.0x) if unset.
+    pub fn get_min_bond_multiplier(env: Env, token: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MinBondMultiplier(token))
+            .unwrap_or(10)
     // ── Source Chain Allowlist ────────────────────────────────────────────────
+get_tiered_fee_bps is only called from fund_c_address (1320), reveal_fund (4164), fund_c_address_with_swap (4325), and execute_meta_fund (4498). batch_fund_c_address (1445) and fund_c_address_with_referral (2079) both compute the fee directly from the flat global rate via get_effective_fee_bps, never consulting the caller's volume tier — meaning the tiered-fee feature is silently bypassed on 2 of the bridge's 7 funding entry points.
+
+What needs to be done
+ Route batch_fund_c_address and fund_c_address_with_referral through get_tiered_fee_bps the same way the other four funding paths do
+ Add test_batch_fund_applies_tiered_fee and test_referral_fund_applies_tiered_fee
+Files to change
+contracts/onboarding-bridge/src/lib.rs
+Difficulty
+Medium
+
+Getting started
+This is a self-contained task — no additional repo access or secrets needed.
+
+git clone https://github.com/<your-fork>/C-Address-Onboarding-Bridge--Contract.git
+cd C-Address-Onboarding-Bridge--Contract
+rustup target add wasm32-unknown-unknown
+cargo test -p onboarding-bridge --features testutils
+Submitting your PR
+When you open your pull request, include Closes #123 in the PR description (using this issue's actual number in place of 123). This links the PR to the issue and closes it automatically on merge.
+
+Please follow this repo's Conventional Commits format for your commit messages (e.g. fix(contract): ..., test(sdk): ..., docs: ...).
+
+
 
     /// Admin-only: add a chain name to the src_chain allowlist.
     ///
@@ -751,6 +801,7 @@ impl IntentSettlement {
                 is_active: true,
                 registered_at: env.ledger().timestamp(),
                 active_intents: 0,
+                last_slash_time: 0,
             },
         };
 
@@ -996,6 +1047,16 @@ impl IntentSettlement {
             .set(&DataKey::Intent(intent_id.clone()), &intent);
         Self::bump_intent_ttl(&env, &intent_id);
 
+        let mut user_intents: Vec<BytesN<32>> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UserIntents(user.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        user_intents.push_back(intent_id.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::UserIntents(user.clone()), &user_intents);
+
         let total: u64 = env
             .storage()
             .instance()
@@ -1034,11 +1095,21 @@ impl IntentSettlement {
             panic_with_error!(&env, Error::SolverInactive);
         }
 
+        let now = env.ledger().timestamp();
+        if solver_record.last_slash_time > 0 && now < solver_record.last_slash_time + SLASH_COOLDOWN {
+            panic_with_error!(&env, Error::SolverInactive);
+        }
+
         let mut intent: IntentRecord = env
             .storage()
             .persistent()
             .get(&DataKey::Intent(intent_id.clone()))
             .unwrap_or_else(|| panic_with_error!(&env, Error::IntentNotFound));
+
+        let adjusted_min_bond = Self::get_adjusted_min_bond(&env, &intent.dst_token);
+        if solver_record.bond_amount < adjusted_min_bond {
+            panic_with_error!(&env, Error::SolverBondTooLow);
+        }
 
         let now = env.ledger().timestamp();
         // Boundary semantics: deadline is EXCLUSIVE for acceptance.
@@ -1318,6 +1389,7 @@ impl IntentSettlement {
         let slash_amount = (solver_record.bond_amount / 10).max(1);
         solver_record.bond_amount -= slash_amount;
         solver_record.fills_failed += 1;
+        solver_record.last_slash_time = now;
         solver_record.active_intents = solver_record.active_intents.saturating_sub(1);
 
         let cfg = Self::load_config(&env);
@@ -1600,6 +1672,17 @@ impl IntentSettlement {
         (intents, volume)
     }
 
+    /// Minimum bond required for solver registration.
+    pub fn get_min_bond(_env: Env) -> i128 {
+        MIN_BOND
+    }
+
+    /// List all intent IDs for a given user. Returns empty Vec if user has no intents.
+    pub fn list_intents_by_user(env: Env, user: Address) -> Vec<BytesN<32>> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::UserIntents(user))
+            .unwrap_or_else(|| Vec::new(&env))
     /// Total number of solvers ever registered.
     pub fn get_solver_count(env: Env) -> u32 {
         env.storage()
@@ -1678,6 +1761,13 @@ impl IntentSettlement {
         }
     }
 
+    fn get_adjusted_min_bond(env: &Env, dst_token: &Address) -> i128 {
+        let multiplier = env
+            .storage()
+            .persistent()
+            .get::<_, i128>(&DataKey::MinBondMultiplier(dst_token.clone()))
+            .unwrap_or(10);
+        (MIN_BOND * multiplier) / 10
     /// Load the protocol config from storage, falling back to defaults for
     /// contracts that pre-date this upgrade (upgrade-safe).
     fn load_config(env: &Env) -> ProtocolConfig {
