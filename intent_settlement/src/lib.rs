@@ -144,6 +144,20 @@ pub struct SolverRecord {
     pub active_intents: u32,
 }
 
+/// Return type for `get_protocol_params`.
+/// Exposes the four effective protocol values as named fields so integrators
+/// don't have to rely on source-code comments for the constant definitions.
+#[contracttype]
+#[derive(Clone)]
+pub struct ProtocolParams {
+    /// Minimum USDC bond (in token's smallest unit) a solver must hold.
+    pub min_bond: i128,
+    /// Seconds a solver has to fill an intent after accepting it.
+    pub fill_window: u64,
+    /// Default intent lifetime in seconds (when no explicit deadline is passed).
+    pub intent_expiry: u64,
+    /// Protocol fee charged on each fill, in basis points (1 bps = 0.01%).
+    pub protocol_fee_bps: i128,
 /// Tracks the leading bid for an intent that is in the `Bidding` state.
 /// Only the current best bid is kept — a new submission replaces it only
 /// if it quotes a strictly higher `quoted_dst_amount`.
@@ -1203,6 +1217,22 @@ impl IntentSettlement {
     }
 
     // ── Views ─────────────────────────────────────────────────────────────────
+
+    /// Read-only: returns the current effective protocol parameters.
+    ///
+    /// Useful for integrators who need to know MIN_BOND, FILL_WINDOW,
+    /// INTENT_EXPIRY, and PROTOCOL_FEE_BPS without reading source code.
+    /// Returns the values as a dedicated struct so each field is named at
+    /// the call site rather than relying on tuple-position conventions.
+    pub fn get_protocol_params(env: Env) -> ProtocolParams {
+        let _ = env; // view — no storage read needed; values are compile-time constants
+        ProtocolParams {
+            min_bond: MIN_BOND,
+            fill_window: FILL_WINDOW,
+            intent_expiry: INTENT_EXPIRY,
+            protocol_fee_bps: PROTOCOL_FEE_BPS,
+        }
+    }
 
     /// Fetch an intent's full record by id, or None if it was never submitted.
     pub fn get_intent(env: Env, intent_id: BytesN<32>) -> Option<IntentRecord> {
