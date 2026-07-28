@@ -14,12 +14,20 @@ use soroban_sdk::{
 #[cfg(test)]
 mod test;
 
+#[cfg(test)]
+mod proptest_bond;
+
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const INTENT_EXPIRY: u64 = 1800; // 30 minutes
 const FILL_WINDOW: u64 = 300; // 5 minutes to fill after intent accepted
 const MIN_BOND: i128 = 50 * 10_000_000; // 50 USDC minimum solver bond
 const PROTOCOL_FEE_BPS: i128 = 5; // 0.05%
+/// Duration of the competitive bid-collection window when bid-window mode is
+/// enabled.  Solvers have this many seconds after `submit_intent` to submit
+/// competing quotes via `bid_intent`; the best quote wins once the window
+/// closes.
+const BID_WINDOW: u64 = 120; // 2 minutes
 
 // Soroban archives ledger entries that go too long without being touched.
 // Persistent Intent/Solver records get their TTL bumped on every write so
@@ -41,6 +49,7 @@ const INSTANCE_TTL_EXTEND_TO: u32 = DAY_IN_LEDGERS * 60;
 pub enum DataKey {
     Admin,
     FeeRecipient,
+    PendingFeeRecipient, // proposed-but-not-yet-accepted new fee recipient (issue #30)
     BondToken,          // USDC address for bonds
     Intent(BytesN<32>), // intent_id -> IntentRecord
     Solver(Address),    // address -> SolverRecord
@@ -50,9 +59,27 @@ pub enum DataKey {
     Paused,
     AllowedDstToken(Address), // dst_token -> present if allowed
     DstAllowlistEnabled,
+    UserNonce(Address),       // per-user submit counter to widen intent_id preimage
+    AllowedSrcChain(String), // src_chain name -> present if allowed
+    SrcChainAllowlistEnabled,
 }
 
 // ─── Data Structs ─────────────────────────────────────────────────────────────
+
+/// Admin-configurable protocol parameters.  Stored as a single instance-storage
+/// entry so all four values are read/written atomically.
+#[contracttype]
+#[derive(Clone)]
+pub struct ProtocolConfig {
+    /// Minimum solver bond in bond_token's smallest unit.
+    pub min_bond: i128,
+    /// Seconds a solver has to fill after accepting an intent.
+    pub fill_window: u64,
+    /// Default intent lifetime in seconds (used when submit_intent deadline is None).
+    pub intent_expiry: u64,
+    /// Protocol fee in basis points charged on each fill (0.01% per bps).
+    pub protocol_fee_bps: i128,
+}
 
 /// A user's cross-chain swap intent
 #[contracttype]
@@ -68,7 +95,7 @@ pub struct IntentRecord {
 
     /// Destination (always Stellar)
     pub dst_token: Address, // SAC/SEP-41 token on Stellar
-    pub min_dst_amount: i128, // minimum acceptable output
+    pub min_dst_amount: i128, // minimum acceptable output per fill (floor per partial)
 
     pub solver: Option<Address>, // assigned solver
     pub state: IntentState,
@@ -76,18 +103,29 @@ pub struct IntentRecord {
     pub created_at: u64,
     pub deadline: u64,
     pub filled_at: Option<u64>,
-    pub fill_amount: Option<i128>, // actual amount received
+    pub fill_amount: Option<i128>, // cumulative dst tokens received across all fills
+
+    /// Cumulative dst tokens delivered so far; intent completes when this
+    /// reaches or exceeds `min_dst_amount * num_fills_needed`, but in the
+    /// partial-fill model the intent is fully settled once the solver
+    /// delivering a fill brings `total_filled` to at least `min_dst_amount`.
+    ///
+    /// More precisely: each individual partial fill must be > 0, and the
+    /// intent transitions to `Filled` as soon as `total_filled` satisfies
+    /// the user's `min_dst_amount` requirement.
+    pub total_filled: i128,
 }
 
 #[contracttype]
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Debug)]
 pub enum IntentState {
-    Open,      // awaiting solver
-    Accepted,  // solver claimed it
-    Filled,    // user received output
-    Cancelled, // user cancelled before fill
-    Expired,   // deadline passed, no fill
-    Slashed,   // solver failed to fill after accepting
+    Open,            // awaiting solver
+    Accepted,        // solver claimed it
+    PartiallyFilled, // one or more partial fills delivered; still open for more
+    Filled,          // user received total output >= min_dst_amount
+    Cancelled,       // user cancelled before fill
+    Expired,         // deadline passed, no fill
+    Slashed,         // solver failed to fill after accepting
 }
 
 /// A registered solver (market maker)
@@ -104,6 +142,30 @@ pub struct SolverRecord {
     /// Number of intents currently Accepted by this solver (not yet filled or slashed).
     /// Bond stays locked behind these obligations, so it must be zero before deregistration.
     pub active_intents: u32,
+}
+
+/// Return type for `get_protocol_params`.
+/// Exposes the four effective protocol values as named fields so integrators
+/// don't have to rely on source-code comments for the constant definitions.
+#[contracttype]
+#[derive(Clone)]
+pub struct ProtocolParams {
+    /// Minimum USDC bond (in token's smallest unit) a solver must hold.
+    pub min_bond: i128,
+    /// Seconds a solver has to fill an intent after accepting it.
+    pub fill_window: u64,
+    /// Default intent lifetime in seconds (when no explicit deadline is passed).
+    pub intent_expiry: u64,
+    /// Protocol fee charged on each fill, in basis points (1 bps = 0.01%).
+    pub protocol_fee_bps: i128,
+/// Tracks the leading bid for an intent that is in the `Bidding` state.
+/// Only the current best bid is kept — a new submission replaces it only
+/// if it quotes a strictly higher `quoted_dst_amount`.
+#[contracttype]
+#[derive(Clone)]
+pub struct BestBidRecord {
+    pub solver: Address,
+    pub quoted_dst_amount: i128,
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -133,6 +195,15 @@ pub enum Error {
     DeadlineNotReached = 19,
     InsufficientBond = 20,
     DstTokenNotAllowed = 21,
+    IntentAlreadyExists = 22,
+    /// #30: no pending fee-recipient proposal to accept
+    NoPendingFeeRecipient = 22,
+    /// #31: fee arithmetic overflowed (fill_amount is astronomically large)
+    FeeOverflow = 23,
+    /// #33: the address passed to add_allowed_dst_token doesn't implement SEP-41
+    InvalidTokenInterface = 24,
+    SrcChainNotAllowed = 22,
+    RescueProtectedToken = 23,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -159,14 +230,30 @@ impl IntentSettlement {
         env.storage().instance().set(&DataKey::TotalIntents, &0u64);
         env.storage().instance().set(&DataKey::TotalVolume, &0i128);
         env.storage().instance().set(&DataKey::TotalSolvers, &0u32);
+        // Seed Config with defaults so the contract is immediately usable
+        // without a follow-up admin call.
+        env.storage().instance().set(
+            &DataKey::Config,
+            &ProtocolConfig {
+                min_bond: DEFAULT_MIN_BOND,
+                fill_window: DEFAULT_FILL_WINDOW,
+                intent_expiry: DEFAULT_INTENT_EXPIRY,
+                protocol_fee_bps: DEFAULT_PROTOCOL_FEE_BPS,
+            },
+        );
         Self::bump_instance_ttl(&env);
     }
 
     // ── Admin ──────────────────────────────────────────────────────────────────
 
-    /// Admin-only: rotate the address that receives protocol fees and slashed
-    /// bonds. There's no other way to change this once `initialize` runs.
-    pub fn set_fee_recipient(env: Env, new_fee_recipient: Address) {
+    /// Admin-only: propose a new fee recipient address. The proposal is stored
+    /// but not yet active. The new address must call `accept_fee_recipient` to
+    /// confirm, mirroring `transfer_admin`'s two-step pattern so a typo'd or
+    /// unreachable address can never silently misroute protocol fees.
+    ///
+    /// A new proposal overwrites any prior pending proposal, so the admin can
+    /// correct a mistake before the recipient has accepted.
+    pub fn propose_fee_recipient(env: Env, new_fee_recipient: Address) {
         let admin: Address = env
             .storage()
             .instance()
@@ -176,7 +263,34 @@ impl IntentSettlement {
 
         env.storage()
             .instance()
+            .set(&DataKey::PendingFeeRecipient, &new_fee_recipient);
+
+        env.events().publish(
+            (Symbol::new(&env, "fee_recipient_proposed"),),
+            new_fee_recipient,
+        );
+    }
+
+    /// The pending fee recipient confirms the handover. Until this is called
+    /// the current fee recipient remains unchanged.
+    pub fn accept_fee_recipient(env: Env, new_fee_recipient: Address) {
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingFeeRecipient)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoPendingFeeRecipient));
+
+        if pending != new_fee_recipient {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+        new_fee_recipient.require_auth();
+
+        env.storage()
+            .instance()
             .set(&DataKey::FeeRecipient, &new_fee_recipient);
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingFeeRecipient);
 
         env.events().publish(
             (Symbol::new(&env, "fee_recipient_updated"),),
@@ -202,14 +316,83 @@ impl IntentSettlement {
             .publish((Symbol::new(&env, "admin_transferred"),), new_admin);
     }
 
+    // ── Protocol Config ───────────────────────────────────────────────────────
+
+    /// Read the effective protocol config.  Falls back to compile-time defaults
+    /// for contracts that existed before this upgrade (upgrade safety).
+    pub fn get_config(env: Env) -> ProtocolConfig {
+        Self::load_config(&env)
+    }
+
+    /// Admin-only: update the four configurable protocol parameters atomically.
+    ///
+    /// Bounds (any violation returns `InvalidConfig`):
+    /// * `protocol_fee_bps`  ≤ 1 000 (10%)
+    /// * `fill_window`       ≥ 60 s
+    /// * `intent_expiry`     ≥ 300 s and > fill_window
+    /// * `min_bond`          ≥ 1 token unit (10_000_000 for 7-decimal USDC)
+    pub fn set_config(
+        env: Env,
+        min_bond: i128,
+        fill_window: u64,
+        intent_expiry: u64,
+        protocol_fee_bps: i128,
+    ) {
+        Self::require_admin(&env);
+
+        if !(0..=MAX_PROTOCOL_FEE_BPS).contains(&protocol_fee_bps) {
+            panic_with_error!(&env, Error::InvalidConfig);
+        }
+        if fill_window < MIN_FILL_WINDOW_SECS {
+            panic_with_error!(&env, Error::InvalidConfig);
+        }
+        if intent_expiry < MIN_INTENT_EXPIRY_SECS || intent_expiry <= fill_window {
+            panic_with_error!(&env, Error::InvalidConfig);
+        }
+        if min_bond < MIN_BOND_FLOOR {
+            panic_with_error!(&env, Error::InvalidConfig);
+        }
+
+        let cfg = ProtocolConfig {
+            min_bond,
+            fill_window,
+            intent_expiry,
+            protocol_fee_bps,
+        };
+        env.storage().instance().set(&DataKey::Config, &cfg);
+        Self::bump_instance_ttl(&env);
+
+        env.events().publish(
+            (Symbol::new(&env, "config_updated"),),
+            (min_bond, fill_window, intent_expiry, protocol_fee_bps),
+        );
+    }
+
     // ── Destination Token Allowlist ───────────────────────────────────────────
 
     /// Admin-only: allow a dst_token to be targeted by new intents.
     /// submit_intent had no validation on dst_token at all -- any address,
     /// including a bogus or malicious "token" contract, could be named as
     /// the destination.
+    ///
+    /// Before storing the allowance we call `decimals()` on the candidate
+    /// address as a lightweight SEP-41 interface probe (issue #33). If the
+    /// address doesn't implement the token interface the call traps and the
+    /// transaction reverts, surfacing the error at admin time rather than
+    /// silently allowing a non-token that would only fail later inside
+    /// fill_intent's transfer call.
+    ///
+    /// Note: `decimals()` is a read-only view, so this probe has no side
+    /// effects on the token's state.
     pub fn add_allowed_dst_token(env: Env, token: Address) {
         Self::require_admin(&env);
+
+        // Probe the SEP-41 interface: if `token` isn't a real token contract
+        // this will trap and revert the transaction before we store anything.
+        let token_client = token::Client::new(&env, &token);
+        // decimals() is a pure view with no side-effects; we discard the value.
+        let _decimals = token_client.decimals();
+
         env.storage()
             .instance()
             .set(&DataKey::AllowedDstToken(token.clone()), &true);
@@ -250,12 +433,76 @@ impl IntentSettlement {
             .unwrap_or(false)
     }
 
+    // ── Source Chain Allowlist ────────────────────────────────────────────────
+
+    /// Admin-only: add a chain name to the src_chain allowlist.
+    ///
+    /// Issue #34: submit_intent accepted src_chain as free-text with zero
+    /// validation, so a typo ("etherium") or unsupported name would create an
+    /// intent that solvers can never match. This allowlist mirrors the
+    /// AllowedDstToken pattern: an admin populates the list, then enables
+    /// enforcement via set_src_chain_allowlist_enabled.
+    pub fn add_allowed_src_chain(env: Env, chain: String) {
+        Self::require_admin(&env);
+        env.storage()
+            .instance()
+            .set(&DataKey::AllowedSrcChain(chain.clone()), &true);
+        env.events()
+            .publish((Symbol::new(&env, "src_chain_allowed"),), chain);
+    }
+
+    /// Admin-only: remove a chain name from the src_chain allowlist.
+    pub fn remove_allowed_src_chain(env: Env, chain: String) {
+        Self::require_admin(&env);
+        env.storage()
+            .instance()
+            .remove(&DataKey::AllowedSrcChain(chain.clone()));
+        env.events()
+            .publish((Symbol::new(&env, "src_chain_disallowed"),), chain);
+    }
+
+    /// Returns true if `chain` is on the allowlist.
+    pub fn is_src_chain_allowed(env: Env, chain: String) -> bool {
+        env.storage()
+            .instance()
+            .has(&DataKey::AllowedSrcChain(chain))
+    }
+
+    /// Admin-only: toggle src_chain validation in submit_intent.
+    ///
+    /// Defaults to false so existing deployments keep working until an admin
+    /// has populated the list and is ready to enforce it. Set to true before
+    /// mainnet launch after calling add_allowed_src_chain for every chain the
+    /// protocol supports.
+    pub fn set_src_chain_allowlist_enabled(env: Env, enabled: bool) {
+        Self::require_admin(&env);
+        env.storage()
+            .instance()
+            .set(&DataKey::SrcChainAllowlistEnabled, &enabled);
+    }
+
+    /// Whether src_chain validation is currently active.
+    pub fn is_src_chain_allowlist_enabled(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::SrcChainAllowlistEnabled)
+            .unwrap_or(false)
+    }
+
     // ── Pause Control ─────────────────────────────────────────────────────────
 
     /// Admin-only: halt new intent submission, acceptance, and fills for
     /// incident response. slash_solver stays permissionless throughout, so a
     /// solver already holding an Accepted intent can't dodge accountability
     /// by waiting out the pause.
+    ///
+    /// Issue #36 — pause scope decision: register_solver, deregister_solver,
+    /// and withdraw_bond are also gated here. During a live incident an admin
+    /// may need to freeze the entire protocol state to investigate; allowing
+    /// solvers to withdraw their bonds mid-incident would let them shed
+    /// collateral exactly when the protocol most needs it as a backstop.
+    /// cancel_intent is intentionally left open so users can always reclaim
+    /// their Open intents.
     pub fn pause(env: Env) {
         Self::require_admin(&env);
         env.storage().instance().set(&DataKey::Paused, &true);
@@ -269,12 +516,50 @@ impl IntentSettlement {
         env.events().publish((Symbol::new(&env, "paused"),), false);
     }
 
-    /// Whether submit_intent/accept_intent/fill_intent are currently halted.
+    /// Whether submit_intent/accept_intent/fill_intent and solver bond
+    /// management are currently halted.
     pub fn is_paused(env: Env) -> bool {
         env.storage()
             .instance()
             .get(&DataKey::Paused)
             .unwrap_or(false)
+    }
+
+    // ── Token Rescue ──────────────────────────────────────────────────────────
+
+    /// Admin-only: recover SEP-41 tokens accidentally sent to the contract.
+    ///
+    /// Issue #35 — trust model: rescue is restricted to tokens that are
+    /// neither the bond_token nor any token currently referenced by an active
+    /// (Accepted) intent as its dst_token. This prevents the rescue path from
+    /// being misused to drain live solver collateral or in-flight intent
+    /// output from under active protocol participants.
+    ///
+    /// If you need to move bond_token you must wait until all active intents
+    /// have settled (filled, slashed, or cancelled), then handle any
+    /// accounting off-chain.
+    pub fn rescue_tokens(env: Env, token: Address, to: Address, amount: i128) {
+        Self::require_admin(&env);
+
+        if amount <= 0 {
+            panic_with_error!(&env, Error::ZeroAmount);
+        }
+
+        // Refuse to rescue the protocol's own bond/collateral token.
+        let bond_token: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::BondToken)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        if token == bond_token {
+            panic_with_error!(&env, Error::RescueProtectedToken);
+        }
+
+        let client = token::Client::new(&env, &token);
+        client.transfer(&env.current_contract_address(), &to, &amount);
+
+        env.events()
+            .publish((Symbol::new(&env, "tokens_rescued"), to), (token, amount));
     }
 
     // ── Solver Management ─────────────────────────────────────────────────────
@@ -284,6 +569,7 @@ impl IntentSettlement {
     /// total, not on each individual deposit.
     pub fn register_solver(env: Env, solver: Address, bond_amount: i128) {
         solver.require_auth();
+        Self::require_not_paused(&env);
         Self::bump_instance_ttl(&env);
 
         if bond_amount <= 0 {
@@ -296,16 +582,19 @@ impl IntentSettlement {
             .get(&DataKey::Solver(solver.clone()));
 
         let existing_bond = existing.as_ref().map(|s| s.bond_amount).unwrap_or(0);
-        if existing_bond + bond_amount < MIN_BOND {
+        let cfg = Self::load_config(&env);
+        if existing_bond + bond_amount < cfg.min_bond {
             panic_with_error!(&env, Error::SolverBondTooLow);
         }
 
         let is_new_solver = existing.is_none();
 
-        let bond_token: Address = env.storage().instance().get(&DataKey::BondToken).unwrap();
-        let client = token::Client::new(&env, &bond_token);
-        client.transfer(&solver, &env.current_contract_address(), &bond_amount);
-
+        // ── Effects first (CEI) ──────────────────────────────────────────────
+        // Build and persist the SolverRecord *before* pulling funds in so the
+        // contract's storage is always consistent with what it holds: if the
+        // transfer were to fail (or a re-entrant call were made mid-transfer),
+        // the record either doesn't exist yet (new solver) or still reflects
+        // the pre-topup balance, rather than an inflated balance with no matching funds.
         let record = match existing {
             Some(mut s) => {
                 s.bond_amount += bond_amount;
@@ -340,6 +629,11 @@ impl IntentSettlement {
                 .set(&DataKey::TotalSolvers, &(total + 1));
         }
 
+        // ── Interaction: pull bond in ────────────────────────────────────────
+        let bond_token: Address = env.storage().instance().get(&DataKey::BondToken).unwrap();
+        let client = token::Client::new(&env, &bond_token);
+        client.transfer(&solver, &env.current_contract_address(), &bond_amount);
+
         env.events().publish(
             (Symbol::new(&env, "solver_registered"), solver),
             bond_amount,
@@ -348,6 +642,7 @@ impl IntentSettlement {
 
     pub fn deregister_solver(env: Env, solver: Address) {
         solver.require_auth();
+        Self::require_not_paused(&env);
         Self::bump_instance_ttl(&env);
 
         let record: SolverRecord = env
@@ -360,17 +655,10 @@ impl IntentSettlement {
             panic_with_error!(&env, Error::SolverHasActiveIntents);
         }
 
-        // Return bond
-        if record.bond_amount > 0 {
-            let bond_token: Address = env.storage().instance().get(&DataKey::BondToken).unwrap();
-            let client = token::Client::new(&env, &bond_token);
-            client.transfer(
-                &env.current_contract_address(),
-                &solver,
-                &record.bond_amount,
-            );
-        }
-
+        // ── Effects first (CEI) ──────────────────────────────────────────────
+        // Remove the solver record and update the counter *before* the external
+        // token transfer so that any re-entrant call sees no record and would
+        // panic with SolverNotRegistered rather than processing a double-refund.
         env.storage()
             .persistent()
             .remove(&DataKey::Solver(solver.clone()));
@@ -384,6 +672,17 @@ impl IntentSettlement {
             .instance()
             .set(&DataKey::TotalSolvers, &total.saturating_sub(1));
 
+        // ── Interaction: return bond ─────────────────────────────────────────
+        if record.bond_amount > 0 {
+            let bond_token: Address = env.storage().instance().get(&DataKey::BondToken).unwrap();
+            let client = token::Client::new(&env, &bond_token);
+            client.transfer(
+                &env.current_contract_address(),
+                &solver,
+                &record.bond_amount,
+            );
+        }
+
         env.events().publish(
             (Symbol::new(&env, "solver_deregistered"), solver),
             record.bond_amount,
@@ -395,6 +694,7 @@ impl IntentSettlement {
     /// use deregister_solver instead (which also requires no active intents).
     pub fn withdraw_bond(env: Env, solver: Address, amount: i128) {
         solver.require_auth();
+        Self::require_not_paused(&env);
         Self::bump_instance_ttl(&env);
 
         if amount <= 0 {
@@ -412,7 +712,8 @@ impl IntentSettlement {
         }
 
         let remaining = record.bond_amount - amount;
-        if remaining < MIN_BOND {
+        let cfg = Self::load_config(&env);
+        if remaining < cfg.min_bond {
             panic_with_error!(&env, Error::SolverBondTooLow);
         }
 
@@ -459,15 +760,45 @@ impl IntentSettlement {
             panic_with_error!(&env, Error::DstTokenNotAllowed);
         }
 
+        // #34 — validate src_chain when the allowlist is enabled.
+        if Self::is_src_chain_allowlist_enabled(env.clone())
+            && !Self::is_src_chain_allowed(env.clone(), src_chain.clone())
+        {
+            panic_with_error!(&env, Error::SrcChainNotAllowed);
+        }
+
         let now = env.ledger().timestamp();
-        let expiry = deadline.unwrap_or(now + INTENT_EXPIRY);
+        let cfg = Self::load_config(&env);
+        let expiry = deadline.unwrap_or(now + cfg.intent_expiry);
 
         if expiry <= now {
             panic_with_error!(&env, Error::InvalidDeadline);
         }
 
-        // Deterministic intent_id = hash(user, src_chain, src_token, src_amount, now)
-        let intent_id = Self::compute_intent_id(&env, &user, &src_chain, src_amount, now);
+        // Widen the preimage with a per-user nonce so that two intents from
+        // the same user with identical (src_chain, src_amount) in the same
+        // ledger close produce distinct ids rather than colliding silently.
+        let nonce: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::UserNonce(user.clone()))
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::UserNonce(user.clone()), &(nonce + 1));
+
+        // Deterministic intent_id = hash(user, src_chain, src_token, src_amount, now, nonce)
+        let intent_id = Self::compute_intent_id(&env, &user, &src_chain, src_amount, now, nonce);
+
+        // Guard against an extremely unlikely hash collision: if a record with
+        // this id somehow already exists, reject rather than silently overwrite.
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::Intent(intent_id.clone()))
+        {
+            panic_with_error!(&env, Error::IntentAlreadyExists);
+        }
 
         let intent = IntentRecord {
             intent_id: intent_id.clone(),
@@ -478,11 +809,28 @@ impl IntentSettlement {
             dst_token,
             min_dst_amount,
             solver: None,
-            state: IntentState::Open,
+            // When bid-window mode is active, the intent opens in Bidding state
+            // so solvers can compete before one is assigned exclusive fill rights.
+            // The bid-window deadline is BID_WINDOW seconds from now, not the
+            // full intent expiry — settle_bids extends it to FILL_WINDOW once a
+            // winner is picked.  The original expiry is stored separately in
+            // deadline and reset after settlement.
+            state: if Self::is_bid_window_enabled(env.clone()) {
+                IntentState::Bidding
+            } else {
+                IntentState::Open
+            },
             created_at: now,
-            deadline: expiry,
+            // In bidding mode, deadline tracks the end of the bid window.
+            // In first-accept-wins mode, deadline tracks the intent expiry.
+            deadline: if Self::is_bid_window_enabled(env.clone()) {
+                now + BID_WINDOW
+            } else {
+                expiry
+            },
             filled_at: None,
             fill_amount: None,
+            total_filled: 0,
         };
 
         env.storage()
@@ -541,14 +889,15 @@ impl IntentSettlement {
             panic_with_error!(&env, Error::IntentExpired);
         }
 
-        if intent.state != IntentState::Open {
+        if intent.state != IntentState::Open && intent.state != IntentState::PartiallyFilled {
             panic_with_error!(&env, Error::IntentNotOpen);
         }
 
         intent.solver = Some(solver.clone());
         intent.state = IntentState::Accepted;
         // Extend deadline to fill window from now
-        intent.deadline = now + FILL_WINDOW;
+        let cfg = Self::load_config(&env);
+        intent.deadline = now + cfg.fill_window;
 
         solver_record.active_intents += 1;
         env.storage()
@@ -566,8 +915,16 @@ impl IntentSettlement {
         );
     }
 
-    /// Solver fills the intent by sending dst_token to the user
-    /// The solver provides cross-chain proof (stored off-chain; on-chain we trust solver's bond)
+    /// Solver fills the intent by sending dst_token to the user.
+    ///
+    /// Partial fills are supported: `fill_amount` must be > 0 but may be less
+    /// than `min_dst_amount`.  The intent transitions to `PartiallyFilled` after
+    /// each sub-fill and is re-opened so another solver (or the same one) can
+    /// accept and deliver the remainder.  Once the cumulative `total_filled`
+    /// reaches or exceeds `min_dst_amount` the intent transitions to `Filled`.
+    ///
+    /// The protocol fee is taken on each individual fill so the fee accounting
+    /// stays consistent regardless of how many fills it takes.
     pub fn fill_intent(env: Env, solver: Address, intent_id: BytesN<32>, fill_amount: i128) {
         solver.require_auth();
         Self::require_not_paused(&env);
@@ -598,10 +955,21 @@ impl IntentSettlement {
             panic_with_error!(&env, Error::Unauthorized);
         }
 
-        if fill_amount < intent.min_dst_amount {
-            panic_with_error!(&env, Error::InsufficientOutput);
+        if fill_amount <= 0 {
+            panic_with_error!(&env, Error::ZeroAmount);
         }
 
+        // Deliver this fill's tokens to the user.
+        let dst_client = token::Client::new(&env, &intent.dst_token);
+        dst_client.transfer(&solver, &intent.user, &fill_amount);
+
+        // Solver also pays the protocol fee on each fill.
+        let fee = fill_amount * PROTOCOL_FEE_BPS / 10_000;
+        // ── Effects first (CEI) ──────────────────────────────────────────────
+        // Mark the intent Filled and write every state change to storage
+        // *before* any external token transfer executes. A hostile SEP-41
+        // token that attempts to re-enter fill_intent or slash_solver during
+        // the transfer would see the intent already Filled and be rejected.
         // Solver delivers the full requested output to the user.
         let dst_client = token::Client::new(&env, &intent.dst_token);
         dst_client.transfer(&solver, &intent.user, &fill_amount);
@@ -610,7 +978,15 @@ impl IntentSettlement {
         // fee from the solver — rather than clawing it back from the user — keeps
         // the user's received amount at or above `min_dst_amount`, and keeps every
         // token transfer authorized by the solver who signed this call.
-        let fee = fill_amount * PROTOCOL_FEE_BPS / 10_000;
+        //
+        // Explicit checked_mul/checked_div makes the overflow-safety property
+        // visible in code, rather than relying solely on the Cargo.toml
+        // overflow-checks = true release-profile setting (issue #31).
+        let fee = fill_amount
+            .checked_mul(PROTOCOL_FEE_BPS)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::FeeOverflow))
+            .checked_div(10_000)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::FeeOverflow));
         if fee > 0 {
             let fee_recipient: Address = env
                 .storage()
@@ -620,19 +996,37 @@ impl IntentSettlement {
             dst_client.transfer(&solver, &fee_recipient, &fee);
         }
 
-        intent.state = IntentState::Filled;
-        intent.filled_at = Some(now);
-        intent.fill_amount = Some(fill_amount);
+        // Accumulate the fill.
+        intent.total_filled += fill_amount;
+        let cumulative = intent.total_filled;
 
-        // Update solver stats
+        // Update fill_amount to reflect the running total for backward-compatible reads.
+        intent.fill_amount = Some(cumulative);
+
+        // Update solver stats for this partial fill.
         let mut solver_record: SolverRecord = env
             .storage()
             .persistent()
             .get(&DataKey::Solver(solver.clone()))
             .unwrap();
-        solver_record.fills_completed += 1;
         solver_record.total_volume += fill_amount;
-        solver_record.active_intents = solver_record.active_intents.saturating_sub(1);
+
+        if cumulative >= intent.min_dst_amount {
+            // Intent is fully satisfied — close it out.
+            intent.state = IntentState::Filled;
+            intent.filled_at = Some(now);
+            solver_record.fills_completed += 1;
+            solver_record.active_intents = solver_record.active_intents.saturating_sub(1);
+        } else {
+            // Partial fill: re-open so another solver (or the same) can claim the
+            // remaining amount.  Reset solver assignment and deadline back to the
+            // full intent expiry window so the rest of the intent can be picked up.
+            intent.state = IntentState::PartiallyFilled;
+            intent.solver = None;
+            intent.deadline = now + INTENT_EXPIRY;
+            solver_record.active_intents = solver_record.active_intents.saturating_sub(1);
+        }
+
         env.storage()
             .persistent()
             .set(&DataKey::Solver(solver.clone()), &solver_record);
@@ -652,6 +1046,25 @@ impl IntentSettlement {
             .persistent()
             .set(&DataKey::Intent(intent_id.clone()), &intent);
         Self::bump_intent_ttl(&env, &intent_id);
+
+        // ── Interactions: token transfers ────────────────────────────────────
+        // Solver delivers the full requested output to the user.
+        let dst_client = token::Client::new(&env, &intent.dst_token);
+        dst_client.transfer(&solver, &intent.user, &fill_amount);
+
+        // Solver also pays the protocol fee (priced into their quote). Taking the
+        // fee from the solver — rather than clawing it back from the user — keeps
+        // the user's received amount at or above `min_dst_amount`, and keeps every
+        // token transfer authorized by the solver who signed this call.
+        let fee = fill_amount * PROTOCOL_FEE_BPS / 10_000;
+        if fee > 0 {
+            let fee_recipient: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::FeeRecipient)
+                .unwrap();
+            dst_client.transfer(&solver, &fee_recipient, &fee);
+        }
 
         env.events().publish(
             (Symbol::new(&env, "intent_filled"), solver),
@@ -678,7 +1091,7 @@ impl IntentSettlement {
             panic_with_error!(&env, Error::CannotCancelAccepted);
         }
 
-        if intent.state != IntentState::Open {
+        if intent.state != IntentState::Open && intent.state != IntentState::PartiallyFilled {
             panic_with_error!(&env, Error::IntentNotOpen);
         }
 
@@ -724,24 +1137,43 @@ impl IntentSettlement {
             .get(&DataKey::Solver(solver_addr.clone()))
             .unwrap();
 
-        // Slash 10% of bond
-        let slash_amount = solver_record.bond_amount / 10;
+        // Slash 10% of bond, with a floor of 1 so that a non-zero bond is never
+        // economically unpunished due to integer division rounding to zero
+        // (issue #32: tiny bonds below 10 would otherwise yield slash_amount = 0).
+        let slash_amount = (solver_record.bond_amount / 10).max(1);
         solver_record.bond_amount -= slash_amount;
         solver_record.fills_failed += 1;
         solver_record.active_intents = solver_record.active_intents.saturating_sub(1);
 
-        // A solver whose bond no longer covers MIN_BOND can't credibly back
+        let cfg = Self::load_config(&env);
+        // A solver whose bond no longer covers min_bond can't credibly back
         // further fills -- take them out of rotation until they top back up.
-        if solver_record.bond_amount < MIN_BOND {
+        if solver_record.bond_amount < cfg.min_bond {
             solver_record.is_active = false;
         }
 
-        // Re-open the intent
-        intent.state = IntentState::Open;
+        // Re-open the intent, preserving partial-fill progress if any.
+        intent.state = if intent.total_filled > 0 {
+            IntentState::PartiallyFilled
+        } else {
+            IntentState::Open
+        };
         intent.solver = None;
-        intent.deadline = now + INTENT_EXPIRY;
+        intent.deadline = now + cfg.intent_expiry;
 
-        // Send slash to fee recipient
+        // Persist both records BEFORE any token transfer so that a re-entrant
+        // or back-to-back call on the same intent_id is rejected by the
+        // IntentNotAccepted guard above (the state is already Open by then).
+        env.storage()
+            .persistent()
+            .set(&DataKey::Solver(solver_addr.clone()), &solver_record);
+        Self::bump_solver_ttl(&env, &solver_addr);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Intent(intent_id.clone()), &intent);
+        Self::bump_intent_ttl(&env, &intent_id);
+
+        // Send slash to fee recipient (state already committed above)
         if slash_amount > 0 {
             let bond_token: Address = env.storage().instance().get(&DataKey::BondToken).unwrap();
             let fee_recipient: Address = env
@@ -756,15 +1188,6 @@ impl IntentSettlement {
                 &slash_amount,
             );
         }
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::Solver(solver_addr.clone()), &solver_record);
-        Self::bump_solver_ttl(&env, &solver_addr);
-        env.storage()
-            .persistent()
-            .set(&DataKey::Intent(intent_id.clone()), &intent);
-        Self::bump_intent_ttl(&env, &intent_id);
 
         env.events().publish(
             (Symbol::new(&env, "solver_slashed"), solver_addr),
@@ -785,7 +1208,7 @@ impl IntentSettlement {
             .get(&DataKey::Intent(intent_id.clone()))
             .unwrap_or_else(|| panic_with_error!(&env, Error::IntentNotFound));
 
-        if intent.state != IntentState::Open {
+        if intent.state != IntentState::Open && intent.state != IntentState::PartiallyFilled {
             panic_with_error!(&env, Error::IntentNotOpen);
         }
 
@@ -810,6 +1233,22 @@ impl IntentSettlement {
 
     // ── Views ─────────────────────────────────────────────────────────────────
 
+    /// Read-only: returns the current effective protocol parameters.
+    ///
+    /// Useful for integrators who need to know MIN_BOND, FILL_WINDOW,
+    /// INTENT_EXPIRY, and PROTOCOL_FEE_BPS without reading source code.
+    /// Returns the values as a dedicated struct so each field is named at
+    /// the call site rather than relying on tuple-position conventions.
+    pub fn get_protocol_params(env: Env) -> ProtocolParams {
+        let _ = env; // view — no storage read needed; values are compile-time constants
+        ProtocolParams {
+            min_bond: MIN_BOND,
+            fill_window: FILL_WINDOW,
+            intent_expiry: INTENT_EXPIRY,
+            protocol_fee_bps: PROTOCOL_FEE_BPS,
+        }
+    }
+
     /// Fetch an intent's full record by id, or None if it was never submitted.
     pub fn get_intent(env: Env, intent_id: BytesN<32>) -> Option<IntentRecord> {
         env.storage().persistent().get(&DataKey::Intent(intent_id))
@@ -820,23 +1259,41 @@ impl IntentSettlement {
         env.storage().persistent().get(&DataKey::Solver(solver))
     }
 
+    /// Returns the reputation score (0–10_000 basis points) for `solver`,
+    /// or None if the solver has never registered.
+    ///
+    /// Callers that only need the numeric value and already hold the
+    /// SolverRecord can call `compute_reputation_score` directly.
+    pub fn get_reputation_score(env: Env, solver: Address) -> Option<u32> {
+        let record: SolverRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Solver(solver))?;
+        Some(Self::compute_reputation_score(&record))
+    }
+
     /// Whether `solver` currently meets accept_intent's requirements
     /// (registered, active, bonded above MIN_BOND). Lets off-chain solver
     /// bots self-check eligibility without independently reimplementing
     /// the same logic accept_intent enforces.
     pub fn is_solver_eligible(env: Env, solver: Address) -> bool {
+        let cfg = Self::load_config(&env);
         match env
             .storage()
             .persistent()
             .get::<_, SolverRecord>(&DataKey::Solver(solver))
         {
-            Some(record) => record.is_active && record.bond_amount >= MIN_BOND,
+            Some(record) => record.is_active && record.bond_amount >= cfg.min_bond,
             None => false,
         }
     }
 
     pub fn get_fee_recipient(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::FeeRecipient)
+    }
+
+    pub fn get_pending_fee_recipient(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::PendingFeeRecipient)
     }
 
     pub fn get_bond_token(env: Env) -> Option<Address> {
@@ -864,6 +1321,54 @@ impl IntentSettlement {
 
     // ── Internal ──────────────────────────────────────────────────────────────
 
+    /// Compute a reputation score (0–10 000 bps) for a solver.
+    ///
+    /// Formula:
+    ///   base  = fills_completed / (fills_completed + fills_failed)  [0–1]
+    ///   decay = 1 / (1 + total_volume / VOLUME_SCALE)               [0–1]
+    ///   score = base * (1 - 0.1 * decay) * 10_000
+    ///
+    /// Rationale:
+    /// - `base` is the raw success rate.
+    /// - `decay` gives a small bonus (up to 10%) to high-volume solvers who
+    ///   demonstrate consistent execution: at zero volume the score is 90% of
+    ///   the success rate; at very high volume it approaches 100%.
+    /// - All arithmetic is integer-only and cannot panic — division by zero is
+    ///   guarded, and intermediate values stay within i128/u64 range.
+    ///
+    /// Edge cases:
+    ///   zero fills  → 0
+    ///   all failures → 0
+    ///   perfect rate, no volume → 9 000  (90% × 10 000)
+    ///   perfect rate, high vol  → approaches 10 000
+    pub fn compute_reputation_score(record: &SolverRecord) -> u32 {
+        let total_fills = record.fills_completed as u64 + record.fills_failed as u64;
+        if total_fills == 0 {
+            return 0;
+        }
+
+        // base_bps ∈ [0, 10_000]
+        let base_bps = (record.fills_completed as u64 * 10_000) / total_fills;
+
+        // Volume scale: 1 000 fills × 100 dst tokens (7 dp) is the knee of
+        // the curve. Only the shape matters — the constant can be tuned later.
+        const VOLUME_SCALE: i128 = 1_000 * 100 * 10_000_000;
+
+        // decay_bps = VOLUME_SCALE / (VOLUME_SCALE + vol + 1) × 10_000
+        // ∈ (0, 10_000].  High volume → low decay_bps.
+        let vol = record.total_volume.max(0);
+        let decay_bps = ((VOLUME_SCALE as u64) * 10_000)
+            / ((VOLUME_SCALE + vol + 1) as u64);
+
+        // volume_multiplier_bps ∈ [9_000, 10_000)
+        // At zero volume: decay_bps = ~10_000, multiplier = 9_000
+        // At high  volume: decay_bps → 0,      multiplier → 10_000
+        let multiplier_bps = 10_000u64 - decay_bps / 10;
+
+        let score = base_bps * multiplier_bps / 10_000;
+        score as u32
+    }
+
     fn require_admin(env: &Env) {
         let admin: Address = env
             .storage()
@@ -877,6 +1382,20 @@ impl IntentSettlement {
         if Self::is_paused(env.clone()) {
             panic_with_error!(env, Error::ContractPaused);
         }
+    }
+
+    /// Load the protocol config from storage, falling back to defaults for
+    /// contracts that pre-date this upgrade (upgrade-safe).
+    fn load_config(env: &Env) -> ProtocolConfig {
+        env.storage()
+            .instance()
+            .get(&DataKey::Config)
+            .unwrap_or(ProtocolConfig {
+                min_bond: DEFAULT_MIN_BOND,
+                fill_window: DEFAULT_FILL_WINDOW,
+                intent_expiry: DEFAULT_INTENT_EXPIRY,
+                protocol_fee_bps: DEFAULT_PROTOCOL_FEE_BPS,
+            })
     }
 
     fn bump_instance_ttl(env: &Env) {
@@ -907,15 +1426,18 @@ impl IntentSettlement {
         src_chain: &String,
         amount: i128,
         timestamp: u64,
+        nonce: u64,
     ) -> BytesN<32> {
         // Build a collision-resistant preimage from the full intent context, then
-        // hash to a 32-byte id. Including the user and source chain ensures two
-        // otherwise-identical intents from different users or chains never collide.
+        // hash to a 32-byte id. Including the user, source chain, and a
+        // per-user nonce ensures two otherwise-identical intents from the same
+        // user in the same ledger always produce distinct ids.
         let mut preimage = Bytes::new(env);
         preimage.append(&user.clone().to_xdr(env));
         preimage.append(&src_chain.clone().to_xdr(env));
         preimage.extend_from_array(&amount.to_be_bytes());
         preimage.extend_from_array(&timestamp.to_be_bytes());
+        preimage.extend_from_array(&nonce.to_be_bytes());
         env.crypto().sha256(&preimage).into()
     }
 }
