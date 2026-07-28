@@ -878,8 +878,10 @@ impl IntentSettlement {
             .unwrap_or_else(|| panic_with_error!(&env, Error::IntentNotFound));
 
         let now = env.ledger().timestamp();
+        // Boundary semantics: deadline is EXCLUSIVE for acceptance.
+        // `now >= intent.deadline` rejects at the boundary second (`now == deadline`)
+        // so the full [created_at, deadline) half-open window is available for solvers.
         if now >= intent.deadline {
-            intent.state = IntentState::Expired;
             env.storage()
                 .persistent()
                 .set(&DataKey::Intent(intent_id.clone()), &intent);
@@ -935,6 +937,10 @@ impl IntentSettlement {
             .unwrap_or_else(|| panic_with_error!(&env, Error::IntentNotFound));
 
         let now = env.ledger().timestamp();
+        // Boundary semantics: the fill-window deadline is EXCLUSIVE for filling.
+        // `now >= intent.deadline` rejects at the boundary second (`now == deadline`)
+        // so the full [accepted_at, accepted_at + FILL_WINDOW) window is available
+        // to the solver.
         if now >= intent.deadline {
             panic_with_error!(&env, Error::FillWindowExpired);
         }
@@ -1115,6 +1121,11 @@ impl IntentSettlement {
             panic_with_error!(&env, Error::IntentNotAccepted);
         }
 
+        // Boundary semantics: the fill-window deadline is INCLUSIVE for slashing.
+        // The guard `now < intent.deadline` is false when `now == deadline`, so
+        // slashing becomes valid at the deadline second itself (not strictly after).
+        // Fill window available to solver: [accepted_at, accepted_at + FILL_WINDOW).
+        // Slash window: [accepted_at + FILL_WINDOW, ∞).
         if now < intent.deadline {
             panic_with_error!(&env, Error::FillWindowExpired); // not expired yet
         }
@@ -1202,6 +1213,10 @@ impl IntentSettlement {
         }
 
         let now = env.ledger().timestamp();
+        // Boundary semantics: the intent deadline is INCLUSIVE for expiry.
+        // The guard `now < intent.deadline` is false when `now == deadline`, so
+        // expiry becomes valid at the deadline second itself (not strictly after).
+        // Intent is live in [created_at, deadline); caller can expire at deadline+.
         if now < intent.deadline {
             panic_with_error!(&env, Error::DeadlineNotReached);
         }
