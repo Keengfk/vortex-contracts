@@ -29,6 +29,8 @@ Core protocol logic (`intent_settlement/src/lib.rs`):
 - `set_fee_recipient()` / `transfer_admin()` — admin key management
 - `pause()` / `unpause()` — admin-only incident response
 - `add_allowed_dst_token()` / `remove_allowed_dst_token()` / `set_dst_allowlist_enabled()` — optional dst_token allowlist
+- `add_allowed_src_chain()` / `remove_allowed_src_chain()` / `set_src_chain_allowlist_enabled()` — optional src_chain allowlist (#34)
+- `rescue_tokens()` — admin-only recovery of non-bond tokens accidentally sent to the contract (#35)
 
 #### Usage examples
 
@@ -67,6 +69,65 @@ stellar contract invoke --id <CONTRACT_ID> --source <ANY_SECRET_KEY> --network t
 stellar contract invoke --id <CONTRACT_ID> --source <ANY_SECRET_KEY> --network testnet -- \
   get_stats
 ```
+
+#### Intent Lifecycle
+
+The diagram below covers all six `IntentState` variants and the functions that
+drive each transition.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Open : submit_intent()
+
+    Open --> Accepted : accept_intent()\n[solver registered & active,\n deadline not reached]
+    Open --> Cancelled : cancel_intent()\n[caller == intent.user]
+    Open --> Expired : expire_intent()\n[now >= deadline]
+
+    Accepted --> Filled : fill_intent()\n[fill_amount >= min_dst_amount,\n now < deadline]
+    Accepted --> Open : slash_solver()\n[now >= deadline]\n(10 % bond slashed,\nintent re-opened with fresh deadline)
+
+    Filled --> [*]
+    Cancelled --> [*]
+    Expired --> [*]
+```
+
+> **Note:** `accept_intent` also lazily sets state to `Expired` (and panics)
+> when the intent's original deadline has already passed, but this is a
+> read-time guard, not a persisted `Open → Expired` path — that explicit
+> transition is handled by `expire_intent`.
+
+---
+
+#### Error Reference
+
+The table below maps every `Error` variant to the function(s) that raise it and
+the exact condition that triggers it.
+
+| # | Variant | Raised by | Condition |
+|---|---------|-----------|-----------|
+| 1 | `AlreadyInitialized` | `initialize` | `DataKey::Admin` already exists in instance storage |
+| 2 | `Unauthorized` | `fill_intent`, `cancel_intent` | Caller is not the assigned solver / intent owner |
+| 3 | `IntentNotFound` | `accept_intent`, `fill_intent`, `cancel_intent`, `slash_solver`, `expire_intent` | No `IntentRecord` found for the supplied `intent_id` |
+| 4 | `IntentNotOpen` | `cancel_intent`, `expire_intent` | Intent state is not `Open` |
+| 5 | `IntentExpired` | `accept_intent` | `now >= intent.deadline` when a solver tries to accept |
+| 6 | `IntentNotAccepted` | `fill_intent`, `slash_solver` | Intent state is not `Accepted` |
+| 7 | `SolverNotRegistered` | `accept_intent`, `deregister_solver`, `withdraw_bond` | No `SolverRecord` found for the address |
+| 8 | `SolverBondTooLow` | `register_solver`, `withdraw_bond` | Resulting bond total < `MIN_BOND` (50 USDC) |
+| 9 | `InsufficientOutput` | `fill_intent` | `fill_amount < intent.min_dst_amount` |
+| 10 | `FillWindowExpired` | `fill_intent` | `now >= intent.deadline` (fill window elapsed); also used in `slash_solver` as an inverse guard (window not yet expired) |
+| 11 | `CannotCancelAccepted` | `cancel_intent` | Intent state is `Accepted` |
+| 12 | `SolverInactive` | `accept_intent` | `solver_record.is_active == false` |
+| 13 | `ZeroAmount` | `submit_intent`, `register_solver`, `withdraw_bond` | `src_amount ≤ 0`, `min_dst_amount ≤ 0`, or `bond_amount ≤ 0` |
+| 14 | `InvalidDeadline` | `submit_intent` | Supplied `deadline ≤ env.ledger().timestamp()` |
+| 15 | `IntentAlreadyFilled` | `fill_intent` | Intent state is `Filled` |
+| 16 | `NotInitialized` | `set_fee_recipient`, `transfer_admin`, `require_admin` | `DataKey::Admin` absent (contract not initialized) |
+| 17 | `SolverHasActiveIntents` | `deregister_solver` | `solver_record.active_intents > 0` |
+| 18 | `ContractPaused` | `submit_intent`, `accept_intent`, `fill_intent` (via `require_not_paused`) | `DataKey::Paused` is `true` |
+| 19 | `DeadlineNotReached` | `expire_intent` | `now < intent.deadline` |
+| 20 | `InsufficientBond` | `withdraw_bond` | Requested withdrawal `amount > solver_record.bond_amount` |
+| 21 | `DstTokenNotAllowed` | `submit_intent` | `DstAllowlistEnabled` is `true` and `dst_token` is not in the `AllowedDstToken` list |
+
+---
 
 ### `solver_registry` (planned)
 
@@ -110,8 +171,40 @@ Settlement relies on two primitives:
    5 minutes. If they fail to fill, the intent reverts to `open` and is
    re-auctioned, and the bond is slashed permissionlessly via `slash_solver()`.
 
+### Pause scope (issue #36)
+
+`pause()` halts `submit_intent`, `accept_intent`, `fill_intent`, **and** the
+solver bond management functions (`register_solver`, `deregister_solver`,
+`withdraw_bond`). The rationale:
+
+- During a live incident an admin needs to freeze the full protocol state to
+  investigate. Allowing solvers to withdraw bonds while paused would let them
+  shed collateral exactly when the protocol needs it most as a backstop.
+- `slash_solver()` remains **permissionless and unpauseable** — a solver who
+  already accepted an intent cannot dodge accountability by waiting out the
+  pause.
+- `cancel_intent()` remains **open during a pause** — users should always be
+  able to reclaim their Open intents without needing admin cooperation.
+
+### Destination token allowlist default (issue #37)
+
+`is_dst_allowlist_enabled` defaults to **`false`** on a fresh deployment,
+meaning `submit_intent` accepts any `dst_token` address until an admin opts in.
+
+**Pre-launch action required:** before going live on mainnet, call
+`add_allowed_dst_token()` for every supported output token, then call
+`set_dst_allowlist_enabled(true)` to enforce validation. This prevents users
+from accidentally targeting an unsupported or malicious token contract.
+
+The same pattern applies to the **source-chain allowlist** (`is_src_chain_allowlist_enabled`,
+also off by default). Call `add_allowed_src_chain()` for every supported source
+chain (e.g. `"ethereum"`, `"base"`, `"polygon"`), then enable enforcement with
+`set_src_chain_allowlist_enabled(true)`.
+
 To report a vulnerability, see the org
 [SECURITY.md](https://github.com/vortex-protocol/.github/blob/main/SECURITY.md).
+For the detailed threat model specific to `intent_settlement`, see
+[SECURITY.md](./SECURITY.md) in this repository.
 
 ---
 
