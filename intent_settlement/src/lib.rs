@@ -341,6 +341,10 @@ pub struct IntentSettlement;
 impl IntentSettlement {
     // ── Initialization ────────────────────────────────────────────────────────
 
+    /// One-time contract setup. Records the `admin`, `fee_recipient`, and
+    /// `bond_token` (USDC) addresses, seeds protocol stats to zero, writes the
+    /// default `ProtocolConfig`, and extends the instance TTL.
+    /// Panics with `AlreadyInitialized` if called a second time.
     pub fn initialize(env: Env, admin: Address, fee_recipient: Address, bond_token: Address) {
         if env.storage().instance().has(&DataKey::Admin) {
             panic_with_error!(&env, Error::AlreadyInitialized);
@@ -538,6 +542,9 @@ impl IntentSettlement {
             .publish((Symbol::new(&env, "dst_token_allowed"),), token);
     }
 
+    /// Admin-only: remove a dst_token from the allowlist. After removal,
+    /// `submit_intent` will reject that token when `DstAllowlistEnabled` is
+    /// `true`. Has no effect on intents already in flight.
     pub fn remove_allowed_dst_token(env: Env, token: Address) {
         Self::require_admin(&env);
         env.storage()
@@ -547,6 +554,8 @@ impl IntentSettlement {
             .publish((Symbol::new(&env, "dst_token_disallowed"),), token);
     }
 
+    /// Returns `true` if `token` is on the dst_token allowlist.
+    /// Does not check whether allowlist enforcement is currently active.
     pub fn is_dst_token_allowed(env: Env, token: Address) -> bool {
         env.storage()
             .instance()
@@ -564,6 +573,8 @@ impl IntentSettlement {
             .set(&DataKey::DstAllowlistEnabled, &enabled);
     }
 
+    /// Returns `true` if the dst_token allowlist is currently being enforced
+    /// by `submit_intent`. Defaults to `false` on a fresh deployment.
     pub fn is_dst_allowlist_enabled(env: Env) -> bool {
         env.storage()
             .instance()
@@ -832,6 +843,9 @@ Please follow this repo's Conventional Commits format for your commit messages (
         );
     }
 
+    /// Solver voluntarily exits the protocol. Returns the full bond to the
+    /// solver and removes their record. Requires no active (Accepted) intents —
+    /// use `slash_solver` to clear those first.
     pub fn deregister_solver(env: Env, solver: Address) {
         // Auth audit: require_auth() is correct. Only the solver themselves
         // may deregister and trigger bond return. require_auth_for_args is not
@@ -1641,18 +1655,23 @@ Please follow this repo's Conventional Commits format for your commit messages (
         }
     }
 
+    /// Returns the current fee recipient address, or `None` before initialization.
     pub fn get_fee_recipient(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::FeeRecipient)
     }
 
+    /// Returns the pending (not-yet-accepted) fee recipient proposal, or `None`
+    /// if no proposal is currently outstanding.
     pub fn get_pending_fee_recipient(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::PendingFeeRecipient)
     }
 
+    /// Returns the bond token address (USDC SAC), or `None` before initialization.
     pub fn get_bond_token(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::BondToken)
     }
 
+    /// Returns the current admin address, or `None` before initialization.
     pub fn get_admin(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::Admin)
     }
