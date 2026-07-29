@@ -3,6 +3,8 @@ target/
 **/target/
 *.wasm
 test_snapshots/
+proptest-regressions/
+*.pending
 
 # Editor / OS
 .DS_Store

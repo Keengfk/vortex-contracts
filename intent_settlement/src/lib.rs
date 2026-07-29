@@ -213,6 +213,23 @@ pub struct BestBidRecord {
     pub quoted_dst_amount: i128,
 }
 
+/// Aggregate protocol-wide health snapshot, returned by `get_protocol_health`.
+/// Bundles the fields that previously required three separate calls
+/// (`is_paused`, `get_stats`, `get_solver_count`) into one, so
+/// dashboard/monitoring integrations need a single round-trip.
+#[contracttype]
+#[derive(Clone)]
+pub struct ProtocolHealth {
+    /// Mirrors `is_paused()` — true when submit/accept/fill are halted.
+    pub paused: bool,
+    /// Mirrors `get_stats().0` — total intents ever submitted.
+    pub total_intents: u64,
+    /// Mirrors `get_stats().1` — cumulative dst_token volume across all fills.
+    pub total_volume: i128,
+    /// Mirrors `get_solver_count()` — currently registered solvers.
+    pub total_solvers: u32,
+}
+
 // ─── Errors ───────────────────────────────────────────────────────────────────
 
 #[contracterror]
@@ -1689,6 +1706,39 @@ Please follow this repo's Conventional Commits format for your commit messages (
             .instance()
             .get(&DataKey::TotalSolvers)
             .unwrap_or(0)
+    }
+
+    /// Aggregate health snapshot combining `is_paused`, `get_stats`, and
+    /// `get_solver_count` into a single call, for dashboard/monitoring
+    /// integrations that would otherwise need three separate round-trips.
+    pub fn get_protocol_health(env: Env) -> ProtocolHealth {
+        let paused: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false);
+        let total_intents: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalIntents)
+            .unwrap_or(0);
+        let total_volume: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalVolume)
+            .unwrap_or(0);
+        let total_solvers: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalSolvers)
+            .unwrap_or(0);
+
+        ProtocolHealth {
+            paused,
+            total_intents,
+            total_volume,
+            total_solvers,
+        }
     }
 
     // ── Internal ──────────────────────────────────────────────────────────────
