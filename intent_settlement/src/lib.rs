@@ -330,6 +330,18 @@ pub enum Error {
     InvalidTokenInterface = 24,
     SrcChainNotAllowed = 22,
     RescueProtectedToken = 23,
+    /// #127: `submit_intent` was called with a `src_token` whose format does
+    /// not match the conventions of the declared `src_chain`.
+    ///
+    /// EVM chains (ethereum, base, polygon, arbitrum, optimism): expect a
+    /// `0x`-prefixed 42-character hex string (e.g. `"0xA0b86991…"`).
+    ///
+    /// Solana: expects a base58 string between 32 and 44 characters long with
+    /// no `0x` prefix.
+    ///
+    /// If `src_chain` is unknown this error is never raised — unknown chains
+    /// bypass token-format validation so the allowlist remains the sole gate.
+    InvalidSrcToken = 28,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -975,6 +987,12 @@ Please follow this repo's Conventional Commits format for your commit messages (
         {
             panic_with_error!(&env, Error::SrcChainNotAllowed);
         }
+
+        // #127 — validate src_token address format against the declared chain's
+        // conventions (EVM: 0x + 40 hex chars; Solana: base58 32–44 chars).
+        // This runs even when the src_chain allowlist is disabled so obviously
+        // malformed tokens are always caught at submission time.
+        Self::validate_src_token(&env, &src_chain, &src_token);
 
         let now = env.ledger().timestamp();
         let cfg = Self::load_config(&env);
@@ -1739,6 +1757,102 @@ Please follow this repo's Conventional Commits format for your commit messages (
 
         let score = base_bps * multiplier_bps / 10_000;
         score as u32
+    }
+
+    /// #127: Validate `src_token` address format against the conventions of
+    /// `src_chain`.
+    ///
+    /// Rules:
+    /// * EVM chains (`"ethereum"`, `"base"`, `"polygon"`, `"arbitrum"`,
+    ///   `"optimism"`): token must be a `0x`-prefixed 42-character ASCII string
+    ///   (2 + 40 hex digits).
+    /// * `"solana"`: token must be a base58-encoded public key — ASCII, no `0x`
+    ///   prefix, between 32 and 44 characters inclusive.
+    /// * Any other `src_chain` value: validation is skipped (forward-compatible).
+    ///
+    /// Called from `submit_intent` unconditionally so that even when the
+    /// src_chain allowlist is disabled, obviously malformed tokens are rejected
+    /// early.
+    fn validate_src_token(env: &Env, src_chain: &String, src_token: &String) {
+        let token_len = src_token.len();
+        let chain_len = src_chain.len();
+
+        // Compare `src_chain` byte-by-byte against a known ASCII literal.
+        let chain_is = |literal: &[u8]| -> bool {
+            if chain_len as usize != literal.len() {
+                return false;
+            }
+            let mut i = 0u32;
+            while i < chain_len {
+                if src_chain.get(i) != literal[i as usize] as u32 {
+                    return false;
+                }
+                i += 1;
+            }
+            true
+        };
+
+        let is_evm = chain_is(b"ethereum")
+            || chain_is(b"base")
+            || chain_is(b"polygon")
+            || chain_is(b"arbitrum")
+            || chain_is(b"optimism");
+
+        if is_evm {
+            // EVM token address: exactly "0x" + 40 hex chars = 42 characters.
+            if token_len != 42 {
+                panic_with_error!(env, Error::InvalidSrcToken);
+            }
+            // Must start with "0x".
+            if src_token.get(0) != b'0' as u32 || src_token.get(1) != b'x' as u32 {
+                panic_with_error!(env, Error::InvalidSrcToken);
+            }
+            // Remaining 40 characters must all be hex digits [0-9a-fA-F].
+            let mut i = 2u32;
+            while i < 42 {
+                let ch = src_token.get(i);
+                let is_hex = (ch >= b'0' as u32 && ch <= b'9' as u32)
+                    || (ch >= b'a' as u32 && ch <= b'f' as u32)
+                    || (ch >= b'A' as u32 && ch <= b'F' as u32);
+                if !is_hex {
+                    panic_with_error!(env, Error::InvalidSrcToken);
+                }
+                i += 1;
+            }
+            return;
+        }
+
+        if chain_is(b"solana") {
+            // Solana token (SPL mint): base58-encoded public key, 32–44 chars,
+            // no "0x" prefix.
+            if token_len < 32 || token_len > 44 {
+                panic_with_error!(env, Error::InvalidSrcToken);
+            }
+            if token_len >= 2
+                && src_token.get(0) == b'0' as u32
+                && src_token.get(1) == b'x' as u32
+            {
+                panic_with_error!(env, Error::InvalidSrcToken);
+            }
+            // Validate base58 alphabet:
+            // 123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz
+            // (excludes: '0', 'I', 'O', 'l')
+            let mut i = 0u32;
+            while i < token_len {
+                let ch = src_token.get(i);
+                let is_b58 = (ch >= b'1' as u32 && ch <= b'9' as u32)
+                    || (ch >= b'A' as u32 && ch <= b'H' as u32)
+                    || (ch >= b'J' as u32 && ch <= b'N' as u32)
+                    || (ch >= b'P' as u32 && ch <= b'Z' as u32)
+                    || (ch >= b'a' as u32 && ch <= b'k' as u32)
+                    || (ch >= b'm' as u32 && ch <= b'z' as u32);
+                if !is_b58 {
+                    panic_with_error!(env, Error::InvalidSrcToken);
+                }
+                i += 1;
+            }
+        }
+        // Unknown chain: skip validation — forward-compatible with future chains.
     }
 
     fn require_admin(env: &Env) {
