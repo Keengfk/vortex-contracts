@@ -9,7 +9,7 @@ use crate::{
     Error, IntentSettlement, IntentSettlementClient, IntentState, FILL_WINDOW, INTENT_EXPIRY,
     MIN_BOND, SLASH_COOLDOWN,
     DataKey, Error, IntentSettlement, IntentSettlementClient, IntentState, SolverRecord,
-    FILL_WINDOW, INTENT_EXPIRY, MIN_BOND,
+    FILL_WINDOW, INTENT_EXPIRY, MIN_BOND, ADMIN_TIMELOCK_DELAY,
 };
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
@@ -80,6 +80,16 @@ impl Ctx {
     fn pass_time(&self, secs: u64) {
         self.env.ledger().with_mut(|li| li.timestamp += secs);
     }
+
+    /// Propose + (after the timelock) execute adding `token` to the dst_token
+    /// allowlist, in one call. Convenience wrapper for tests that only care
+    /// about the end state (#115/#118 replaced the old one-step
+    /// `add_allowed_dst_token` with a propose/execute flow).
+    fn allow_dst_token(&self, token: &Address) {
+        self.client().propose_add_dst_token(token);
+        self.pass_time(ADMIN_TIMELOCK_DELAY);
+        self.client().execute_add_dst_token(token);
+    }
 }
 
 fn setup() -> Ctx {
@@ -144,17 +154,20 @@ fn admin_can_propose_and_accept_fee_recipient() {
 
     // Step 1: admin proposes
     ctx.client().propose_fee_recipient(&new_recipient);
-    assert_eq!(
-        ctx.client().get_pending_fee_recipient(),
-        Some(new_recipient.clone())
-    );
+    let (pending, eta) = ctx.client().get_pending_fee_recipient().unwrap();
+    assert_eq!(pending, new_recipient);
     // Active recipient unchanged until accepted
     assert_eq!(
         ctx.client().get_fee_recipient(),
         Some(ctx.fee_recipient.clone())
     );
 
-    // Step 2: new recipient accepts
+    // Accepting before the timelock delay elapses is rejected (#115).
+    let res = ctx.client().try_accept_fee_recipient(&new_recipient);
+    assert_eq!(res, Err(Ok(Error::TimelockNotElapsed.into())));
+
+    // Step 2: new recipient accepts once the timelock has elapsed
+    ctx.pass_time(eta - ctx.env.ledger().timestamp());
     ctx.client().accept_fee_recipient(&new_recipient);
     assert_eq!(
         ctx.client().get_fee_recipient(),
@@ -206,18 +219,27 @@ fn admin_can_transfer_admin() {
     let ctx = setup();
     assert_eq!(ctx.client().get_admin(), Some(ctx.admin.clone()));
 
+    // #115/#116: transfer_admin is now a timelocked propose/accept flow.
     let new_admin = Address::generate(&ctx.env);
-    ctx.client().transfer_admin(&new_admin);
+    ctx.client().propose_admin_transfer(&new_admin);
+    let (pending, eta) = ctx.client().get_pending_admin().unwrap();
+    assert_eq!(pending, new_admin);
+    assert_eq!(ctx.client().get_admin(), Some(ctx.admin.clone()));
+
+    // Accepting before the timelock delay elapses is rejected.
+    let res = ctx.client().try_accept_admin_transfer(&new_admin);
+    assert_eq!(res, Err(Ok(Error::TimelockNotElapsed.into())));
+
+    ctx.pass_time(eta - ctx.env.ledger().timestamp());
+    ctx.client().accept_admin_transfer(&new_admin);
     assert_eq!(ctx.client().get_admin(), Some(new_admin.clone()));
+    assert_eq!(ctx.client().get_pending_admin(), None);
 
     // The new admin can now exercise admin-only functions — use the two-step
     // propose/accept flow that replaced set_fee_recipient (issue #30).
     let another_recipient = Address::generate(&ctx.env);
     ctx.client().propose_fee_recipient(&another_recipient);
-    assert_eq!(
-        ctx.client().get_pending_fee_recipient(),
-        Some(another_recipient.clone())
-    );
+    ctx.pass_time(ADMIN_TIMELOCK_DELAY);
     ctx.client().accept_fee_recipient(&another_recipient);
     assert_eq!(ctx.client().get_fee_recipient(), Some(another_recipient));
 }
@@ -660,10 +682,13 @@ fn dst_allowlist_blocks_unlisted_token_once_enabled() {
 fn dst_allowlist_allows_listed_token_once_enabled() {
     let ctx = setup();
     let c = ctx.client();
-    c.add_allowed_dst_token(&ctx.dst_token);
+    ctx.allow_dst_token(&ctx.dst_token);
     c.set_dst_allowlist_enabled(&true);
 
     assert!(c.is_dst_token_allowed(&ctx.dst_token));
+    let listed = c.list_allowed_dst_tokens();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed.get(0).unwrap(), ctx.dst_token);
     ctx.submit();
 }
 
@@ -671,11 +696,20 @@ fn dst_allowlist_allows_listed_token_once_enabled() {
 fn dst_allowlist_removal_blocks_previously_allowed_token() {
     let ctx = setup();
     let c = ctx.client();
-    c.add_allowed_dst_token(&ctx.dst_token);
+    ctx.allow_dst_token(&ctx.dst_token);
     c.set_dst_allowlist_enabled(&true);
-    c.remove_allowed_dst_token(&ctx.dst_token);
+
+    // #115/#118: removal is now a timelocked propose/execute flow.
+    c.propose_remove_dst_token(&ctx.dst_token);
+    assert!(c.is_dst_token_allowed(&ctx.dst_token));
+    let res = c.try_execute_remove_dst_token(&ctx.dst_token);
+    assert_eq!(res, Err(Ok(Error::TimelockNotElapsed.into())));
+
+    ctx.pass_time(ADMIN_TIMELOCK_DELAY);
+    c.execute_remove_dst_token(&ctx.dst_token);
 
     assert!(!c.is_dst_token_allowed(&ctx.dst_token));
+    assert_eq!(c.list_allowed_dst_tokens().len(), 0);
     let deadline: Option<u64> = None;
     let res = c.try_submit_intent(
         &ctx.user,
@@ -1715,25 +1749,25 @@ fn slash_tiny_bond_always_yields_nonzero_slash() {
 // ─── Issue #33: add_allowed_dst_token validates SEP-41 interface ─────────────────
 
 /// #33: Passing the settlement contract's own address (which is not a token)
-/// to add_allowed_dst_token must fail.  The `decimals()` probe inside
-/// add_allowed_dst_token will trap on a contract that doesn't implement SEP-41,
+/// to propose_add_dst_token must fail.  The `decimals()` probe inside
+/// propose_add_dst_token will trap on a contract that doesn't implement SEP-41,
 /// reverting the transaction before any storage entry is written.
 #[test]
-fn add_allowed_dst_token_rejects_non_token_contract() {
+fn propose_add_dst_token_rejects_non_token_contract() {
     let ctx = setup();
 
     // ctx.contract_id is a real deployed contract (IntentSettlement) but it
     // does not implement the SEP-41 token interface, so decimals() will trap.
     let res = ctx
         .client()
-        .try_add_allowed_dst_token(&ctx.contract_id);
+        .try_propose_add_dst_token(&ctx.contract_id);
 
     // The call must fail — either with InvalidTokenInterface or a generic
     // contract-trap error (the host converts a trapped cross-contract call
     // into an Err result in the test environment).
     assert!(
         res.is_err(),
-        "allowlisting a non-token address should fail"
+        "proposing a non-token address should fail"
     );
 
     // No storage entry must have been written for the bogus address.
@@ -1743,13 +1777,14 @@ fn add_allowed_dst_token_rejects_non_token_contract() {
     );
 }
 
-/// #33 (positive case): a real SEP-41 token passes the probe and is stored.
+/// #33 (positive case): a real SEP-41 token passes the probe and is stored
+/// once the timelocked propose/execute flow (#115/#118) completes.
 #[test]
 fn add_allowed_dst_token_accepts_real_token() {
     let ctx = setup();
 
     // dst_token was registered as a StellarAssetContract — it implements SEP-41.
-    ctx.client().add_allowed_dst_token(&ctx.dst_token);
+    ctx.allow_dst_token(&ctx.dst_token);
     assert!(ctx.client().is_dst_token_allowed(&ctx.dst_token));
 }
 // ─── #34 Source chain allowlist ──────────────────────────────────────────────────

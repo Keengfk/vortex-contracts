@@ -3,6 +3,11 @@ target/
 **/target/
 *.wasm
 test_snapshots/
+**/test_snapshots/
+.stellar/
+**/.stellar/
+*.snap
+*.snap.new
 
 # Editor / OS
 .DS_Store
