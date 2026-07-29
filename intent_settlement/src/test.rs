@@ -6,10 +6,8 @@
 //! expiry, solver bonding/slashing, and the guard conditions on each step.
 
 use crate::{
-    Error, IntentSettlement, IntentSettlementClient, IntentState, FILL_WINDOW, INTENT_EXPIRY,
-    MIN_BOND, SLASH_COOLDOWN,
     DataKey, Error, IntentSettlement, IntentSettlementClient, IntentState, SolverRecord,
-    FILL_WINDOW, INTENT_EXPIRY, MIN_BOND,
+    FILL_WINDOW, INTENT_EXPIRY, MIN_BOND, SLASH_COOLDOWN,
 };
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
@@ -2019,5 +2017,179 @@ fn dst_allowlist_enabled_defaults_to_false() {
         !ctx.client().is_dst_allowlist_enabled(),
         "DstAllowlistEnabled must default to false; \
          enable it explicitly via set_dst_allowlist_enabled before mainnet launch"
+    );
+}
+
+// ─── Issue #121: Protocol fee cap ───────────────────────────────────────────────
+
+use crate::{
+    DEFAULT_FILL_WINDOW, DEFAULT_INTENT_EXPIRY, DEFAULT_MIN_BOND, DEFAULT_PROTOCOL_FEE_BPS,
+    MAX_PROTOCOL_FEE_BPS, MIN_BOND_FLOOR, MIN_FILL_WINDOW_SECS, MIN_INTENT_EXPIRY_SECS,
+};
+
+/// set_config rejects protocol_fee_bps strictly above MAX_PROTOCOL_FEE_BPS (10%).
+#[test]
+fn set_config_rejects_fee_above_cap() {
+    let ctx = setup();
+    let over_cap = MAX_PROTOCOL_FEE_BPS + 1;
+    let res = ctx.client().try_set_config(
+        &DEFAULT_MIN_BOND,
+        &DEFAULT_FILL_WINDOW,
+        &DEFAULT_INTENT_EXPIRY,
+        &over_cap,
+    );
+    assert_eq!(
+        res,
+        Err(Ok(Error::InvalidConfig.into())),
+        "fee_bps above MAX_PROTOCOL_FEE_BPS must be rejected"
+    );
+}
+
+/// set_config accepts protocol_fee_bps exactly equal to MAX_PROTOCOL_FEE_BPS (10%).
+#[test]
+fn set_config_accepts_fee_at_cap() {
+    let ctx = setup();
+    ctx.client().set_config(
+        &DEFAULT_MIN_BOND,
+        &DEFAULT_FILL_WINDOW,
+        &DEFAULT_INTENT_EXPIRY,
+        &MAX_PROTOCOL_FEE_BPS,
+    );
+    let cfg = ctx.client().get_config();
+    assert_eq!(
+        cfg.protocol_fee_bps, MAX_PROTOCOL_FEE_BPS,
+        "fee_bps exactly at the cap should be stored"
+    );
+}
+
+/// set_config accepts protocol_fee_bps = 0 (zero fee is valid).
+#[test]
+fn set_config_accepts_zero_fee() {
+    let ctx = setup();
+    ctx.client().set_config(
+        &DEFAULT_MIN_BOND,
+        &DEFAULT_FILL_WINDOW,
+        &DEFAULT_INTENT_EXPIRY,
+        &0,
+    );
+    let cfg = ctx.client().get_config();
+    assert_eq!(cfg.protocol_fee_bps, 0, "zero fee_bps should be accepted");
+}
+
+/// set_config accepts a typical small fee (5 bps = 0.05%).
+#[test]
+fn set_config_accepts_typical_fee() {
+    let ctx = setup();
+    ctx.client().set_config(
+        &DEFAULT_MIN_BOND,
+        &DEFAULT_FILL_WINDOW,
+        &DEFAULT_INTENT_EXPIRY,
+        &DEFAULT_PROTOCOL_FEE_BPS,
+    );
+    let cfg = ctx.client().get_config();
+    assert_eq!(
+        cfg.protocol_fee_bps, DEFAULT_PROTOCOL_FEE_BPS,
+        "default fee_bps should round-trip through set_config"
+    );
+}
+
+/// set_config rejects a negative protocol_fee_bps value.
+#[test]
+fn set_config_rejects_negative_fee() {
+    let ctx = setup();
+    let res = ctx.client().try_set_config(
+        &DEFAULT_MIN_BOND,
+        &DEFAULT_FILL_WINDOW,
+        &DEFAULT_INTENT_EXPIRY,
+        &-1,
+    );
+    assert_eq!(
+        res,
+        Err(Ok(Error::InvalidConfig.into())),
+        "negative fee_bps must be rejected"
+    );
+}
+
+/// set_config rejects fill_window below the minimum (MIN_FILL_WINDOW_SECS).
+#[test]
+fn set_config_rejects_fill_window_below_minimum() {
+    let ctx = setup();
+    let res = ctx.client().try_set_config(
+        &DEFAULT_MIN_BOND,
+        &(MIN_FILL_WINDOW_SECS - 1),
+        &DEFAULT_INTENT_EXPIRY,
+        &DEFAULT_PROTOCOL_FEE_BPS,
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidConfig.into())));
+}
+
+/// set_config rejects intent_expiry not greater than fill_window.
+#[test]
+fn set_config_rejects_intent_expiry_not_greater_than_fill_window() {
+    let ctx = setup();
+    // intent_expiry == fill_window: should fail (must be strictly greater)
+    let res = ctx.client().try_set_config(
+        &DEFAULT_MIN_BOND,
+        &DEFAULT_FILL_WINDOW,
+        &DEFAULT_FILL_WINDOW, // equal, not greater
+        &DEFAULT_PROTOCOL_FEE_BPS,
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidConfig.into())));
+}
+
+/// set_config rejects min_bond below the floor (MIN_BOND_FLOOR).
+#[test]
+fn set_config_rejects_min_bond_below_floor() {
+    let ctx = setup();
+    let res = ctx.client().try_set_config(
+        &(MIN_BOND_FLOOR - 1),
+        &DEFAULT_FILL_WINDOW,
+        &DEFAULT_INTENT_EXPIRY,
+        &DEFAULT_PROTOCOL_FEE_BPS,
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidConfig.into())));
+}
+
+/// After a successful set_config, get_config returns the new values.
+#[test]
+fn set_config_updates_all_fields() {
+    let ctx = setup();
+    let new_min_bond: i128 = 100 * 10_000_000; // 100 USDC
+    let new_fill_window: u64 = 120;             // 2 minutes
+    let new_intent_expiry: u64 = 3600;          // 1 hour
+    let new_fee_bps: i128 = 10;                 // 0.10%
+
+    ctx.client().set_config(
+        &new_min_bond,
+        &new_fill_window,
+        &new_intent_expiry,
+        &new_fee_bps,
+    );
+
+    let cfg = ctx.client().get_config();
+    assert_eq!(cfg.min_bond, new_min_bond);
+    assert_eq!(cfg.fill_window, new_fill_window);
+    assert_eq!(cfg.intent_expiry, new_intent_expiry);
+    assert_eq!(cfg.protocol_fee_bps, new_fee_bps);
+}
+
+/// Non-admin cannot call set_config (require_admin guard).
+#[test]
+fn set_config_requires_admin() {
+    // With mock_all_auths the call itself succeeds, but the admin auth must
+    // be among the recorded authorisations.
+    let ctx = setup();
+    ctx.client().set_config(
+        &DEFAULT_MIN_BOND,
+        &DEFAULT_FILL_WINDOW,
+        &DEFAULT_INTENT_EXPIRY,
+        &DEFAULT_PROTOCOL_FEE_BPS,
+    );
+    let auths = ctx.env.auths();
+    let admin_authed = auths.iter().any(|(addr, _)| *addr == ctx.admin);
+    assert!(
+        admin_authed,
+        "set_config must require admin auth; got: {:?}",
+        auths
     );
 }

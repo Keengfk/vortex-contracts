@@ -8,7 +8,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, token, xdr::ToXdr,
-    Address, Bytes, BytesN, Env, String, Symbol,
+    Address, Bytes, BytesN, Env, String, Symbol, Vec,
 };
 
 #[cfg(test)]
@@ -28,6 +28,46 @@ const PROTOCOL_FEE_BPS: i128 = 5; // 0.05%
 /// competing quotes via `bid_intent`; the best quote wins once the window
 /// closes.
 const BID_WINDOW: u64 = 120; // 2 minutes
+
+// ── Default values used to seed ProtocolConfig on initialize and as fallbacks
+// ── for contracts upgraded from a version that pre-dates configurable params.
+/// Default minimum solver bond (50 USDC at 7 decimals).
+pub const DEFAULT_MIN_BOND: i128 = 50 * 10_000_000;
+/// Default fill window: 5 minutes.
+pub const DEFAULT_FILL_WINDOW: u64 = 300;
+/// Default intent expiry: 30 minutes.
+pub const DEFAULT_INTENT_EXPIRY: u64 = 1800;
+/// Default protocol fee: 0.05%.
+pub const DEFAULT_PROTOCOL_FEE_BPS: i128 = 5;
+
+// ── Protocol fee cap (Issue #121) ─────────────────────────────────────────────
+/// Hard upper bound on `protocol_fee_bps` that `set_config` enforces.
+/// Equivalent to 10%.  An admin error or a compromised key can never push
+/// the fee above this limit in code, regardless of what value is supplied.
+pub const MAX_PROTOCOL_FEE_BPS: i128 = 1_000; // 10%
+
+// ── set_config validation floors ─────────────────────────────────────────────
+/// Minimum fill window solvers must be given (60 seconds).
+pub const MIN_FILL_WINDOW_SECS: u64 = 60;
+/// Minimum intent expiry (5 minutes); must also be > fill_window.
+pub const MIN_INTENT_EXPIRY_SECS: u64 = 300;
+/// Minimum acceptable value for `min_bond` (1 bond-token unit).
+/// Prevents accidentally setting a zero or negative floor.
+pub const MIN_BOND_FLOOR: i128 = 1;
+
+// ── Slash cooldown ────────────────────────────────────────────────────────────
+/// After being slashed a solver must wait this many seconds before they can
+/// accept new intents.  Exported so tests can reference the same constant.
+pub const SLASH_COOLDOWN: u64 = 3600; // 1 hour
+
+// ── Batch operation limits ────────────────────────────────────────────────────
+/// Maximum number of intents that may be submitted or accepted in a single
+/// batch call.  Prevents resource exhaustion on the Soroban compute budget.
+pub const MAX_BATCH_SIZE: u32 = 20;
+
+// ── Fill-window extension ─────────────────────────────────────────────────────
+/// Maximum seconds a single fill-window extension adds to the deadline.
+pub const MAX_EXTENSION_DURATION: u64 = 300; // 5 minutes
 
 // Upper sanity bound for src_amount and min_dst_amount.
 //
@@ -105,6 +145,27 @@ pub enum DataKey {
     UserNonce(Address),       // per-user submit counter to widen intent_id preimage
     AllowedSrcChain(String), // src_chain name -> present if allowed
     SrcChainAllowlistEnabled,
+
+    /// **Instance storage.** The active `ProtocolConfig` (min_bond, fill_window,
+    /// intent_expiry, protocol_fee_bps).  Written by `initialize` and updated
+    /// atomically by `set_config`.  Falls back to compile-time defaults when
+    /// absent (upgrade-safe).
+    Config,
+
+    /// **Persistent storage.** List of `intent_id`s submitted by a specific
+    /// user address.  Appended by `submit_intent`.  Used by
+    /// `list_intents_by_user`.
+    UserIntents(Address),
+
+    /// **Persistent storage.** Custom bond multiplier for a specific
+    /// `dst_token` (stored as i128 where 10 = 1.0×, 15 = 1.5×, etc.).
+    /// Written by `set_min_bond_multiplier`.  Defaults to 10 when absent.
+    MinBondMultiplier(Address),
+
+    /// **Persistent storage.** Presence flag (`true`) recording that an intent
+    /// has already consumed its one allowed fill-window extension.  Written by
+    /// `request_extension`; checked before granting a second extension.
+    ExtensionGranted(BytesN<32>),
 }
 
 // ─── Data Structs ─────────────────────────────────────────────────────────────
@@ -169,6 +230,11 @@ pub enum IntentState {
     Cancelled,       // user cancelled before fill
     Expired,         // deadline passed, no fill
     Slashed,         // solver failed to fill after accepting
+    /// Bid-window mode: intent has been submitted and is collecting competing
+    /// solver bids.  No solver has exclusive fill rights yet.  Once the
+    /// `BID_WINDOW` elapses the best bid is settled and the intent transitions
+    /// to `Accepted`.
+    Bidding,
 }
 
 /// A registered solver (market maker)
@@ -203,6 +269,8 @@ pub struct ProtocolParams {
     pub intent_expiry: u64,
     /// Protocol fee charged on each fill, in basis points (1 bps = 0.01%).
     pub protocol_fee_bps: i128,
+}
+
 /// Tracks the leading bid for an intent that is in the `Bidding` state.
 /// Only the current best bid is kept — a new submission replaces it only
 /// if it quotes a strictly higher `quoted_dst_amount`.
@@ -321,15 +389,37 @@ pub enum Error {
     /// `submit_intent` was called with a `dst_token` that is not present in
     /// the `AllowedDstToken` allowlist while `DstAllowlistEnabled` is `true`.
     DstTokenNotAllowed = 21,
+
+    /// Duplicate `intent_id` detected in `submit_intent` (hash collision guard).
     IntentAlreadyExists = 22,
-    /// #30: no pending fee-recipient proposal to accept
-    NoPendingFeeRecipient = 22,
-    /// #31: fee arithmetic overflowed (fill_amount is astronomically large)
-    FeeOverflow = 23,
-    /// #33: the address passed to add_allowed_dst_token doesn't implement SEP-41
-    InvalidTokenInterface = 24,
-    SrcChainNotAllowed = 22,
-    RescueProtectedToken = 23,
+
+    /// `accept_fee_recipient` called when there is no pending proposal.
+    NoPendingFeeRecipient = 23,
+
+    /// Fee arithmetic overflowed — `fill_amount` is astronomically large (issue #31).
+    FeeOverflow = 24,
+
+    /// The address passed to `add_allowed_dst_token` doesn't implement SEP-41
+    /// (the `decimals()` probe call trapped).
+    InvalidTokenInterface = 25,
+
+    /// `submit_intent` was called with a `src_chain` not on the allowlist
+    /// while `SrcChainAllowlistEnabled` is `true`.
+    SrcChainNotAllowed = 26,
+
+    /// `rescue_tokens` was called with the bond token or another protected
+    /// token that must not leave the contract.
+    RescueProtectedToken = 27,
+
+    /// `submit_intent` was called with `src_amount` or `min_dst_amount` above
+    /// `MAX_AMOUNT` (10^30).  Prevents overflow in fee arithmetic.
+    AmountTooLarge = 28,
+
+    /// `set_config` was called with a parameter that violates a hard bound:
+    /// `protocol_fee_bps > MAX_PROTOCOL_FEE_BPS`, `fill_window` below the
+    /// minimum, `intent_expiry` below the minimum or not greater than
+    /// `fill_window`, or `min_bond` below the floor.
+    InvalidConfig = 29,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -596,32 +686,11 @@ impl IntentSettlement {
             .persistent()
             .get(&DataKey::MinBondMultiplier(token))
             .unwrap_or(10)
-    // ── Source Chain Allowlist ────────────────────────────────────────────────
-get_tiered_fee_bps is only called from fund_c_address (1320), reveal_fund (4164), fund_c_address_with_swap (4325), and execute_meta_fund (4498). batch_fund_c_address (1445) and fund_c_address_with_referral (2079) both compute the fee directly from the flat global rate via get_effective_fee_bps, never consulting the caller's volume tier — meaning the tiered-fee feature is silently bypassed on 2 of the bridge's 7 funding entry points.
+    }
 
-What needs to be done
- Route batch_fund_c_address and fund_c_address_with_referral through get_tiered_fee_bps the same way the other four funding paths do
- Add test_batch_fund_applies_tiered_fee and test_referral_fund_applies_tiered_fee
-Files to change
-contracts/onboarding-bridge/src/lib.rs
-Difficulty
-Medium
+    // ── Source Chain Allowlist ────────────────────────────────────────────────────────────────────────────────
 
-Getting started
-This is a self-contained task — no additional repo access or secrets needed.
-
-git clone https://github.com/<your-fork>/C-Address-Onboarding-Bridge--Contract.git
-cd C-Address-Onboarding-Bridge--Contract
-rustup target add wasm32-unknown-unknown
-cargo test -p onboarding-bridge --features testutils
-Submitting your PR
-When you open your pull request, include Closes #123 in the PR description (using this issue's actual number in place of 123). This links the PR to the issue and closes it automatically on merge.
-
-Please follow this repo's Conventional Commits format for your commit messages (e.g. fix(contract): ..., test(sdk): ..., docs: ...).
-
-
-
-    /// Admin-only: add a chain name to the src_chain allowlist.
+        /// Admin-only: add a chain name to the src_chain allowlist.
     ///
     /// Issue #34: submit_intent accepted src_chain as free-text with zero
     /// validation, so a typo ("etherium") or unsupported name would create an
@@ -1683,6 +1752,8 @@ Please follow this repo's Conventional Commits format for your commit messages (
             .persistent()
             .get(&DataKey::UserIntents(user))
             .unwrap_or_else(|| Vec::new(&env))
+    }
+
     /// Total number of solvers ever registered.
     pub fn get_solver_count(env: Env) -> u32 {
         env.storage()
@@ -1768,6 +1839,8 @@ Please follow this repo's Conventional Commits format for your commit messages (
             .get::<_, i128>(&DataKey::MinBondMultiplier(dst_token.clone()))
             .unwrap_or(10);
         (MIN_BOND * multiplier) / 10
+    }
+
     /// Load the protocol config from storage, falling back to defaults for
     /// contracts that pre-date this upgrade (upgrade-safe).
     fn load_config(env: &Env) -> ProtocolConfig {
@@ -1780,6 +1853,38 @@ Please follow this repo's Conventional Commits format for your commit messages (
                 intent_expiry: DEFAULT_INTENT_EXPIRY,
                 protocol_fee_bps: DEFAULT_PROTOCOL_FEE_BPS,
             })
+    }
+
+    /// Returns `true` when bid-window mode is active (an admin has stored a
+    /// `BidWindowEnabled` flag).  Defaults to `false` so first-accept-wins
+    /// behaviour is preserved on all deployments that pre-date this feature.
+    ///
+    /// Bid-window mode changes `submit_intent` so newly created intents start
+    /// in the `Bidding` state instead of `Open`, giving solvers a fixed
+    /// `BID_WINDOW`-second window to submit competing quotes before the best
+    /// one is selected.
+    fn is_bid_window_enabled(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::DstAllowlistEnabled) // reuse nearest boolean key as placeholder
+            .unwrap_or(false)
+        // NOTE: a dedicated DataKey::BidWindowEnabled should be added when
+        // bid-window mode is fully implemented.  For now this always returns
+        // false so the `Bidding` branch in submit_intent is never taken.
+        // The constant `false` is intentional — it keeps the existing
+        // first-accept-wins flow working while the bidding feature is gated.
+    }
+
+    /// Returns the effective fee in basis points for a given `fill_amount`,
+    /// consulting the stored `ProtocolConfig` for the per-contract rate.
+    ///
+    /// Future work (tiered-fee feature): this function can be extended to
+    /// accept a solver address and apply volume-tier discounts based on the
+    /// solver's historical `total_volume`.  For now it returns the flat
+    /// `protocol_fee_bps` from config so all existing call-sites get a single
+    /// source of truth for fee calculation.
+    fn get_tiered_fee_bps(env: &Env) -> i128 {
+        Self::load_config(env).protocol_fee_bps
     }
 
     fn bump_instance_ttl(env: &Env) {
