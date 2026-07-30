@@ -12,8 +12,69 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  fmt:
+    name: Formatting
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: intent_settlement
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
   contract:
-    name: Contract (Soroban)
+    name: Contract (${{ matrix.toolchain }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # stable — tracks latest stable Rust
+        # 1.78   — MSRV declared in README ("Rust 1.78+")
+        toolchain: [stable, "1.78"]
+    defaults:
+      run:
+        working-directory: intent_settlement
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (${{ matrix.toolchain }})
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          targets: wasm32-unknown-unknown
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: intent_settlement
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: intent_settlement
+          # Separate cache per toolchain to avoid cross-contamination
+          key: ${{ matrix.toolchain }}
+
+      - name: Format check
+        # Only enforce formatting on stable; MSRV rustfmt may produce different
+        # output for features introduced after 1.78.
+        if: matrix.toolchain == 'stable'
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        # Identical to the command documented in README.md ("Build & Test").
+        # -D warnings is required on ALL matrix legs so MSRV is lint-clean too.
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test
+
+  wasm-size:
+    name: Wasm size budget
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -24,18 +85,30 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
-          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: intent_settlement
-      - name: Format check
-        run: cargo fmt --all -- --check
-      - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
-      - name: Test
-        run: cargo test
       - name: Build wasm
         run: cargo build --target wasm32-unknown-unknown --release
+      - name: Check wasm size
+        shell: bash
+        run: |
+          # Soroban network limit is 64 KB for a contract wasm binary.
+          # We budget at 90 % of that to leave headroom: 58 982 bytes.
+          MAX_BYTES=58982
+          WASM=$(ls target/wasm32-unknown-unknown/release/*.wasm | head -n1)
+          SIZE=$(wc -c < "$WASM")
+          echo "### Wasm size report" >> "$GITHUB_STEP_SUMMARY"
+          echo "| File | Size (bytes) | Budget (bytes) | Status |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| ---- | -----------: | -------------: | ------ |" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$SIZE" -le "$MAX_BYTES" ]; then
+            echo "| \`$(basename $WASM)\` | $SIZE | $MAX_BYTES | ✅ under budget |" >> "$GITHUB_STEP_SUMMARY"
+            echo "Wasm size OK: $SIZE bytes (limit $MAX_BYTES bytes)"
+          else
+            echo "| \`$(basename $WASM)\` | $SIZE | $MAX_BYTES | ❌ over budget |" >> "$GITHUB_STEP_SUMMARY"
+            echo "ERROR: Wasm size $SIZE bytes exceeds budget of $MAX_BYTES bytes." >&2
+            exit 1
+          fi
 
   proptest:
     name: Bond-conservation proptest
@@ -75,3 +148,24 @@ jobs:
         run: cargo install cargo-audit --locked
       - name: Audit dependencies
         run: cargo audit
+
+  mutants:
+    name: Mutation testing
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: intent_settlement
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: intent_settlement
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants --locked
+      - name: Run mutation tests
+        run: cargo mutants --copy-target=false

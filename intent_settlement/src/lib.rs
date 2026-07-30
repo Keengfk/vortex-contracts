@@ -8,7 +8,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, token, xdr::ToXdr,
-    Address, Bytes, BytesN, Env, String, Symbol,
+    Address, Bytes, BytesN, Env, String, Symbol, Vec,
 };
 
 #[cfg(test)]
@@ -28,6 +28,14 @@ const PROTOCOL_FEE_BPS: i128 = 5; // 0.05%
 /// competing quotes via `bid_intent`; the best quote wins once the window
 /// closes.
 const BID_WINDOW: u64 = 120; // 2 minutes
+
+/// Delay enforced between proposing and executing a sensitive admin change
+/// (admin transfer, fee recipient handover, dst_token allowlist changes).
+/// Gives users and solvers a window to notice and react before the change
+/// takes effect (#115). Proposing also emits a distinct event immediately,
+/// so off-chain monitors get advance notice even before the delay elapses
+/// (#116).
+const ADMIN_TIMELOCK_DELAY: u64 = 172_800; // 48 hours
 
 // Upper sanity bound for src_amount and min_dst_amount.
 //
@@ -59,9 +67,10 @@ const INSTANCE_TTL_EXTEND_TO: u32 = DAY_IN_LEDGERS * 60;
 #[derive(Clone)]
 pub enum DataKey {
     /// **Instance storage.** The admin `Address` that may call privileged
-    /// functions (`pause`, `unpause`, `set_fee_recipient`, `transfer_admin`,
-    /// `add_allowed_dst_token`, etc.).  Written once by `initialize` and
-    /// rotated by `transfer_admin`.  Lives as long as the contract instance.
+    /// functions (`pause`, `unpause`, `propose_fee_recipient`,
+    /// `propose_admin_transfer`, `propose_add_dst_token`, etc.).  Written
+    /// once by `initialize` and rotated by `accept_admin_transfer`.  Lives as
+    /// long as the contract instance.
     Admin,
 
     /// **Instance storage.** The `Address` that receives protocol fees
@@ -69,11 +78,31 @@ pub enum DataKey {
     /// `slash_solver`).  Written by `initialize` and updated by
     /// `set_fee_recipient`.  Lives as long as the contract instance.
     FeeRecipient,
-    PendingFeeRecipient, // proposed-but-not-yet-accepted new fee recipient (issue #30)
+    /// Proposed-but-not-yet-accepted new fee recipient plus the ledger
+    /// timestamp at which `accept_fee_recipient` may execute it (issue #30,
+    /// timelock added by #115): `(Address, u64)`.
+    PendingFeeRecipient,
     BondToken,          // USDC address for bonds
     Intent(BytesN<32>), // intent_id -> IntentRecord
     Solver(Address),    // address -> SolverRecord
     TotalIntents,
+
+    /// **Instance storage.** Count of intents currently in `Open` or
+    /// `PartiallyFilled` state (`u64`).  Incremented by `submit_intent` and
+    /// by `slash_solver` (which re-opens the intent).  Decremented by
+    /// `accept_intent`, `cancel_intent`, `expire_intent`, and `fill_intent`
+    /// (only on a full fill that closes the intent).
+    ///
+    /// Trade-off (#109): maintaining this counter on-chain costs one extra
+    /// instance-storage read+write on every state-changing call but gives
+    /// dashboards an O(1) open-intent count without replaying events.  The
+    /// alternative — leaving the computation entirely to indexers — is cheaper
+    /// on-chain but forces every dashboard to run a full event replay.  Given
+    /// that the counter sits in instance storage (one ledger entry, already
+    /// loaded on every call) the marginal cost is a single integer increment/
+    /// decrement, which is negligible compared to the persistent-storage reads
+    /// for `IntentRecord` and `SolverRecord`.
+    OpenIntents,
 
     /// **Instance storage.** Cumulative `dst_token` volume (`i128`) across
     /// all successfully filled intents.  Incremented by `fill_intent`.
@@ -105,6 +134,16 @@ pub enum DataKey {
     UserNonce(Address),       // per-user submit counter to widen intent_id preimage
     AllowedSrcChain(String), // src_chain name -> present if allowed
     SrcChainAllowlistEnabled,
+
+    /// **Instance storage.** The `Address` authorized to call `pause` in
+    /// addition to `Admin` (issue #120). Lets an operator hand a hot key to
+    /// an incident-response process without exposing the admin key that
+    /// also controls fee routing and admin transfer. Absent until the admin
+    /// calls `set_pauser`, in which case `pause` remains admin-only.
+    /// `unpause` is intentionally *not* reachable via this role (narrow
+    /// unpause access) -- resuming the protocol always needs the full
+    /// admin's judgment.
+    Pauser,
 }
 
 // ─── Data Structs ─────────────────────────────────────────────────────────────
@@ -313,7 +352,8 @@ pub enum Error {
 
     /// An operation that requires the contract to be initialized (i.e. needs
     /// `Admin` in instance storage) was called before `initialize`.  Raised
-    /// by `require_admin` and by `set_fee_recipient` / `transfer_admin`.
+    /// by `require_admin` and by `propose_fee_recipient` /
+    /// `propose_admin_transfer`.
     NotInitialized = 16,
 
     /// `deregister_solver` was called while the solver's `active_intents`
@@ -347,6 +387,18 @@ pub enum Error {
     InvalidTokenInterface = 24,
     SrcChainNotAllowed = 22,
     RescueProtectedToken = 23,
+    /// #127: `submit_intent` was called with a `src_token` whose format does
+    /// not match the conventions of the declared `src_chain`.
+    ///
+    /// EVM chains (ethereum, base, polygon, arbitrum, optimism): expect a
+    /// `0x`-prefixed 42-character hex string (e.g. `"0xA0b86991…"`).
+    ///
+    /// Solana: expects a base58 string between 32 and 44 characters long with
+    /// no `0x` prefix.
+    ///
+    /// If `src_chain` is unknown this error is never raised — unknown chains
+    /// bypass token-format validation so the allowlist remains the sole gate.
+    InvalidSrcToken = 28,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -358,6 +410,10 @@ pub struct IntentSettlement;
 impl IntentSettlement {
     // ── Initialization ────────────────────────────────────────────────────────
 
+    /// One-time contract setup. Records the `admin`, `fee_recipient`, and
+    /// `bond_token` (USDC) addresses, seeds protocol stats to zero, writes the
+    /// default `ProtocolConfig`, and extends the instance TTL.
+    /// Panics with `AlreadyInitialized` if called a second time.
     pub fn initialize(env: Env, admin: Address, fee_recipient: Address, bond_token: Address) {
         if env.storage().instance().has(&DataKey::Admin) {
             panic_with_error!(&env, Error::AlreadyInitialized);
@@ -377,6 +433,7 @@ impl IntentSettlement {
         env.storage().instance().set(&DataKey::TotalIntents, &0u64);
         env.storage().instance().set(&DataKey::TotalVolume, &0i128);
         env.storage().instance().set(&DataKey::TotalSolvers, &0u32);
+        env.storage().instance().set(&DataKey::OpenIntents, &0u64);
         // Seed Config with defaults so the contract is immediately usable
         // without a follow-up admin call.
         env.storage().instance().set(
@@ -394,12 +451,17 @@ impl IntentSettlement {
     // ── Admin ──────────────────────────────────────────────────────────────────
 
     /// Admin-only: propose a new fee recipient address. The proposal is stored
-    /// but not yet active. The new address must call `accept_fee_recipient` to
-    /// confirm, mirroring `transfer_admin`'s two-step pattern so a typo'd or
-    /// unreachable address can never silently misroute protocol fees.
+    /// (with the ledger timestamp at which it becomes executable) but not yet
+    /// active, and a `fee_recipient_proposed` event fires immediately so
+    /// off-chain monitors have advance notice (#116). The new address must
+    /// wait out the timelock and then call `accept_fee_recipient` to confirm,
+    /// mirroring `transfer_admin`'s two-step pattern so a typo'd or
+    /// unreachable address can never silently misroute protocol fees, and
+    /// giving affected parties a window to react before it's live (#115).
     ///
-    /// A new proposal overwrites any prior pending proposal, so the admin can
-    /// correct a mistake before the recipient has accepted.
+    /// A new proposal overwrites any prior pending proposal (and resets the
+    /// timelock), so the admin can correct a mistake before the recipient has
+    /// accepted.
     pub fn propose_fee_recipient(env: Env, new_fee_recipient: Address) {
         let admin: Address = env
             .storage()
@@ -411,20 +473,22 @@ impl IntentSettlement {
         // meaningful sub-scope within "being admin".
         admin.require_auth();
 
+        let eta = env.ledger().timestamp() + ADMIN_TIMELOCK_DELAY;
         env.storage()
             .instance()
-            .set(&DataKey::PendingFeeRecipient, &new_fee_recipient);
+            .set(&DataKey::PendingFeeRecipient, &(new_fee_recipient.clone(), eta));
 
         env.events().publish(
             (Symbol::new(&env, "fee_recipient_proposed"),),
-            new_fee_recipient,
+            (new_fee_recipient, eta),
         );
     }
 
-    /// The pending fee recipient confirms the handover. Until this is called
+    /// The pending fee recipient confirms the handover once the timelock
+    /// delay since `propose_fee_recipient` has elapsed. Until this is called
     /// the current fee recipient remains unchanged.
     pub fn accept_fee_recipient(env: Env, new_fee_recipient: Address) {
-        let pending: Address = env
+        let (pending, eta): (Address, u64) = env
             .storage()
             .instance()
             .get(&DataKey::PendingFeeRecipient)
@@ -432,6 +496,9 @@ impl IntentSettlement {
 
         if pending != new_fee_recipient {
             panic_with_error!(&env, Error::Unauthorized);
+        }
+        if env.ledger().timestamp() < eta {
+            panic_with_error!(&env, Error::TimelockNotElapsed);
         }
         new_fee_recipient.require_auth();
 
@@ -448,24 +515,57 @@ impl IntentSettlement {
         );
     }
 
-    /// Admin-only: transfer the admin role to a new address. The new admin
-    /// must authorize too, so a typo'd address can't accidentally brick
-    /// admin control of the contract.
-    pub fn transfer_admin(env: Env, new_admin: Address) {
+    /// Admin-only: propose transferring the admin role to a new address. A
+    /// `admin_transfer_proposed` event fires immediately for off-chain
+    /// monitors (#116); the transfer itself only takes effect once
+    /// `new_admin` calls `accept_admin_transfer` after the timelock delay
+    /// has elapsed (#115), so a typo'd address can't accidentally brick
+    /// admin control and affected parties get advance notice.
+    ///
+    /// A new proposal overwrites any prior pending proposal (and resets the
+    /// timelock).
+    pub fn propose_admin_transfer(env: Env, new_admin: Address) {
         let admin: Address = env
             .storage()
             .instance()
             .get(&DataKey::Admin)
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
-        // Auth audit: require_auth() is correct on both the outgoing and
-        // incoming admin. Requiring both prevents accidentally handing the role
-        // to a typo'd or uncontrolled address. require_auth_for_args is not
-        // applicable — both signers ARE the principals, there's nothing to
-        // sub-scope.
+        // Auth audit: require_auth() is correct here — the stored admin
+        // address must sign to propose handing off its own role.
         admin.require_auth();
+
+        let eta = env.ledger().timestamp() + ADMIN_TIMELOCK_DELAY;
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &(new_admin.clone(), eta));
+
+        env.events().publish(
+            (Symbol::new(&env, "admin_transfer_proposed"),),
+            (new_admin, eta),
+        );
+    }
+
+    /// The pending new admin confirms the handover once the timelock delay
+    /// since `propose_admin_transfer` has elapsed. Requiring the incoming
+    /// admin's own signature prevents accidentally handing the role to a
+    /// typo'd or uncontrolled address.
+    pub fn accept_admin_transfer(env: Env, new_admin: Address) {
+        let (pending, eta): (Address, u64) = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoPendingAdminTransfer));
+
+        if pending != new_admin {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+        if env.ledger().timestamp() < eta {
+            panic_with_error!(&env, Error::TimelockNotElapsed);
+        }
         new_admin.require_auth();
 
         env.storage().instance().set(&DataKey::Admin, &new_admin);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
 
         env.events()
             .publish((Symbol::new(&env, "admin_transferred"),), new_admin);
@@ -525,21 +625,26 @@ impl IntentSettlement {
 
     // ── Destination Token Allowlist ───────────────────────────────────────────
 
-    /// Admin-only: allow a dst_token to be targeted by new intents.
-    /// submit_intent had no validation on dst_token at all -- any address,
-    /// including a bogus or malicious "token" contract, could be named as
-    /// the destination.
+    /// Admin-only: propose allowing a dst_token to be targeted by new
+    /// intents. submit_intent had no validation on dst_token at all --
+    /// any address, including a bogus or malicious "token" contract, could
+    /// be named as the destination.
     ///
-    /// Before storing the allowance we call `decimals()` on the candidate
-    /// address as a lightweight SEP-41 interface probe (issue #33). If the
-    /// address doesn't implement the token interface the call traps and the
-    /// transaction reverts, surfacing the error at admin time rather than
-    /// silently allowing a non-token that would only fail later inside
-    /// fill_intent's transfer call.
+    /// We call `decimals()` on the candidate address as a lightweight SEP-41
+    /// interface probe (issue #33) at proposal time. If the address doesn't
+    /// implement the token interface the call traps and the transaction
+    /// reverts, surfacing the error at admin time rather than silently
+    /// storing a proposal that would only fail later.
+    ///
+    /// This only records the proposal and fires a `dst_token_add_proposed`
+    /// event for off-chain monitors (#116); the token isn't actually
+    /// allowed until `execute_add_dst_token` is called after the timelock
+    /// delay has elapsed (#115, #118), giving users and solvers a window to
+    /// notice and react before the allowlist changes.
     ///
     /// Note: `decimals()` is a read-only view, so this probe has no side
     /// effects on the token's state.
-    pub fn add_allowed_dst_token(env: Env, token: Address) {
+    pub fn propose_add_dst_token(env: Env, token: Address) {
         Self::require_admin(&env);
 
         // Probe the SEP-41 interface: if `token` isn't a real token contract
@@ -548,22 +653,88 @@ impl IntentSettlement {
         // decimals() is a pure view with no side-effects; we discard the value.
         let _decimals = token_client.decimals();
 
+        let eta = env.ledger().timestamp() + ADMIN_TIMELOCK_DELAY;
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingDstTokenAdd(token.clone()), &eta);
+
+        env.events().publish(
+            (Symbol::new(&env, "dst_token_add_proposed"),),
+            (token, eta),
+        );
+    }
+
+    /// Apply a previously proposed `propose_add_dst_token` once its timelock
+    /// delay has elapsed. Callable by anyone -- the change was already
+    /// authorized by the admin at proposal time, so there's nothing left to
+    /// gate once the delay has passed.
+    pub fn execute_add_dst_token(env: Env, token: Address) {
+        let eta: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingDstTokenAdd(token.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoPendingDstTokenChange));
+        if env.ledger().timestamp() < eta {
+            panic_with_error!(&env, Error::TimelockNotElapsed);
+        }
+
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingDstTokenAdd(token.clone()));
         env.storage()
             .instance()
             .set(&DataKey::AllowedDstToken(token.clone()), &true);
+        Self::add_to_dst_token_list(&env, &token);
+
         env.events()
             .publish((Symbol::new(&env, "dst_token_allowed"),), token);
     }
 
-    pub fn remove_allowed_dst_token(env: Env, token: Address) {
+    /// Admin-only: propose disallowing a dst_token. Fires a
+    /// `dst_token_remove_proposed` event immediately (#116); the token stays
+    /// allowed until `execute_remove_dst_token` is called after the timelock
+    /// delay elapses (#115).
+    pub fn propose_remove_dst_token(env: Env, token: Address) {
         Self::require_admin(&env);
+
+        let eta = env.ledger().timestamp() + ADMIN_TIMELOCK_DELAY;
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingDstTokenRemove(token.clone()), &eta);
+
+        env.events().publish(
+            (Symbol::new(&env, "dst_token_remove_proposed"),),
+            (token, eta),
+        );
+    }
+
+    /// Apply a previously proposed `propose_remove_dst_token` once its
+    /// timelock delay has elapsed. Callable by anyone, for the same reason
+    /// as `execute_add_dst_token`.
+    pub fn execute_remove_dst_token(env: Env, token: Address) {
+        let eta: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingDstTokenRemove(token.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoPendingDstTokenChange));
+        if env.ledger().timestamp() < eta {
+            panic_with_error!(&env, Error::TimelockNotElapsed);
+        }
+
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingDstTokenRemove(token.clone()));
         env.storage()
             .instance()
             .remove(&DataKey::AllowedDstToken(token.clone()));
+        Self::remove_from_dst_token_list(&env, &token);
+
         env.events()
             .publish((Symbol::new(&env, "dst_token_disallowed"),), token);
     }
 
+    /// Returns `true` if `token` is on the dst_token allowlist.
+    /// Does not check whether allowlist enforcement is currently active.
     pub fn is_dst_token_allowed(env: Env, token: Address) -> bool {
         env.storage()
             .instance()
@@ -574,18 +745,39 @@ impl IntentSettlement {
     /// Off by default -- an admin opts in once they've populated the list
     /// via add_allowed_dst_token, rather than every intent submission
     /// suddenly requiring one.
+    ///
+    /// Issue #119: emits an event like every other admin toggle in this
+    /// contract (pause/unpause, fee_recipient_updated, admin_transferred),
+    /// so off-chain indexers can observe enforcement flips without polling
+    /// `is_dst_allowlist_enabled`.
     pub fn set_dst_allowlist_enabled(env: Env, enabled: bool) {
         Self::require_admin(&env);
         env.storage()
             .instance()
             .set(&DataKey::DstAllowlistEnabled, &enabled);
+        env.events()
+            .publish((Symbol::new(&env, "dst_allowlist_enabled"),), enabled);
     }
 
+    /// Returns `true` if the dst_token allowlist is currently being enforced
+    /// by `submit_intent`. Defaults to `false` on a fresh deployment.
     pub fn is_dst_allowlist_enabled(env: Env) -> bool {
         env.storage()
             .instance()
             .get(&DataKey::DstAllowlistEnabled)
             .unwrap_or(false)
+    }
+
+    /// List every dst_token currently present in the allowlist (#117).
+    /// `is_dst_token_allowed` only answers one-token-at-a-time queries; this
+    /// gives integrators and auditors a complete picture without replaying
+    /// every `dst_token_allowed` / `dst_token_disallowed` event. Returns an
+    /// empty `Vec` if nothing has ever been allowed.
+    pub fn list_allowed_dst_tokens(env: Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::AllowedDstTokenList)
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     // ── Per-Token Bond Multiplier ──────────────────────────────────────────────
@@ -613,30 +805,9 @@ impl IntentSettlement {
             .persistent()
             .get(&DataKey::MinBondMultiplier(token))
             .unwrap_or(10)
+    }
+
     // ── Source Chain Allowlist ────────────────────────────────────────────────
-get_tiered_fee_bps is only called from fund_c_address (1320), reveal_fund (4164), fund_c_address_with_swap (4325), and execute_meta_fund (4498). batch_fund_c_address (1445) and fund_c_address_with_referral (2079) both compute the fee directly from the flat global rate via get_effective_fee_bps, never consulting the caller's volume tier — meaning the tiered-fee feature is silently bypassed on 2 of the bridge's 7 funding entry points.
-
-What needs to be done
- Route batch_fund_c_address and fund_c_address_with_referral through get_tiered_fee_bps the same way the other four funding paths do
- Add test_batch_fund_applies_tiered_fee and test_referral_fund_applies_tiered_fee
-Files to change
-contracts/onboarding-bridge/src/lib.rs
-Difficulty
-Medium
-
-Getting started
-This is a self-contained task — no additional repo access or secrets needed.
-
-git clone https://github.com/<your-fork>/C-Address-Onboarding-Bridge--Contract.git
-cd C-Address-Onboarding-Bridge--Contract
-rustup target add wasm32-unknown-unknown
-cargo test -p onboarding-bridge --features testutils
-Submitting your PR
-When you open your pull request, include Closes #123 in the PR description (using this issue's actual number in place of 123). This links the PR to the issue and closes it automatically on merge.
-
-Please follow this repo's Conventional Commits format for your commit messages (e.g. fix(contract): ..., test(sdk): ..., docs: ...).
-
-
 
     /// Admin-only: add a chain name to the src_chain allowlist.
     ///
@@ -694,10 +865,29 @@ Please follow this repo's Conventional Commits format for your commit messages (
 
     // ── Pause Control ─────────────────────────────────────────────────────────
 
-    /// Admin-only: halt new intent submission, acceptance, and fills for
-    /// incident response. slash_solver stays permissionless throughout, so a
-    /// solver already holding an Accepted intent can't dodge accountability
-    /// by waiting out the pause.
+    /// Admin-only: designate (or rotate) the address that may call `pause`
+    /// in addition to the admin (issue #120). This lets incident response
+    /// use a narrower-scoped hot key instead of the full admin key, which
+    /// also controls fee routing and admin transfer. Calling this again
+    /// with a new address replaces the previous pauser; there is no way to
+    /// clear it back to "admin-only" other than pointing it at the admin's
+    /// own address.
+    pub fn set_pauser(env: Env, pauser: Address) {
+        Self::require_admin(&env);
+        env.storage().instance().set(&DataKey::Pauser, &pauser);
+        env.events()
+            .publish((Symbol::new(&env, "pauser_updated"),), pauser);
+    }
+
+    /// The current pauser address, if the admin has set one.
+    pub fn get_pauser(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Pauser)
+    }
+
+    /// Admin- or pauser-only: halt new intent submission, acceptance, and
+    /// fills for incident response. slash_solver stays permissionless
+    /// throughout, so a solver already holding an Accepted intent can't
+    /// dodge accountability by waiting out the pause.
     ///
     /// Issue #36 — pause scope decision: register_solver, deregister_solver,
     /// and withdraw_bond are also gated here. During a live incident an admin
@@ -706,13 +896,22 @@ Please follow this repo's Conventional Commits format for your commit messages (
     /// collateral exactly when the protocol most needs it as a backstop.
     /// cancel_intent is intentionally left open so users can always reclaim
     /// their Open intents.
-    pub fn pause(env: Env) {
-        Self::require_admin(&env);
+    ///
+    /// Issue #120 — `caller` must be either the admin or the address set via
+    /// `set_pauser`, so fast incident response doesn't require exposing the
+    /// full admin key.
+    pub fn pause(env: Env, caller: Address) {
+        Self::require_admin_or_pauser(&env, &caller);
         env.storage().instance().set(&DataKey::Paused, &true);
         env.events().publish((Symbol::new(&env, "paused"),), true);
     }
 
     /// Admin-only: lift a pause and restore normal operation.
+    ///
+    /// Issue #120 — deliberately narrower than `pause`: the pauser role can
+    /// freeze the protocol but cannot unfreeze it. Resuming money movement
+    /// after an incident always needs the full admin's judgment, not just
+    /// whoever holds the pause hot key.
     pub fn unpause(env: Env) {
         Self::require_admin(&env);
         env.storage().instance().set(&DataKey::Paused, &false);
@@ -849,6 +1048,9 @@ Please follow this repo's Conventional Commits format for your commit messages (
         );
     }
 
+    /// Solver voluntarily exits the protocol. Returns the full bond to the
+    /// solver and removes their record. Requires no active (Accepted) intents —
+    /// use `slash_solver` to clear those first.
     pub fn deregister_solver(env: Env, solver: Address) {
         // Auth audit: require_auth() is correct. Only the solver themselves
         // may deregister and trigger bond return. require_auth_for_args is not
@@ -943,8 +1145,11 @@ Please follow this repo's Conventional Commits format for your commit messages (
         let client = token::Client::new(&env, &bond_token);
         client.transfer(&env.current_contract_address(), &solver, &amount);
 
+        // Issue #108: include the post-withdrawal remaining balance so indexers
+        // can maintain a solver's bond ledger without a separate get_solver call.
+        // data: (amount: i128, remaining: i128)
         env.events()
-            .publish((Symbol::new(&env, "bond_withdrawn"), solver), amount);
+            .publish((Symbol::new(&env, "bond_withdrawn"), solver), (amount, remaining));
     }
 
     // ── Intent Lifecycle ──────────────────────────────────────────────────────
@@ -992,6 +1197,12 @@ Please follow this repo's Conventional Commits format for your commit messages (
         {
             panic_with_error!(&env, Error::SrcChainNotAllowed);
         }
+
+        // #127 — validate src_token address format against the declared chain's
+        // conventions (EVM: 0x + 40 hex chars; Solana: base58 32–44 chars).
+        // This runs even when the src_chain allowlist is disabled so obviously
+        // malformed tokens are always caught at submission time.
+        Self::validate_src_token(&env, &src_chain, &src_token);
 
         let now = env.ledger().timestamp();
         let cfg = Self::load_config(&env);
@@ -1083,6 +1294,17 @@ Please follow this repo's Conventional Commits format for your commit messages (
             .instance()
             .set(&DataKey::TotalIntents, &(total + 1));
 
+        // Increment open_intents: every new submission starts as Open (or Bidding,
+        // which also counts as an unfilled intent awaiting a solver).
+        let open: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::OpenIntents)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::OpenIntents, &(open + 1));
+
         env.events().publish(
             (Symbol::new(&env, "intent_submitted"), user),
             (intent_id.clone(), min_dst_amount, expiry),
@@ -1154,6 +1376,16 @@ Please follow this repo's Conventional Commits format for your commit messages (
         env.storage()
             .persistent()
             .set(&DataKey::Solver(solver.clone()), &solver_record);
+
+        // Decrement open_intents: the intent is no longer open (a solver owns it).
+        let open: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::OpenIntents)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::OpenIntents, &open.saturating_sub(1));
 
         env.storage()
             .persistent()
@@ -1271,6 +1503,8 @@ Please follow this repo's Conventional Commits format for your commit messages (
 
         if cumulative >= intent.min_dst_amount {
             // Intent is fully satisfied — close it out.
+            // open_intents was already decremented when the intent was accepted;
+            // no further adjustment needed here.
             intent.state = IntentState::Filled;
             intent.filled_at = Some(now);
             solver_record.fills_completed += 1;
@@ -1279,10 +1513,20 @@ Please follow this repo's Conventional Commits format for your commit messages (
             // Partial fill: re-open so another solver (or the same) can claim the
             // remaining amount.  Reset solver assignment and deadline back to the
             // full intent expiry window so the rest of the intent can be picked up.
+            // The intent is back in Open rotation, so increment open_intents again.
             intent.state = IntentState::PartiallyFilled;
             intent.solver = None;
             intent.deadline = now + INTENT_EXPIRY;
             solver_record.active_intents = solver_record.active_intents.saturating_sub(1);
+
+            let open: u64 = env
+                .storage()
+                .instance()
+                .get(&DataKey::OpenIntents)
+                .unwrap_or(0);
+            env.storage()
+                .instance()
+                .set(&DataKey::OpenIntents, &(open + 1));
         }
 
         env.storage()
@@ -1340,6 +1584,19 @@ Please follow this repo's Conventional Commits format for your commit messages (
         user.require_auth();
         Self::bump_instance_ttl(&env);
 
+        let now = env.ledger().timestamp();
+
+        // Check cancellation cooldown for spam-deterrence
+        if let Some(last_cancel_time) = env
+            .storage()
+            .persistent()
+            .get::<_, u64>(&DataKey::CancelCooldown(user.clone()))
+        {
+            if now < last_cancel_time + CANCEL_COOLDOWN {
+                panic_with_error!(&env, Error::CancelCooldownNotExpired);
+            }
+        }
+
         let mut intent: IntentRecord = env
             .storage()
             .persistent()
@@ -1363,6 +1620,20 @@ Please follow this repo's Conventional Commits format for your commit messages (
             .persistent()
             .set(&DataKey::Intent(intent_id.clone()), &intent);
         Self::bump_intent_ttl(&env, &intent_id);
+
+        // Decrement open_intents: intent is no longer open.
+        let open: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::OpenIntents)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::OpenIntents, &open.saturating_sub(1));
+        // Update cancellation cooldown
+        env.storage()
+            .persistent()
+            .set(&DataKey::CancelCooldown(user.clone()), &now);
 
         env.events()
             .publish((Symbol::new(&env, "intent_cancelled"), user), intent_id);
@@ -1417,6 +1688,7 @@ Please follow this repo's Conventional Commits format for your commit messages (
         }
 
         // Re-open the intent, preserving partial-fill progress if any.
+        // The intent transitions back to Open/PartiallyFilled, so increment open_intents.
         intent.state = if intent.total_filled > 0 {
             IntentState::PartiallyFilled
         } else {
@@ -1424,6 +1696,15 @@ Please follow this repo's Conventional Commits format for your commit messages (
         };
         intent.solver = None;
         intent.deadline = now + cfg.intent_expiry;
+
+        let open: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::OpenIntents)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::OpenIntents, &(open + 1));
 
         // Persist both records BEFORE any token transfer so that a re-entrant
         // or back-to-back call on the same intent_id is rejected by the
@@ -1490,6 +1771,16 @@ Please follow this repo's Conventional Commits format for your commit messages (
             .persistent()
             .set(&DataKey::Intent(intent_id.clone()), &intent);
         Self::bump_intent_ttl(&env, &intent_id);
+
+        // Decrement open_intents: intent is no longer open.
+        let open: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::OpenIntents)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::OpenIntents, &open.saturating_sub(1));
 
         env.events()
             .publish((Symbol::new(&env, "intent_expired"),), intent_id);
@@ -1658,24 +1949,53 @@ Please follow this repo's Conventional Commits format for your commit messages (
         }
     }
 
+    /// Returns the current fee recipient address, or `None` before initialization.
     pub fn get_fee_recipient(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::FeeRecipient)
     }
 
-    pub fn get_pending_fee_recipient(env: Env) -> Option<Address> {
+    /// Pending fee-recipient proposal, if any: `(new_fee_recipient, eta)`
+    /// where `eta` is the ledger timestamp at which `accept_fee_recipient`
+    /// may execute it.
+    pub fn get_pending_fee_recipient(env: Env) -> Option<(Address, u64)> {
         env.storage().instance().get(&DataKey::PendingFeeRecipient)
     }
 
+    /// Returns the bond token address (USDC SAC), or `None` before initialization.
     pub fn get_bond_token(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::BondToken)
     }
 
+    /// Returns the current admin address, or `None` before initialization.
     pub fn get_admin(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::Admin)
     }
 
-    /// (total intents ever submitted, total volume ever filled).
-    pub fn get_stats(env: Env) -> (u64, i128) {
+    /// Returns `(total_intents, total_volume, open_intents)`.
+    ///
+    /// - `total_intents` — cumulative count of intents ever submitted.
+    /// - `total_volume`  — cumulative dst-token units delivered across all fills.
+    /// - `open_intents`  — intents currently in `Open` or `PartiallyFilled` state.
+    ///
+    /// **Trade-off (#109):** `open_intents` is maintained as an on-chain
+    /// counter in instance storage (the same ledger entry that already holds
+    /// `TotalIntents` and `TotalVolume`).  This means every state-changing
+    /// call (`submit_intent`, `accept_intent`, `fill_intent`,
+    /// `cancel_intent`, `expire_intent`, `slash_solver`) pays one extra
+    /// integer read + write inside the instance entry, which is already
+    /// loaded on every call.  The marginal cost is negligible compared to the
+    /// persistent-storage I/O for `IntentRecord` and `SolverRecord`.
+    ///
+    /// The alternative — leaving `open_intents` entirely to indexers — would
+    /// keep on-chain logic simpler, but would force every dashboard to replay
+    /// the full event history for an O(N) count.  Storing the counter on-chain
+    /// makes it O(1) for any caller.
+    ///
+    /// Note: the counter can transiently under-count if the contract is
+    /// upgraded from a version that did not track it (pre-#109 deployments
+    /// will have `OpenIntents` absent, which `unwrap_or(0)` handles gracefully
+    /// — the counter will be accurate from the upgrade ledger forward).
+    pub fn get_stats(env: Env) -> (u64, i128, u64) {
         let intents: u64 = env
             .storage()
             .instance()
@@ -1686,7 +2006,12 @@ Please follow this repo's Conventional Commits format for your commit messages (
             .instance()
             .get(&DataKey::TotalVolume)
             .unwrap_or(0);
-        (intents, volume)
+        let open: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::OpenIntents)
+            .unwrap_or(0);
+        (intents, volume, open)
     }
 
     /// Minimum bond required for solver registration.
@@ -1700,6 +2025,8 @@ Please follow this repo's Conventional Commits format for your commit messages (
             .persistent()
             .get(&DataKey::UserIntents(user))
             .unwrap_or_else(|| Vec::new(&env))
+    }
+
     /// Total number of solvers ever registered.
     pub fn get_solver_count(env: Env) -> u32 {
         env.storage()
@@ -1791,6 +2118,102 @@ Please follow this repo's Conventional Commits format for your commit messages (
         score as u32
     }
 
+    /// #127: Validate `src_token` address format against the conventions of
+    /// `src_chain`.
+    ///
+    /// Rules:
+    /// * EVM chains (`"ethereum"`, `"base"`, `"polygon"`, `"arbitrum"`,
+    ///   `"optimism"`): token must be a `0x`-prefixed 42-character ASCII string
+    ///   (2 + 40 hex digits).
+    /// * `"solana"`: token must be a base58-encoded public key — ASCII, no `0x`
+    ///   prefix, between 32 and 44 characters inclusive.
+    /// * Any other `src_chain` value: validation is skipped (forward-compatible).
+    ///
+    /// Called from `submit_intent` unconditionally so that even when the
+    /// src_chain allowlist is disabled, obviously malformed tokens are rejected
+    /// early.
+    fn validate_src_token(env: &Env, src_chain: &String, src_token: &String) {
+        let token_len = src_token.len();
+        let chain_len = src_chain.len();
+
+        // Compare `src_chain` byte-by-byte against a known ASCII literal.
+        let chain_is = |literal: &[u8]| -> bool {
+            if chain_len as usize != literal.len() {
+                return false;
+            }
+            let mut i = 0u32;
+            while i < chain_len {
+                if src_chain.get(i) != literal[i as usize] as u32 {
+                    return false;
+                }
+                i += 1;
+            }
+            true
+        };
+
+        let is_evm = chain_is(b"ethereum")
+            || chain_is(b"base")
+            || chain_is(b"polygon")
+            || chain_is(b"arbitrum")
+            || chain_is(b"optimism");
+
+        if is_evm {
+            // EVM token address: exactly "0x" + 40 hex chars = 42 characters.
+            if token_len != 42 {
+                panic_with_error!(env, Error::InvalidSrcToken);
+            }
+            // Must start with "0x".
+            if src_token.get(0) != b'0' as u32 || src_token.get(1) != b'x' as u32 {
+                panic_with_error!(env, Error::InvalidSrcToken);
+            }
+            // Remaining 40 characters must all be hex digits [0-9a-fA-F].
+            let mut i = 2u32;
+            while i < 42 {
+                let ch = src_token.get(i);
+                let is_hex = (ch >= b'0' as u32 && ch <= b'9' as u32)
+                    || (ch >= b'a' as u32 && ch <= b'f' as u32)
+                    || (ch >= b'A' as u32 && ch <= b'F' as u32);
+                if !is_hex {
+                    panic_with_error!(env, Error::InvalidSrcToken);
+                }
+                i += 1;
+            }
+            return;
+        }
+
+        if chain_is(b"solana") {
+            // Solana token (SPL mint): base58-encoded public key, 32–44 chars,
+            // no "0x" prefix.
+            if token_len < 32 || token_len > 44 {
+                panic_with_error!(env, Error::InvalidSrcToken);
+            }
+            if token_len >= 2
+                && src_token.get(0) == b'0' as u32
+                && src_token.get(1) == b'x' as u32
+            {
+                panic_with_error!(env, Error::InvalidSrcToken);
+            }
+            // Validate base58 alphabet:
+            // 123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz
+            // (excludes: '0', 'I', 'O', 'l')
+            let mut i = 0u32;
+            while i < token_len {
+                let ch = src_token.get(i);
+                let is_b58 = (ch >= b'1' as u32 && ch <= b'9' as u32)
+                    || (ch >= b'A' as u32 && ch <= b'H' as u32)
+                    || (ch >= b'J' as u32 && ch <= b'N' as u32)
+                    || (ch >= b'P' as u32 && ch <= b'Z' as u32)
+                    || (ch >= b'a' as u32 && ch <= b'k' as u32)
+                    || (ch >= b'm' as u32 && ch <= b'z' as u32);
+                if !is_b58 {
+                    panic_with_error!(env, Error::InvalidSrcToken);
+                }
+                i += 1;
+            }
+        }
+        // Unknown chain: skip validation — forward-compatible with future chains.
+    }
+
     fn require_admin(env: &Env) {
         let admin: Address = env
             .storage()
@@ -1798,17 +2221,82 @@ Please follow this repo's Conventional Commits format for your commit messages (
             .get(&DataKey::Admin)
             .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
         // Auth audit: require_auth() is correct. All callers of require_admin
-        // are admin-only functions (pause, unpause, add/remove_allowed_dst_token,
-        // set_dst_allowlist_enabled). The admin is a single address with uniform
-        // authority over these functions; require_auth_for_args would add no
-        // meaningful scope reduction.
+        // are admin-only functions (unpause, set_pauser,
+        // add/remove_allowed_dst_token, set_dst_allowlist_enabled). The admin
+        // is a single address with uniform authority over these functions;
+        // require_auth_for_args would add no meaningful scope reduction.
         admin.require_auth();
+    }
+
+    /// Issue #120: `pause` accepts either the admin or the address set via
+    /// `set_pauser`. `caller` is an explicit argument (rather than looked up
+    /// implicitly, as `require_admin` does for the single-admin case)
+    /// because there are now two addresses that could legitimately be the
+    /// signer, so the contract needs to know which one is authorizing this
+    /// call before it can require that specific address's auth.
+    fn require_admin_or_pauser(env: &Env, caller: &Address) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
+        let is_pauser = env
+            .storage()
+            .instance()
+            .get::<_, Address>(&DataKey::Pauser)
+            .map(|pauser| pauser == *caller)
+            .unwrap_or(false);
+        if *caller != admin && !is_pauser {
+            panic_with_error!(env, Error::Unauthorized);
+        }
+        caller.require_auth();
     }
 
     fn require_not_paused(env: &Env) {
         if Self::is_paused(env.clone()) {
             panic_with_error!(env, Error::ContractPaused);
         }
+    }
+
+    /// Add `token` to the enumerable allowlist (#117), if not already present.
+    fn add_to_dst_token_list(env: &Env, token: &Address) {
+        let mut list: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AllowedDstTokenList)
+            .unwrap_or_else(|| Vec::new(env));
+        let mut already_present = false;
+        for i in 0..list.len() {
+            if list.get(i).unwrap() == *token {
+                already_present = true;
+                break;
+            }
+        }
+        if !already_present {
+            list.push_back(token.clone());
+            env.storage()
+                .instance()
+                .set(&DataKey::AllowedDstTokenList, &list);
+        }
+    }
+
+    /// Remove `token` from the enumerable allowlist (#117), if present.
+    fn remove_from_dst_token_list(env: &Env, token: &Address) {
+        let list: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AllowedDstTokenList)
+            .unwrap_or_else(|| Vec::new(env));
+        let mut new_list: Vec<Address> = Vec::new(env);
+        for i in 0..list.len() {
+            let item = list.get(i).unwrap();
+            if item != *token {
+                new_list.push_back(item);
+            }
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::AllowedDstTokenList, &new_list);
     }
 
     fn get_adjusted_min_bond(env: &Env, dst_token: &Address) -> i128 {
@@ -1818,6 +2306,8 @@ Please follow this repo's Conventional Commits format for your commit messages (
             .get::<_, i128>(&DataKey::MinBondMultiplier(dst_token.clone()))
             .unwrap_or(10);
         (MIN_BOND * multiplier) / 10
+    }
+
     /// Load the protocol config from storage, falling back to defaults for
     /// contracts that pre-date this upgrade (upgrade-safe).
     fn load_config(env: &Env) -> ProtocolConfig {

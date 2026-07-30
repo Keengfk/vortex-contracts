@@ -88,6 +88,95 @@ defended by the `IntentNotOpen` guard (idempotent after first call).
 
 ---
 
+---
+
+### Admin Key Operational Security (#122)
+
+The `Admin` address is the single most sensitive key in the protocol. It
+controls pause/unpause, fee routing, the destination-token allowlist, the
+source-chain allowlist, and admin rotation. A compromised admin key can halt
+the protocol and redirect all fee and slash proceeds. The recommendations below
+apply before and after mainnet launch.
+
+#### Recommended custody model
+
+| Deployment stage | Recommended setup |
+|-----------------|-------------------|
+| Testnet / staging | Developer EOA on a hardware wallet (Ledger/Trezor) |
+| Mainnet launch | 2-of-3 or 3-of-5 multisig (e.g. Gnosis Safe equivalent on Stellar, or a Stellar multi-sig account with threshold set appropriately) |
+| Long-term mainnet | Hardware-backed multisig with geographically distributed key holders; a minimum M-of-N threshold of M ≥ 2 |
+
+A design for a multisig admin wrapper is tracked in
+[`docs/114-multisig-admin-design.md`](./docs/114-multisig-admin-design.md).
+Until that wrapper is deployed, at minimum the admin key must reside on a
+hardware wallet — never a hot wallet or a key stored in plaintext.
+
+#### Key rotation
+
+- Rotate the admin key with `transfer_admin`. Both the outgoing and incoming
+  admin must sign the same transaction, so a typo'd address can never
+  accidentally brick the contract.
+- After rotation, verify `get_admin()` returns the expected new address on-chain
+  before discarding the old key material.
+- Rotation should be rehearsed on testnet before any live key handover.
+
+#### Operational hygiene
+
+1. **Hardware wallet required.** The admin signing key must never exist only in
+   software (e.g. a `.env` file, a CI secret, or an in-memory key). Use a
+   Ledger, Trezor, or equivalent hardware device for all admin transactions.
+
+2. **Separate key per environment.** Testnet, staging, and mainnet must each
+   have a distinct admin key. Reusing a key across environments means a
+   compromise on a lower-trust environment immediately threatens mainnet.
+
+3. **Minimal admin transactions.** Admin calls should originate from an
+   air-gapped or dedicated signing machine. Never sign admin transactions from
+   a machine used for general web browsing or software development.
+
+4. **Pre-launch checklist.** Before enabling mainnet enforcement:
+   - Populate `add_allowed_src_chain` with every supported source chain.
+   - Call `set_src_chain_allowlist_enabled(true)`.
+   - Populate `add_allowed_dst_token` for every supported output token.
+   - Call `set_dst_allowlist_enabled(true)`.
+   - Confirm `get_admin()` and `get_fee_recipient()` return the expected
+     multisig addresses.
+   - See [`docs/pre-deploy-security-checklist.md`](./docs/pre-deploy-security-checklist.md)
+     for the full checklist.
+
+5. **Monitor fee recipient.** `set_fee_recipient` (via the two-step
+   `propose_fee_recipient` / `accept_fee_recipient` flow) redirects all
+   protocol fee and slash proceeds. Monitor the `fee_recipient_proposed` and
+   `fee_recipient_updated` events on-chain; any unexpected proposal should be
+   treated as a potential compromise.
+
+6. **Pause is not a long-term solution.** `pause()` is an incident-response
+   tool, not a substitute for fixing a bug. A paused contract still holds
+   solver bonds; resolve the incident and unpause as quickly as safely
+   possible to minimise disruption to solvers and users.
+
+7. **Post-incident key rotation.** Any time there is evidence that the admin
+   key may have been exposed (phishing, malware, shoulder-surfing), rotate
+   immediately via `transfer_admin` and notify all registered solvers.
+
+#### What a compromised admin key can and cannot do
+
+| Can do | Cannot do |
+|--------|-----------|
+| Pause the contract (halt new swaps) | Transfer user funds directly |
+| Redirect future fees and slashes via `propose_fee_recipient` | Drain solver bonds |
+| Add/remove tokens from dst and src allowlists | Cancel or fill intents on behalf of others |
+| Rotate itself to a new admin address | Bypass the solver bond slash (still permissionless) |
+| Disable allowlist enforcement | Recover already-transferred tokens |
+
+The blast radius of a compromised key is **griefing and fee theft**, not direct
+fund theft. Solver bonds and in-flight intent outputs are only moved by
+`fill_intent`, `slash_solver`, and `rescue_tokens` — none of which are callable
+unilaterally by the admin without other protocol preconditions being met first
+(except `rescue_tokens`, which is limited to non-bond, non-active-intent tokens).
+
+---
+
 ### Known Limitations
 
 - **No cross-chain proof.** The contract cannot verify the source-chain
