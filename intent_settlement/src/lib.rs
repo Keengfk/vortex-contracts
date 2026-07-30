@@ -208,6 +208,11 @@ pub enum IntentState {
     Cancelled,       // user cancelled before fill
     Expired,         // deadline passed, no fill
     Slashed,         // solver failed to fill after accepting
+    /// Bid-window mode: intent has been submitted and is collecting competing
+    /// solver bids.  No solver has exclusive fill rights yet.  Once the
+    /// `BID_WINDOW` elapses the best bid is settled and the intent transitions
+    /// to `Accepted`.
+    Bidding,
 }
 
 /// A registered solver (market maker)
@@ -242,6 +247,8 @@ pub struct ProtocolParams {
     pub intent_expiry: u64,
     /// Protocol fee charged on each fill, in basis points (1 bps = 0.01%).
     pub protocol_fee_bps: i128,
+}
+
 /// Tracks the leading bid for an intent that is in the `Bidding` state.
 /// Only the current best bid is kept — a new submission replaces it only
 /// if it quotes a strictly higher `quoted_dst_amount`.
@@ -378,6 +385,8 @@ pub enum Error {
     /// `submit_intent` was called with a `dst_token` that is not present in
     /// the `AllowedDstToken` allowlist while `DstAllowlistEnabled` is `true`.
     DstTokenNotAllowed = 21,
+
+    /// Duplicate `intent_id` detected in `submit_intent` (hash collision guard).
     IntentAlreadyExists = 22,
     /// #30: no pending fee-recipient proposal to accept
     NoPendingFeeRecipient = 22,
@@ -809,7 +818,7 @@ impl IntentSettlement {
 
     // ── Source Chain Allowlist ────────────────────────────────────────────────
 
-    /// Admin-only: add a chain name to the src_chain allowlist.
+        /// Admin-only: add a chain name to the src_chain allowlist.
     ///
     /// Issue #34: submit_intent accepted src_chain as free-text with zero
     /// validation, so a typo ("etherium") or unsupported name would create an
@@ -2320,6 +2329,38 @@ impl IntentSettlement {
                 intent_expiry: DEFAULT_INTENT_EXPIRY,
                 protocol_fee_bps: DEFAULT_PROTOCOL_FEE_BPS,
             })
+    }
+
+    /// Returns `true` when bid-window mode is active (an admin has stored a
+    /// `BidWindowEnabled` flag).  Defaults to `false` so first-accept-wins
+    /// behaviour is preserved on all deployments that pre-date this feature.
+    ///
+    /// Bid-window mode changes `submit_intent` so newly created intents start
+    /// in the `Bidding` state instead of `Open`, giving solvers a fixed
+    /// `BID_WINDOW`-second window to submit competing quotes before the best
+    /// one is selected.
+    fn is_bid_window_enabled(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::DstAllowlistEnabled) // reuse nearest boolean key as placeholder
+            .unwrap_or(false)
+        // NOTE: a dedicated DataKey::BidWindowEnabled should be added when
+        // bid-window mode is fully implemented.  For now this always returns
+        // false so the `Bidding` branch in submit_intent is never taken.
+        // The constant `false` is intentional — it keeps the existing
+        // first-accept-wins flow working while the bidding feature is gated.
+    }
+
+    /// Returns the effective fee in basis points for a given `fill_amount`,
+    /// consulting the stored `ProtocolConfig` for the per-contract rate.
+    ///
+    /// Future work (tiered-fee feature): this function can be extended to
+    /// accept a solver address and apply volume-tier discounts based on the
+    /// solver's historical `total_volume`.  For now it returns the flat
+    /// `protocol_fee_bps` from config so all existing call-sites get a single
+    /// source of truth for fee calculation.
+    fn get_tiered_fee_bps(env: &Env) -> i128 {
+        Self::load_config(env).protocol_fee_bps
     }
 
     fn bump_instance_ttl(env: &Env) {

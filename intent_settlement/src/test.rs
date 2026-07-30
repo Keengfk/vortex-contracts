@@ -6,8 +6,6 @@
 //! expiry, solver bonding/slashing, and the guard conditions on each step.
 
 use crate::{
-    Error, IntentSettlement, IntentSettlementClient, IntentState, FILL_WINDOW, INTENT_EXPIRY,
-    MIN_BOND, SLASH_COOLDOWN,
     DataKey, Error, IntentSettlement, IntentSettlementClient, IntentState, SolverRecord,
     FILL_WINDOW, INTENT_EXPIRY, MIN_BOND, ADMIN_TIMELOCK_DELAY,
 };
