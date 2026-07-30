@@ -1368,6 +1368,19 @@ Please follow this repo's Conventional Commits format for your commit messages (
         user.require_auth();
         Self::bump_instance_ttl(&env);
 
+        let now = env.ledger().timestamp();
+
+        // Check cancellation cooldown for spam-deterrence
+        if let Some(last_cancel_time) = env
+            .storage()
+            .persistent()
+            .get::<_, u64>(&DataKey::CancelCooldown(user.clone()))
+        {
+            if now < last_cancel_time + CANCEL_COOLDOWN {
+                panic_with_error!(&env, Error::CancelCooldownNotExpired);
+            }
+        }
+
         let mut intent: IntentRecord = env
             .storage()
             .persistent()
@@ -1391,6 +1404,11 @@ Please follow this repo's Conventional Commits format for your commit messages (
             .persistent()
             .set(&DataKey::Intent(intent_id.clone()), &intent);
         Self::bump_intent_ttl(&env, &intent_id);
+
+        // Update cancellation cooldown
+        env.storage()
+            .persistent()
+            .set(&DataKey::CancelCooldown(user.clone()), &now);
 
         env.events()
             .publish((Symbol::new(&env, "intent_cancelled"), user), intent_id);
