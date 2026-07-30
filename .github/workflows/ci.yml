@@ -13,7 +13,52 @@ concurrency:
 
 jobs:
   contract:
-    name: Contract (Soroban)
+    name: Contract (${{ matrix.toolchain }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # stable — tracks latest stable Rust
+        # 1.78   — MSRV declared in README ("Rust 1.78+")
+        toolchain: [stable, "1.78"]
+    defaults:
+      run:
+        working-directory: intent_settlement
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (${{ matrix.toolchain }})
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: intent_settlement
+          # Separate cache per toolchain to avoid cross-contamination
+          key: ${{ matrix.toolchain }}
+
+      - name: Format check
+        # Only enforce formatting on stable; MSRV rustfmt may produce different
+        # output for features introduced after 1.78.
+        if: matrix.toolchain == 'stable'
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        # Identical to the command documented in README.md ("Build & Test").
+        # -D warnings is required on ALL matrix legs so MSRV is lint-clean too.
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test
+
+      - name: Build wasm
+        run: cargo build --target wasm32-unknown-unknown --release
+
+  proptest:
+    name: Bond-conservation proptest
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -28,14 +73,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: intent_settlement
-      - name: Format check
-        run: cargo fmt --all -- --check
-      - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
-      - name: Test
-        run: cargo test
-      - name: Build wasm
-        run: cargo build --target wasm32-unknown-unknown --release
+      - name: Bond conservation proptest
+        # PROPTEST_CASES controls how many random sequences are generated per
+        # test; 256 balances coverage against CI runtime.
+        run: PROPTEST_CASES=256 cargo test --features testutils -- bond_conservation
 
   audit:
     name: Dependency audit
@@ -54,3 +95,24 @@ jobs:
         run: cargo install cargo-audit --locked
       - name: Audit dependencies
         run: cargo audit
+
+  mutants:
+    name: Mutation testing
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: intent_settlement
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: intent_settlement
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants --locked
+      - name: Run mutation tests
+        run: cargo mutants --copy-target=false
