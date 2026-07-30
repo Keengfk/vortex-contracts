@@ -13,7 +13,7 @@ use crate::{
 };
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
-    token, Address, BytesN, Env, String,
+    token, Address, BytesN, Env, String, Symbol,
 };
 
 // ─── Test fixture ───────────────────────────────────────────────────────────────
@@ -131,9 +131,10 @@ fn setup() -> Ctx {
 #[test]
 fn initialize_sets_initial_stats() {
     let ctx = setup();
-    let (intents, volume) = ctx.client().get_stats();
+    let (intents, volume, open) = ctx.client().get_stats();
     assert_eq!(intents, 0);
     assert_eq!(volume, 0);
+    assert_eq!(open, 0);
 }
 
 #[test]
@@ -253,7 +254,7 @@ fn paused_blocks_submit_accept_and_fill() {
     ctx.register_solver();
     let id = ctx.submit();
 
-    c.pause();
+    c.pause(&ctx.admin);
     assert!(c.is_paused());
 
     let deadline: Option<u64> = None;
@@ -277,7 +278,7 @@ fn unpause_restores_normal_operation() {
     let ctx = setup();
     let c = ctx.client();
 
-    c.pause();
+    c.pause(&ctx.admin);
     c.unpause();
     assert!(!c.is_paused());
 
@@ -297,11 +298,163 @@ fn pause_does_not_block_slashing_an_already_accepted_intent() {
     let id = ctx.submit();
     c.accept_intent(&ctx.solver, &id);
 
-    c.pause();
+    c.pause(&ctx.admin);
     ctx.pass_time(FILL_WINDOW + 1);
 
     // Permissionless slashing keeps working even while paused, so a solver
     // can't dodge accountability for an obligation they already took on.
+    c.slash_solver(&id);
+    assert_eq!(c.get_solver(&ctx.solver).unwrap().fills_failed, 1);
+}
+
+// ─── #120 Pauser role ─────────────────────────────────────────────────────────
+
+#[test]
+fn admin_can_set_pauser() {
+    let ctx = setup();
+    let c = ctx.client();
+    assert_eq!(c.get_pauser(), None);
+
+    let pauser = Address::generate(&ctx.env);
+    c.set_pauser(&pauser);
+    assert_eq!(c.get_pauser(), Some(pauser));
+}
+
+#[test]
+fn set_pauser_only_admin_can_call() {
+    let ctx = setup();
+    let c = ctx.client();
+    let pauser = Address::generate(&ctx.env);
+
+    // With mock_all_auths, verify that the admin auth is recorded by the
+    // set_pauser call, the same way rescue_tokens_only_admin_can_call does.
+    c.set_pauser(&pauser);
+
+    let auths = ctx.env.auths();
+    let admin_authed = auths.iter().any(|(addr, _)| *addr == ctx.admin);
+    assert!(
+        admin_authed,
+        "set_pauser must require admin auth; got: {:?}",
+        auths
+    );
+}
+
+#[test]
+fn pauser_can_pause_without_admin_key() {
+    let ctx = setup();
+    let c = ctx.client();
+    let pauser = Address::generate(&ctx.env);
+    c.set_pauser(&pauser);
+
+    c.pause(&pauser);
+    assert!(c.is_paused());
+}
+
+#[test]
+fn pause_rejects_caller_who_is_neither_admin_nor_pauser() {
+    let ctx = setup();
+    let c = ctx.client();
+    let pauser = Address::generate(&ctx.env);
+    c.set_pauser(&pauser);
+
+    let stranger = Address::generate(&ctx.env);
+    let res = c.try_pause(&stranger);
+    assert_eq!(res, Err(Ok(Error::Unauthorized.into())));
+    assert!(!c.is_paused());
+}
+
+#[test]
+fn pauser_cannot_unpause() {
+    let ctx = setup();
+    let c = ctx.client();
+    let pauser = Address::generate(&ctx.env);
+    c.set_pauser(&pauser);
+    c.pause(&pauser);
+
+    // unpause takes no caller argument -- it always requires the stored
+    // admin's auth specifically, so under mock_all_auths this call succeeds
+    // mechanically, but only the admin address is ever the one authorized.
+    c.unpause();
+    let auths = ctx.env.auths();
+    let admin_authed = auths.iter().any(|(addr, _)| *addr == ctx.admin);
+    assert!(
+        admin_authed,
+        "unpause must require admin auth, not the pauser; got: {:?}",
+        auths
+    );
+#[test]
+fn pause_blocks_fill_intent() {
+    let ctx = setup();
+    let c = ctx.client();
+    ctx.register_solver();
+    let id = ctx.submit();
+    c.accept_intent(&ctx.solver, &id);
+
+    c.pause();
+
+    let fee = FILL * 5 / 10_000;
+    ctx.dst_admin().mint(&ctx.solver, &(FILL + fee));
+    let res = c.try_fill_intent(&ctx.solver, &id, &FILL);
+    assert_eq!(res, Err(Ok(Error::ContractPaused.into())));
+}
+
+#[test]
+fn pause_does_not_block_cancel_intent() {
+    let ctx = setup();
+    let c = ctx.client();
+    let id = ctx.submit();
+
+    c.pause();
+    assert!(c.is_paused());
+
+    // cancel_intent should succeed even while paused
+    c.cancel_intent(&ctx.user, &id);
+    assert!(c.get_intent(&id).unwrap().state == IntentState::Cancelled);
+}
+
+#[test]
+fn pause_blocks_submit_accept_fill_but_allows_cancel_and_slash() {
+    let ctx = setup();
+    let c = ctx.client();
+    ctx.register_solver();
+
+    // Submit and accept before pausing
+    let id = ctx.submit();
+    c.accept_intent(&ctx.solver, &id);
+
+    // Submit another intent to test that it can't be accepted while paused
+    let id2 = ctx.submit();
+
+    c.pause();
+    assert!(c.is_paused());
+
+    // Test blocked operations
+    let deadline: Option<u64> = None;
+    let res = c.try_submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "ethereum"),
+        &String::from_str(&ctx.env, "0xdef"),
+        &SRC_AMT,
+        &ctx.dst_token,
+        &MIN_DST,
+        &deadline,
+    );
+    assert_eq!(res, Err(Ok(Error::ContractPaused.into())));
+
+    let res = c.try_accept_intent(&ctx.solver, &id2);
+    assert_eq!(res, Err(Ok(Error::ContractPaused.into())));
+
+    let fee = FILL * 5 / 10_000;
+    ctx.dst_admin().mint(&ctx.solver, &(FILL + fee));
+    let res = c.try_fill_intent(&ctx.solver, &id, &FILL);
+    assert_eq!(res, Err(Ok(Error::ContractPaused.into())));
+
+    // Test allowed operations
+    let id3 = ctx.submit();
+    c.cancel_intent(&ctx.user, &id3);
+    assert!(c.get_intent(&id3).unwrap().state == IntentState::Cancelled);
+
+    ctx.pass_time(FILL_WINDOW + 1);
     c.slash_solver(&id);
     assert_eq!(c.get_solver(&ctx.solver).unwrap().fills_failed, 1);
 }
@@ -383,6 +536,37 @@ fn register_solver_small_topup_below_minimum_succeeds() {
 }
 
 #[test]
+fn register_solver_new_with_exact_min_bond_succeeds() {
+    // New solver registering with exactly MIN_BOND (not above) should succeed.
+    let ctx = setup();
+    ctx.bond_admin().mint(&ctx.solver, &MIN_BOND);
+    let c = ctx.client();
+    c.register_solver(&ctx.solver, &MIN_BOND);
+
+    let record = c.get_solver(&ctx.solver).unwrap();
+    assert_eq!(record.bond_amount, MIN_BOND);
+    assert!(record.is_active);
+}
+
+#[test]
+fn register_solver_topup_to_exact_min_bond_succeeds() {
+    // Existing solver topping up to land exactly at MIN_BOND total should succeed.
+    // First: register with half of MIN_BOND
+    let ctx = setup();
+    let half_min = MIN_BOND / 2;
+    ctx.bond_admin().mint(&ctx.solver, &MIN_BOND);
+    let c = ctx.client();
+    c.register_solver(&ctx.solver, &half_min);
+
+    // Top up by another half to reach exactly MIN_BOND
+    c.register_solver(&ctx.solver, &half_min);
+
+    let record = c.get_solver(&ctx.solver).unwrap();
+    assert_eq!(record.bond_amount, MIN_BOND);
+    assert!(record.is_active);
+}
+
+#[test]
 fn register_solver_zero_amount_fails() {
     let ctx = setup();
     ctx.register_solver();
@@ -398,6 +582,37 @@ fn deregister_returns_bond() {
 
     assert!(ctx.client().get_solver(&ctx.solver).is_none());
     assert_eq!(ctx.bond().balance(&ctx.solver), BOND);
+    assert_eq!(ctx.bond().balance(&ctx.contract_id), 0);
+}
+
+#[test]
+fn deregister_returns_exact_bond_amount_after_topup() {
+    // Solver registers, then tops up with additional deposits.
+    // Deregistration should return the exact accumulated total.
+    let ctx = setup();
+    let topup1 = 100 * 10_000_000;
+    let topup2 = 200 * 10_000_000;
+    let total_expected = BOND + topup1 + topup2;
+
+    ctx.bond_admin().mint(&ctx.solver, &total_expected);
+    let c = ctx.client();
+
+    // First deposit
+    c.register_solver(&ctx.solver, &BOND);
+    // Top up with additional amounts
+    c.register_solver(&ctx.solver, &topup1);
+    c.register_solver(&ctx.solver, &topup2);
+
+    // Verify accumulated bond
+    assert_eq!(
+        c.get_solver(&ctx.solver).unwrap().bond_amount,
+        total_expected
+    );
+
+    // Deregister and verify exact return
+    c.deregister_solver(&ctx.solver);
+    assert!(c.get_solver(&ctx.solver).is_none());
+    assert_eq!(ctx.bond().balance(&ctx.solver), total_expected);
     assert_eq!(ctx.bond().balance(&ctx.contract_id), 0);
 }
 
@@ -724,6 +939,64 @@ fn dst_allowlist_removal_blocks_previously_allowed_token() {
 }
 
 #[test]
+fn dst_allowlist_toggled_mid_lifecycle_does_not_retroactively_affect_open_intent() {
+    let ctx = setup();
+    let c = ctx.client();
+    // Allowlist disabled by default, so any token is accepted
+    assert!(!c.is_dst_allowlist_enabled());
+    let id = ctx.submit();
+
+    // Enable allowlist without adding the dst_token
+    c.set_dst_allowlist_enabled(&true);
+    assert!(!c.is_dst_token_allowed(&ctx.dst_token));
+
+    // The already-open intent should still be readable/usable
+    let intent = c.get_intent(&id).unwrap();
+    assert!(intent.state == IntentState::Open);
+
+    // But new submissions with non-allowed tokens fail
+    let deadline: Option<u64> = None;
+    let res = c.try_submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "ethereum"),
+        &String::from_str(&ctx.env, "0xabc"),
+        &SRC_AMT,
+        &ctx.dst_token,
+        &MIN_DST,
+        &deadline,
+    );
+    assert_eq!(res, Err(Ok(Error::DstTokenNotAllowed.into())));
+}
+
+#[test]
+fn dst_allowlist_can_be_re_enabled_to_accept_previously_blocked_tokens() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    // Enable allowlist and block the token
+    c.set_dst_allowlist_enabled(&true);
+    assert!(!c.is_dst_token_allowed(&ctx.dst_token));
+
+    let deadline: Option<u64> = None;
+    let res = c.try_submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "ethereum"),
+        &String::from_str(&ctx.env, "0xabc"),
+        &SRC_AMT,
+        &ctx.dst_token,
+        &MIN_DST,
+        &deadline,
+    );
+    assert_eq!(res, Err(Ok(Error::DstTokenNotAllowed.into())));
+
+    // Disable the allowlist
+    c.set_dst_allowlist_enabled(&false);
+
+    // Now submissions with any token succeed again
+    ctx.submit();
+}
+
+#[test]
 fn submit_intent_zero_amount_fails() {
     let ctx = setup();
     let deadline: Option<u64> = None;
@@ -867,9 +1140,57 @@ fn full_lifecycle_submit_accept_fill() {
     assert_eq!(solver.fills_failed, 0);
     assert_eq!(solver.total_volume, FILL);
 
+    let (total_intents, total_volume, _open) = c.get_stats();
+    assert_eq!(total_intents, 1);
+    assert_eq!(total_volume, FILL);
+}
+
+#[test]
+fn get_stats_reflects_cumulative_totals_across_multiple_fills() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    ctx.register_solver();
+
+    // First fill cycle
+    let id1 = ctx.submit();
+    c.accept_intent(&ctx.solver, &id1);
+    let fee1 = FILL * 5 / 10_000;
+    ctx.dst_admin().mint(&ctx.solver, &(FILL + fee1));
+    c.fill_intent(&ctx.solver, &id1, &FILL);
+
     let (total_intents, total_volume) = c.get_stats();
     assert_eq!(total_intents, 1);
     assert_eq!(total_volume, FILL);
+
+    // Second fill cycle with a different amount
+    let id2 = ctx.submit();
+    c.accept_intent(&ctx.solver, &id2);
+    let fill2 = 200 * 10_000_000;
+    let fee2 = fill2 * 5 / 10_000;
+    ctx.dst_admin().mint(&ctx.solver, &(fill2 + fee2));
+    c.fill_intent(&ctx.solver, &id2, &fill2);
+
+    let (total_intents, total_volume) = c.get_stats();
+    assert_eq!(total_intents, 2);
+    assert_eq!(total_volume, FILL + fill2);
+
+    // Submit a cancelled intent (should increment TotalIntents but not TotalVolume)
+    let id3 = ctx.submit();
+    c.cancel_intent(&ctx.user, &id3);
+
+    let (total_intents, total_volume) = c.get_stats();
+    assert_eq!(total_intents, 3);
+    assert_eq!(total_volume, FILL + fill2);
+
+    // Submit an expired intent (should increment TotalIntents but not TotalVolume)
+    let id4 = ctx.submit();
+    ctx.pass_time(INTENT_EXPIRY + 1);
+    c.expire_intent(&id4);
+
+    let (total_intents, total_volume) = c.get_stats();
+    assert_eq!(total_intents, 4);
+    assert_eq!(total_volume, FILL + fill2);
 }
 
 // ─── Accept guards ──────────────────────────────────────────────────────────────
@@ -1008,6 +1329,74 @@ fn cannot_cancel_someone_elses_intent() {
     let stranger = Address::generate(&ctx.env);
     let res = ctx.client().try_cancel_intent(&stranger, &id);
     assert_eq!(res, Err(Ok(Error::Unauthorized.into())));
+    // State remains unchanged after rejected cancellation attempt
+    assert!(ctx.client().get_intent(&id).unwrap().state == IntentState::Open);
+}
+
+#[test]
+fn cancel_cooldown_prevents_rapid_cancellations() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    // Submit two intents at different times to avoid collision
+    let id1 = ctx.submit();
+    ctx.pass_time(1);
+    let id2 = ctx.submit();
+
+    // First cancellation succeeds
+    c.cancel_intent(&ctx.user, &id1);
+    assert!(c.get_intent(&id1).unwrap().state == IntentState::Cancelled);
+
+    // Second cancellation within cooldown fails
+    let res = c.try_cancel_intent(&ctx.user, &id2);
+    assert_eq!(res, Err(Ok(Error::CancelCooldownNotExpired.into())));
+}
+
+#[test]
+fn cancel_cooldown_expires_after_delay() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    let id1 = ctx.submit();
+    ctx.pass_time(1);
+    let id2 = ctx.submit();
+
+    // First cancellation
+    c.cancel_intent(&ctx.user, &id1);
+
+    // Wait for cooldown to expire
+    ctx.pass_time(CANCEL_COOLDOWN);
+
+    // Second cancellation now succeeds
+    c.cancel_intent(&ctx.user, &id2);
+    assert!(c.get_intent(&id2).unwrap().state == IntentState::Cancelled);
+}
+
+#[test]
+fn different_users_have_independent_cooldowns() {
+    let ctx = setup();
+    let c = ctx.client();
+    let user2 = Address::generate(&ctx.env);
+
+    let id1 = ctx.submit();
+    ctx.pass_time(1);
+
+    let id2_user: BytesN<32> = c.submit_intent(
+        &user2,
+        &String::from_str(&ctx.env, "ethereum"),
+        &String::from_str(&ctx.env, "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+        &SRC_AMT,
+        &ctx.dst_token,
+        &MIN_DST,
+        &None,
+    );
+
+    // User 1 cancels
+    c.cancel_intent(&ctx.user, &id1);
+
+    // User 2 can immediately cancel despite user 1's recent cancellation
+    c.cancel_intent(&user2, &id2_user);
+    assert!(c.get_intent(&id2_user).unwrap().state == IntentState::Cancelled);
 }
 
 // ─── Slashing ───────────────────────────────────────────────────────────────────
@@ -1063,6 +1452,31 @@ fn slash_below_min_bond_deactivates_solver() {
     let id2 = ctx.submit();
     let res = c.try_accept_intent(&ctx.solver, &id2);
     assert_eq!(res, Err(Ok(Error::SolverInactive.into())));
+}
+
+#[test]
+fn slash_above_min_bond_keeps_solver_active() {
+    // Solver bonded well above MIN_BOND: a 10% slash still leaves >= MIN_BOND.
+    // Verify is_active remains true and solver can still accept intents.
+    let ctx = setup();
+    let c = ctx.client();
+
+    // BOND is 1000 * 10_000_000; MIN_BOND is 50 * 10_000_000.
+    // A 10% slash of BOND is 100 * 10_000_000, leaving 900 * 10_000_000 >> MIN_BOND.
+    ctx.register_solver();
+    let id = ctx.submit();
+    c.accept_intent(&ctx.solver, &id);
+    ctx.pass_time(FILL_WINDOW + 1);
+    c.slash_solver(&id);
+
+    let solver = c.get_solver(&ctx.solver).unwrap();
+    assert!(solver.bond_amount >= MIN_BOND);
+    assert!(solver.is_active);
+
+    // Active solver can accept new intents.
+    assert!(c.is_solver_eligible(&ctx.solver));
+    let id2 = ctx.submit();
+    c.accept_intent(&ctx.solver, &id2);
 }
 
 #[test]
@@ -1148,6 +1562,22 @@ fn expire_intent_unknown_id_fails() {
     let unknown = BytesN::from_array(&ctx.env, &[0u8; 32]);
     let res = ctx.client().try_expire_intent(&unknown);
     assert_eq!(res, Err(Ok(Error::IntentNotFound.into())));
+}
+
+#[test]
+fn expire_intent_before_deadline_state_unchanged() {
+    let ctx = setup();
+    let c = ctx.client();
+    let id = ctx.submit();
+
+    let initial_state = c.get_intent(&id).unwrap().state;
+    assert!(initial_state == IntentState::Open);
+
+    let res = c.try_expire_intent(&id);
+    assert_eq!(res, Err(Ok(Error::DeadlineNotReached.into())));
+
+    let final_state = c.get_intent(&id).unwrap().state;
+    assert!(final_state == IntentState::Open);
 }
 
 // ─── Storage TTL ────────────────────────────────────────────────────────────────
@@ -1965,7 +2395,7 @@ fn rescue_tokens_only_admin_can_call() {
 fn pause_blocks_register_solver() {
     let ctx = setup();
     let c = ctx.client();
-    c.pause();
+    c.pause(&ctx.admin);
 
     ctx.bond_admin().mint(&ctx.solver, &BOND);
     let res = c.try_register_solver(&ctx.solver, &BOND);
@@ -1978,7 +2408,7 @@ fn pause_blocks_deregister_solver() {
     let c = ctx.client();
     ctx.register_solver();
 
-    c.pause();
+    c.pause(&ctx.admin);
     let res = c.try_deregister_solver(&ctx.solver);
     assert_eq!(res, Err(Ok(Error::ContractPaused.into())));
 }
@@ -1989,7 +2419,7 @@ fn pause_blocks_withdraw_bond() {
     let c = ctx.client();
     ctx.register_solver();
 
-    c.pause();
+    c.pause(&ctx.admin);
     let res = c.try_withdraw_bond(&ctx.solver, &(100 * 10_000_000));
     assert_eq!(res, Err(Ok(Error::ContractPaused.into())));
 }
@@ -2011,7 +2441,7 @@ fn unpause_restores_solver_bond_management() {
     let intent = c.get_intent(&id).unwrap();
     assert_eq!(intent.state, IntentState::Filled);
     assert_eq!(intent.total_filled, MIN_DST);
-    c.pause();
+    c.pause(&ctx.admin);
     c.unpause();
 
     // All three operations should succeed after unpause.
@@ -2034,7 +2464,7 @@ fn pause_does_not_block_cancel_intent() {
     let c = ctx.client();
     let id = ctx.submit();
 
-    c.pause();
+    c.pause(&ctx.admin);
     c.cancel_intent(&ctx.user, &id);
     assert!(c.get_intent(&id).unwrap().state == IntentState::Cancelled);
 }
@@ -2054,5 +2484,392 @@ fn dst_allowlist_enabled_defaults_to_false() {
         !ctx.client().is_dst_allowlist_enabled(),
         "DstAllowlistEnabled must default to false; \
          enable it explicitly via set_dst_allowlist_enabled before mainnet launch"
+    );
+}
+
+// ─── #126 src_chain enum / allowlist coverage ────────────────────────────────────
+// These tests document the full set of supported chain names and confirm that:
+//   (a) each supported chain is accepted when the allowlist contains it, and
+//   (b) an unsupported / typo'd chain is rejected when enforcement is on.
+
+/// All five EVM chains in the supported set are accepted when individually
+/// added to the allowlist and enforcement is enabled.
+#[test]
+fn src_chain_allowlist_accepts_all_supported_evm_chains() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    let chains = [
+        "ethereum", "base", "polygon", "arbitrum", "optimism",
+    ];
+
+    for chain_str in &chains {
+        let chain = String::from_str(&ctx.env, chain_str);
+        c.add_allowed_src_chain(&chain);
+    }
+    c.set_src_chain_allowlist_enabled(&true);
+
+    for chain_str in &chains {
+        let chain = String::from_str(&ctx.env, chain_str);
+        assert!(
+            c.is_src_chain_allowed(&chain),
+            "chain '{}' should be in allowlist",
+            chain_str
+        );
+    }
+
+    // submit_intent accepts each chain (uses a valid EVM token address).
+    for chain_str in &chains {
+        let deadline: Option<u64> = None;
+        c.submit_intent(
+            &ctx.user,
+            &String::from_str(&ctx.env, chain_str),
+            &String::from_str(&ctx.env, "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+            &SRC_AMT,
+            &ctx.dst_token,
+            &MIN_DST,
+            &deadline,
+        );
+    }
+}
+
+/// "solana" is accepted as a supported chain when on the allowlist.
+#[test]
+fn src_chain_allowlist_accepts_solana() {
+    let ctx = setup();
+    let c = ctx.client();
+    let chain = String::from_str(&ctx.env, "solana");
+    c.add_allowed_src_chain(&chain);
+    c.set_src_chain_allowlist_enabled(&true);
+
+    assert!(c.is_src_chain_allowed(&String::from_str(&ctx.env, "solana")));
+
+    let deadline: Option<u64> = None;
+    // Valid Solana SPL mint address (base58, 44 chars).
+    c.submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "solana"),
+        &String::from_str(&ctx.env, "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"),
+        &SRC_AMT,
+        &ctx.dst_token,
+        &MIN_DST,
+        &deadline,
+    );
+}
+
+/// A completely unknown chain (not in the supported set) is rejected when
+/// the allowlist is enabled, even if the name "looks" plausible.
+#[test]
+fn src_chain_allowlist_rejects_unknown_chain_when_enabled() {
+    let ctx = setup();
+    let c = ctx.client();
+    // Enable enforcement without adding anything — all chains are blocked.
+    c.set_src_chain_allowlist_enabled(&true);
+
+    let unknown_chains = ["avalanche", "bnb", "etherium", "ETHEREUM", "eth"];
+    for chain_str in &unknown_chains {
+        let deadline: Option<u64> = None;
+        let res = c.try_submit_intent(
+            &ctx.user,
+            &String::from_str(&ctx.env, chain_str),
+            &String::from_str(&ctx.env, "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+            &SRC_AMT,
+            &ctx.dst_token,
+            &MIN_DST,
+            &deadline,
+        );
+        assert_eq!(
+            res,
+            Err(Ok(Error::SrcChainNotAllowed.into())),
+            "chain '{}' should be rejected when not on allowlist",
+            chain_str
+        );
+    }
+}
+
+/// Removing a chain from the allowlist immediately blocks it.
+#[test]
+fn src_chain_allowlist_removal_is_immediate() {
+    let ctx = setup();
+    let c = ctx.client();
+    let chain = String::from_str(&ctx.env, "polygon");
+    c.add_allowed_src_chain(&chain);
+    c.set_src_chain_allowlist_enabled(&true);
+
+    // Confirm it was there.
+    assert!(c.is_src_chain_allowed(&String::from_str(&ctx.env, "polygon")));
+
+    c.remove_allowed_src_chain(&chain);
+    assert!(!c.is_src_chain_allowed(&String::from_str(&ctx.env, "polygon")));
+
+    let deadline: Option<u64> = None;
+    let res = c.try_submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "polygon"),
+        &String::from_str(&ctx.env, "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+        &SRC_AMT,
+        &ctx.dst_token,
+        &MIN_DST,
+        &deadline,
+    );
+    assert_eq!(res, Err(Ok(Error::SrcChainNotAllowed.into())));
+}
+
+// ─── #127 src_token address format validation ────────────────────────────────────
+
+// ── EVM chains ───────────────────────────────────────────────────────────────────
+
+/// A well-formed EVM address (0x + 40 hex chars) is accepted on all EVM chains.
+#[test]
+fn valid_evm_token_accepted_on_evm_chains() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    let evm_chains = ["ethereum", "base", "polygon", "arbitrum", "optimism"];
+    for chain_str in &evm_chains {
+        let deadline: Option<u64> = None;
+        c.submit_intent(
+            &ctx.user,
+            &String::from_str(&ctx.env, chain_str),
+            // Canonical mixed-case checksum address.
+            &String::from_str(&ctx.env, "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+            &SRC_AMT,
+            &ctx.dst_token,
+            &MIN_DST,
+            &deadline,
+        );
+    }
+}
+
+/// All-lowercase hex is also a valid EVM address format.
+#[test]
+fn valid_evm_token_lowercase_accepted() {
+    let ctx = setup();
+    let deadline: Option<u64> = None;
+    ctx.client().submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "ethereum"),
+        &String::from_str(&ctx.env, "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"),
+        &SRC_AMT,
+        &ctx.dst_token,
+        &MIN_DST,
+        &deadline,
+    );
+}
+
+/// Missing "0x" prefix on an EVM chain is rejected with InvalidSrcToken.
+#[test]
+fn evm_token_without_0x_prefix_rejected() {
+    let ctx = setup();
+    let deadline: Option<u64> = None;
+    let res = ctx.client().try_submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "ethereum"),
+        // No "0x" prefix — 40 hex chars only.
+        &String::from_str(&ctx.env, "A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+        &SRC_AMT,
+        &ctx.dst_token,
+        &MIN_DST,
+        &deadline,
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidSrcToken.into())));
+}
+
+/// An EVM address that is too short (< 42 chars) is rejected.
+#[test]
+fn evm_token_too_short_rejected() {
+    let ctx = setup();
+    let deadline: Option<u64> = None;
+    let res = ctx.client().try_submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "base"),
+        &String::from_str(&ctx.env, "0xabc"),   // only 5 chars
+        &SRC_AMT,
+        &ctx.dst_token,
+        &MIN_DST,
+        &deadline,
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidSrcToken.into())));
+}
+
+/// An EVM address that is too long (> 42 chars) is rejected.
+#[test]
+fn evm_token_too_long_rejected() {
+    let ctx = setup();
+    let deadline: Option<u64> = None;
+    // 43 chars total (0x + 41 hex).
+    let res = ctx.client().try_submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "polygon"),
+        &String::from_str(&ctx.env, "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB4800"),
+        &SRC_AMT,
+        &ctx.dst_token,
+        &MIN_DST,
+        &deadline,
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidSrcToken.into())));
+}
+
+/// Non-hex characters after "0x" are rejected on an EVM chain.
+#[test]
+fn evm_token_non_hex_chars_rejected() {
+    let ctx = setup();
+    let deadline: Option<u64> = None;
+    // 42 chars but contains 'g' which is not a hex digit.
+    let res = ctx.client().try_submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "arbitrum"),
+        &String::from_str(&ctx.env, "0xG0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+        &SRC_AMT,
+        &ctx.dst_token,
+        &MIN_DST,
+        &deadline,
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidSrcToken.into())));
+}
+
+/// An empty token string on an EVM chain is rejected.
+#[test]
+fn evm_token_empty_string_rejected() {
+    let ctx = setup();
+    let deadline: Option<u64> = None;
+    let res = ctx.client().try_submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "optimism"),
+        &String::from_str(&ctx.env, ""),
+        &SRC_AMT,
+        &ctx.dst_token,
+        &MIN_DST,
+        &deadline,
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidSrcToken.into())));
+}
+
+// ── Solana chain ──────────────────────────────────────────────────────────────────
+
+/// A valid Solana SPL mint address (44 base58 chars) is accepted.
+#[test]
+fn valid_solana_token_44_chars_accepted() {
+    let ctx = setup();
+    let deadline: Option<u64> = None;
+    ctx.client().submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "solana"),
+        // USDC on Solana mainnet — 44 base58 chars.
+        &String::from_str(&ctx.env, "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"),
+        &SRC_AMT,
+        &ctx.dst_token,
+        &MIN_DST,
+        &deadline,
+    );
+}
+
+/// A 32-character base58 Solana address (minimum valid length) is accepted.
+#[test]
+fn valid_solana_token_32_chars_accepted() {
+    let ctx = setup();
+    let deadline: Option<u64> = None;
+    ctx.client().submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "solana"),
+        // 32 valid base58 chars.
+        &String::from_str(&ctx.env, "So11111111111111111111111111111z"),
+        &SRC_AMT,
+        &ctx.dst_token,
+        &MIN_DST,
+        &deadline,
+    );
+}
+
+/// A Solana token address shorter than 32 chars is rejected.
+#[test]
+fn solana_token_too_short_rejected() {
+    let ctx = setup();
+    let deadline: Option<u64> = None;
+    let res = ctx.client().try_submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "solana"),
+        &String::from_str(&ctx.env, "EPjFWdd5AufqSSqeM2qN1xzybapC8"),  // 29 chars
+        &SRC_AMT,
+        &ctx.dst_token,
+        &MIN_DST,
+        &deadline,
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidSrcToken.into())));
+}
+
+/// A Solana token address longer than 44 chars is rejected.
+#[test]
+fn solana_token_too_long_rejected() {
+    let ctx = setup();
+    let deadline: Option<u64> = None;
+    // 45 chars — one too many.
+    let res = ctx.client().try_submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "solana"),
+        &String::from_str(&ctx.env, "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1vX"),
+        &SRC_AMT,
+        &ctx.dst_token,
+        &MIN_DST,
+        &deadline,
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidSrcToken.into())));
+}
+
+/// A Solana token with a "0x" prefix (EVM-style) is rejected.
+#[test]
+fn solana_token_with_0x_prefix_rejected() {
+    let ctx = setup();
+    let deadline: Option<u64> = None;
+    let res = ctx.client().try_submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "solana"),
+        &String::from_str(&ctx.env, "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+        &SRC_AMT,
+        &ctx.dst_token,
+        &MIN_DST,
+        &deadline,
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidSrcToken.into())));
+}
+
+/// A Solana token containing a character excluded from base58 ('0', 'I', 'O', 'l')
+/// is rejected.
+#[test]
+fn solana_token_invalid_base58_char_rejected() {
+    let ctx = setup();
+    let deadline: Option<u64> = None;
+    // Contains '0' which is not in the base58 alphabet.
+    let res = ctx.client().try_submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "solana"),
+        &String::from_str(&ctx.env, "0PjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"),
+        &SRC_AMT,
+        &ctx.dst_token,
+        &MIN_DST,
+        &deadline,
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidSrcToken.into())));
+}
+
+// ── Unknown chain — validation bypass ────────────────────────────────────────────
+
+/// An unknown (future) chain bypasses src_token format validation entirely.
+/// This ensures forward-compatibility: a chain added later won't silently
+/// reject all its tokens while the allowlist is off.
+#[test]
+fn unknown_chain_bypasses_token_format_validation() {
+    let ctx = setup();
+    let deadline: Option<u64> = None;
+    // "cosmos" is not a known chain — any token string should pass format validation.
+    // (The allowlist is off by default so this reaches the format check.)
+    ctx.client().submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "cosmos"),
+        &String::from_str(&ctx.env, "cosmos1qyqa2zn5c925lyz4gq5qxsrx5gq5qxsr"),
+        &SRC_AMT,
+        &ctx.dst_token,
+        &MIN_DST,
+        &deadline,
     );
 }
