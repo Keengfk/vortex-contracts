@@ -10,3 +10,7 @@ test_snapshots/
 .vscode/*
 !.vscode/extensions.json
 *.swp
+
+# Testnet deployment — contains secret keys, never commit
+deploy-testnet.env
+.last-deploy-testnet

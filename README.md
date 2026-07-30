@@ -152,12 +152,51 @@ stellar contract build
 
 ### Deploy (testnet)
 
+#### Automated (recommended)
+
+A config-driven script handles the build, deploy, and `initialize()` call in
+one step, reducing copy-paste errors across repeated deployments.
+
+```bash
+# 1. Create your config file (only needs to be done once)
+cp deploy-testnet.env.example deploy-testnet.env
+$EDITOR deploy-testnet.env          # fill in admin, fee_recipient, bond_token, secret key
+
+# 2. Deploy + initialize
+./deploy-testnet.sh
+
+# 3. Skip the build if the wasm is already built
+./deploy-testnet.sh --skip-build
+```
+
+The script saves the deployed contract ID to `.last-deploy-testnet` for
+reference. See `deploy-testnet.env.example` for all available options.
+
+#### Manual
+
 ```bash
 stellar contract deploy \
-  --wasm target/wasm32-unknown-unknown/release/vortex_intent_settlement.wasm \
+  --wasm intent_settlement/target/wasm32-unknown-unknown/release/vortex_intent_settlement.wasm \
   --source <SECRET_KEY> \
   --network testnet
 ```
+
+### Reproducible build verification
+
+Independently verify that your local build matches a deployed contract's
+on-chain binary (supply-chain integrity check):
+
+```bash
+# Print the SHA-256 of the locally-built wasm
+./verify-build.sh
+
+# Compare against a deployed contract
+./verify-build.sh <CONTRACT_ID>
+```
+
+The script pins the Rust toolchain version, cleans prior artifacts, and
+rebuilds with `--locked` to ensure a deterministic output. See comments
+inside `verify-build.sh` for the full list of reproducibility settings.
 
 ---
 
