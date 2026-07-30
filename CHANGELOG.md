@@ -40,6 +40,10 @@ first deploys to mainnet.
   relying on a lazy check inside `accept_intent`.
 - **Views**: `get_bond_token`, `get_solver_count` (backed by a new
   `TotalSolvers` stat), `is_solver_eligible`.
+- **Aggregate health view**: `get_protocol_health` bundles `is_paused`,
+  `get_stats`, and `get_solver_count` into a single `ProtocolHealth`
+  struct so dashboard/monitoring integrations need one call instead of
+  three (#112).
 - **Destination token allowlist**: `add_allowed_dst_token` /
   `remove_allowed_dst_token` / `is_dst_token_allowed`, enforced in
   `submit_intent` only once an admin opts in via
@@ -76,3 +80,13 @@ first deploys to mainnet.
   intent lifecycle and an up-to-date entrypoint list.
 - Filled in missing rustdoc on `unpause`, `is_paused`, and the view
   functions.
+- Added `docs/110-monitoring-alerting-spec.md`: signals and thresholds an
+  ops team should watch, including slash rate, bond utilization, and
+  pause/unpause activity (#110).
+- Added `docs/111-expire-intent-event-coverage.md`: confirms and documents
+  the gap between the `intent_expired` event and an intent that is merely
+  past its deadline but not yet materialized as `Expired` (#111).
+- Added `docs/113-event-topic-naming-conventions.md`: documents the
+  current event topic conventions in `intent_settlement` and sets the
+  naming convention future contracts (e.g. `solver_registry`) should
+  follow (#113).
