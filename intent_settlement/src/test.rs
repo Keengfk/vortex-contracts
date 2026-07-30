@@ -231,7 +231,7 @@ fn paused_blocks_submit_accept_and_fill() {
     ctx.register_solver();
     let id = ctx.submit();
 
-    c.pause();
+    c.pause(&ctx.admin);
     assert!(c.is_paused());
 
     let deadline: Option<u64> = None;
@@ -255,7 +255,7 @@ fn unpause_restores_normal_operation() {
     let ctx = setup();
     let c = ctx.client();
 
-    c.pause();
+    c.pause(&ctx.admin);
     c.unpause();
     assert!(!c.is_paused());
 
@@ -275,7 +275,7 @@ fn pause_does_not_block_slashing_an_already_accepted_intent() {
     let id = ctx.submit();
     c.accept_intent(&ctx.solver, &id);
 
-    c.pause();
+    c.pause(&ctx.admin);
     ctx.pass_time(FILL_WINDOW + 1);
 
     // Permissionless slashing keeps working even while paused, so a solver
@@ -284,6 +284,81 @@ fn pause_does_not_block_slashing_an_already_accepted_intent() {
     assert_eq!(c.get_solver(&ctx.solver).unwrap().fills_failed, 1);
 }
 
+// ─── #120 Pauser role ─────────────────────────────────────────────────────────
+
+#[test]
+fn admin_can_set_pauser() {
+    let ctx = setup();
+    let c = ctx.client();
+    assert_eq!(c.get_pauser(), None);
+
+    let pauser = Address::generate(&ctx.env);
+    c.set_pauser(&pauser);
+    assert_eq!(c.get_pauser(), Some(pauser));
+}
+
+#[test]
+fn set_pauser_only_admin_can_call() {
+    let ctx = setup();
+    let c = ctx.client();
+    let pauser = Address::generate(&ctx.env);
+
+    // With mock_all_auths, verify that the admin auth is recorded by the
+    // set_pauser call, the same way rescue_tokens_only_admin_can_call does.
+    c.set_pauser(&pauser);
+
+    let auths = ctx.env.auths();
+    let admin_authed = auths.iter().any(|(addr, _)| *addr == ctx.admin);
+    assert!(
+        admin_authed,
+        "set_pauser must require admin auth; got: {:?}",
+        auths
+    );
+}
+
+#[test]
+fn pauser_can_pause_without_admin_key() {
+    let ctx = setup();
+    let c = ctx.client();
+    let pauser = Address::generate(&ctx.env);
+    c.set_pauser(&pauser);
+
+    c.pause(&pauser);
+    assert!(c.is_paused());
+}
+
+#[test]
+fn pause_rejects_caller_who_is_neither_admin_nor_pauser() {
+    let ctx = setup();
+    let c = ctx.client();
+    let pauser = Address::generate(&ctx.env);
+    c.set_pauser(&pauser);
+
+    let stranger = Address::generate(&ctx.env);
+    let res = c.try_pause(&stranger);
+    assert_eq!(res, Err(Ok(Error::Unauthorized.into())));
+    assert!(!c.is_paused());
+}
+
+#[test]
+fn pauser_cannot_unpause() {
+    let ctx = setup();
+    let c = ctx.client();
+    let pauser = Address::generate(&ctx.env);
+    c.set_pauser(&pauser);
+    c.pause(&pauser);
+
+    // unpause takes no caller argument -- it always requires the stored
+    // admin's auth specifically, so under mock_all_auths this call succeeds
+    // mechanically, but only the admin address is ever the one authorized.
+    c.unpause();
+    let auths = ctx.env.auths();
+    let admin_authed = auths.iter().any(|(addr, _)| *addr == ctx.admin);
+    assert!(
+        admin_authed,
+        "unpause must require admin auth, not the pauser; got: {:?}",
+        auths
+    );
 #[test]
 fn pause_blocks_fill_intent() {
     let ctx = setup();
@@ -2284,7 +2359,7 @@ fn rescue_tokens_only_admin_can_call() {
 fn pause_blocks_register_solver() {
     let ctx = setup();
     let c = ctx.client();
-    c.pause();
+    c.pause(&ctx.admin);
 
     ctx.bond_admin().mint(&ctx.solver, &BOND);
     let res = c.try_register_solver(&ctx.solver, &BOND);
@@ -2297,7 +2372,7 @@ fn pause_blocks_deregister_solver() {
     let c = ctx.client();
     ctx.register_solver();
 
-    c.pause();
+    c.pause(&ctx.admin);
     let res = c.try_deregister_solver(&ctx.solver);
     assert_eq!(res, Err(Ok(Error::ContractPaused.into())));
 }
@@ -2308,7 +2383,7 @@ fn pause_blocks_withdraw_bond() {
     let c = ctx.client();
     ctx.register_solver();
 
-    c.pause();
+    c.pause(&ctx.admin);
     let res = c.try_withdraw_bond(&ctx.solver, &(100 * 10_000_000));
     assert_eq!(res, Err(Ok(Error::ContractPaused.into())));
 }
@@ -2330,7 +2405,7 @@ fn unpause_restores_solver_bond_management() {
     let intent = c.get_intent(&id).unwrap();
     assert_eq!(intent.state, IntentState::Filled);
     assert_eq!(intent.total_filled, MIN_DST);
-    c.pause();
+    c.pause(&ctx.admin);
     c.unpause();
 
     // All three operations should succeed after unpause.
@@ -2353,7 +2428,7 @@ fn pause_does_not_block_cancel_intent() {
     let c = ctx.client();
     let id = ctx.submit();
 
-    c.pause();
+    c.pause(&ctx.admin);
     c.cancel_intent(&ctx.user, &id);
     assert!(c.get_intent(&id).unwrap().state == IntentState::Cancelled);
 }
