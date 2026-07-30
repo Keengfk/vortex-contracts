@@ -438,6 +438,37 @@ fn register_solver_small_topup_below_minimum_succeeds() {
 }
 
 #[test]
+fn register_solver_new_with_exact_min_bond_succeeds() {
+    // New solver registering with exactly MIN_BOND (not above) should succeed.
+    let ctx = setup();
+    ctx.bond_admin().mint(&ctx.solver, &MIN_BOND);
+    let c = ctx.client();
+    c.register_solver(&ctx.solver, &MIN_BOND);
+
+    let record = c.get_solver(&ctx.solver).unwrap();
+    assert_eq!(record.bond_amount, MIN_BOND);
+    assert!(record.is_active);
+}
+
+#[test]
+fn register_solver_topup_to_exact_min_bond_succeeds() {
+    // Existing solver topping up to land exactly at MIN_BOND total should succeed.
+    // First: register with half of MIN_BOND
+    let ctx = setup();
+    let half_min = MIN_BOND / 2;
+    ctx.bond_admin().mint(&ctx.solver, &MIN_BOND);
+    let c = ctx.client();
+    c.register_solver(&ctx.solver, &half_min);
+
+    // Top up by another half to reach exactly MIN_BOND
+    c.register_solver(&ctx.solver, &half_min);
+
+    let record = c.get_solver(&ctx.solver).unwrap();
+    assert_eq!(record.bond_amount, MIN_BOND);
+    assert!(record.is_active);
+}
+
+#[test]
 fn register_solver_zero_amount_fails() {
     let ctx = setup();
     ctx.register_solver();
@@ -453,6 +484,37 @@ fn deregister_returns_bond() {
 
     assert!(ctx.client().get_solver(&ctx.solver).is_none());
     assert_eq!(ctx.bond().balance(&ctx.solver), BOND);
+    assert_eq!(ctx.bond().balance(&ctx.contract_id), 0);
+}
+
+#[test]
+fn deregister_returns_exact_bond_amount_after_topup() {
+    // Solver registers, then tops up with additional deposits.
+    // Deregistration should return the exact accumulated total.
+    let ctx = setup();
+    let topup1 = 100 * 10_000_000;
+    let topup2 = 200 * 10_000_000;
+    let total_expected = BOND + topup1 + topup2;
+
+    ctx.bond_admin().mint(&ctx.solver, &total_expected);
+    let c = ctx.client();
+
+    // First deposit
+    c.register_solver(&ctx.solver, &BOND);
+    // Top up with additional amounts
+    c.register_solver(&ctx.solver, &topup1);
+    c.register_solver(&ctx.solver, &topup2);
+
+    // Verify accumulated bond
+    assert_eq!(
+        c.get_solver(&ctx.solver).unwrap().bond_amount,
+        total_expected
+    );
+
+    // Deregister and verify exact return
+    c.deregister_solver(&ctx.solver);
+    assert!(c.get_solver(&ctx.solver).is_none());
+    assert_eq!(ctx.bond().balance(&ctx.solver), total_expected);
     assert_eq!(ctx.bond().balance(&ctx.contract_id), 0);
 }
 
@@ -1280,6 +1342,31 @@ fn slash_below_min_bond_deactivates_solver() {
     let id2 = ctx.submit();
     let res = c.try_accept_intent(&ctx.solver, &id2);
     assert_eq!(res, Err(Ok(Error::SolverInactive.into())));
+}
+
+#[test]
+fn slash_above_min_bond_keeps_solver_active() {
+    // Solver bonded well above MIN_BOND: a 10% slash still leaves >= MIN_BOND.
+    // Verify is_active remains true and solver can still accept intents.
+    let ctx = setup();
+    let c = ctx.client();
+
+    // BOND is 1000 * 10_000_000; MIN_BOND is 50 * 10_000_000.
+    // A 10% slash of BOND is 100 * 10_000_000, leaving 900 * 10_000_000 >> MIN_BOND.
+    ctx.register_solver();
+    let id = ctx.submit();
+    c.accept_intent(&ctx.solver, &id);
+    ctx.pass_time(FILL_WINDOW + 1);
+    c.slash_solver(&id);
+
+    let solver = c.get_solver(&ctx.solver).unwrap();
+    assert!(solver.bond_amount >= MIN_BOND);
+    assert!(solver.is_active);
+
+    // Active solver can accept new intents.
+    assert!(c.is_solver_eligible(&ctx.solver));
+    let id2 = ctx.submit();
+    c.accept_intent(&ctx.solver, &id2);
 }
 
 #[test]
