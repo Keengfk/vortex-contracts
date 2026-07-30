@@ -74,6 +74,68 @@ stellar contract invoke --id <CONTRACT_ID> --source <ANY_SECRET_KEY> --network t
   get_stats
 ```
 
+#### Decimal Normalization for `src_amount`
+
+`src_amount` must be expressed in the **source token's smallest indivisible
+unit** — the same convention used by the chain's native token representation.
+This varies significantly across chains and tokens, so off-chain tooling that
+builds `submit_intent` calls must apply the correct multiplier before
+submitting.
+
+**General rule:**
+
+```
+src_amount = human_amount × 10^decimals
+```
+
+**Worked examples:**
+
+| Chain | Token | Decimals | Human amount | `src_amount` value |
+|---|---|---|---|---|
+| Ethereum | ETH (WETH) | 18 | 1 ETH | `1_000_000_000_000_000_000` |
+| Ethereum | USDC | 6 | 500 USDC | `500_000_000` |
+| Base | ETH (native) | 18 | 0.5 ETH | `500_000_000_000_000_000` |
+| Base | USDC | 6 | 100 USDC | `100_000_000` |
+| Polygon | MATIC | 18 | 200 MATIC | `200_000_000_000_000_000_000` |
+| Polygon | USDC.e | 6 | 1000 USDC | `1_000_000_000` |
+| Avalanche | AVAX | 18 | 10 AVAX | `10_000_000_000_000_000_000` |
+| Arbitrum | USDC | 6 | 250 USDC | `250_000_000` |
+| BSC | BNB | 18 | 2 BNB | `2_000_000_000_000_000_000` |
+| BSC | USDT | 18 | 50 USDT | `50_000_000_000_000_000_000` |
+
+The existing README usage example (`src_amount 1000000000000000000` for
+1 ETH on Ethereum) follows this convention.
+
+> **Pitfall — USDC on BSC is 18 decimals**, not 6. Always read the deployed
+> contract's `decimals()` function rather than assuming a standard value. Most
+> stablecoins on EVM chains are 6 decimals except on BSC, where USDT and BUSD
+> are 18.
+
+**On-chain bound:** `src_amount` is stored as `i128`. The contract enforces
+`src_amount <= MAX_AMOUNT` (`10^30`), which accommodates amounts up to
+one trillion 18-decimal tokens. Any value above this threshold causes
+`submit_intent` to return `Error::ZeroAmount` (the generic out-of-range
+guard) in the current implementation.
+
+**Stellar side (`min_dst_amount`):** Stellar USDC (Circle's SAC) uses
+**7 decimals** (Stellar's native precision). So 3500 USDC on Stellar is
+`35_000_000_000` (3500 × 10^7).
+
+```bash
+# 1 ETH  → at least 3500 USDC on Stellar
+# src_amount:     1 * 10^18 = 1000000000000000000   (ETH, 18 decimals)
+# min_dst_amount: 3500 * 10^7 = 35000000000          (USDC SAC, 7 decimals)
+stellar contract invoke --id <CONTRACT_ID> --source <SECRET_KEY> --network testnet -- \
+  submit_intent \
+  --src_chain '"ethereum"' \
+  --src_token '"0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"' \
+  --src_amount 1000000000000000000 \
+  --dst_token <USDC_SAC_ADDRESS> \
+  --min_dst_amount 35000000000
+```
+
+---
+
 #### Intent Lifecycle
 
 The diagram below covers all six `IntentState` variants and the functions that
@@ -136,6 +198,34 @@ the exact condition that triggers it.
 ### `solver_registry` (planned)
 
 Tiered solver staking with reputation scores. See the roadmap below.
+
+---
+
+## Supported Source Chains
+
+The `src_chain` field in `submit_intent` must use the canonical lowercase string
+for the source chain. When `SrcChainAllowlistEnabled` is `true`, only the chains
+registered via `add_allowed_src_chain()` are accepted.
+
+| `src_chain` value | Network | Chain type | `src_token` format |
+|---|---|---|---|
+| `"ethereum"` | Ethereum Mainnet | EVM | `0x` + 40 hex chars (EIP-55 checksum) |
+| `"base"` | Base Mainnet | EVM L2 | `0x` + 40 hex chars |
+| `"polygon"` | Polygon PoS | EVM | `0x` + 40 hex chars |
+| `"arbitrum"` | Arbitrum One | EVM L2 | `0x` + 40 hex chars |
+| `"optimism"` | OP Mainnet | EVM L2 | `0x` + 40 hex chars |
+| `"avalanche"` | Avalanche C-Chain | EVM | `0x` + 40 hex chars |
+| `"bsc"` | BNB Smart Chain | EVM | `0x` + 40 hex chars |
+| `"solana"` | Solana Mainnet Beta | SVM | base58 mint address *(planned)* |
+
+For the full token address reference (contract addresses, decimals per chain,
+and allowlist management commands) see
+[docs/132-supported-chains.md](./docs/132-supported-chains.md).
+
+> **Decimal reminder:** EVM tokens use 18 decimals for native assets and
+> typically 6 for stablecoins — except on BSC where USDT and USDC are 18
+> decimals. Always verify via the token contract's `decimals()` call. See the
+> [Decimal Normalization](#decimal-normalization-for-src_amount) section above.
 
 ---
 
