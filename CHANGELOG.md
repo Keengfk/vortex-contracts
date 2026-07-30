@@ -40,10 +40,33 @@ first deploys to mainnet.
   relying on a lazy check inside `accept_intent`.
 - **Views**: `get_bond_token`, `get_solver_count` (backed by a new
   `TotalSolvers` stat), `is_solver_eligible`.
+- **Aggregate health view**: `get_protocol_health` bundles `is_paused`,
+  `get_stats`, and `get_solver_count` into a single `ProtocolHealth`
+  struct so dashboard/monitoring integrations need one call instead of
+  three (#112).
 - **Destination token allowlist**: `add_allowed_dst_token` /
   `remove_allowed_dst_token` / `is_dst_token_allowed`, enforced in
   `submit_intent` only once an admin opts in via
   `set_dst_allowlist_enabled` (off by default).
+- **Timelocked admin actions** (#115, #116): sensitive admin changes now go
+  through a propose-then-execute flow with a 48-hour delay, so users and
+  solvers have a window to notice and react before a change takes effect.
+  A distinct `*_proposed` event fires immediately at proposal time, ahead of
+  the delay, giving off-chain monitors advance notice either way.
+  - `set_fee_recipient` is superseded by `propose_fee_recipient` /
+    `accept_fee_recipient`, now timelocked (`get_pending_fee_recipient`
+    returns `(Address, u64 eta)`).
+  - `transfer_admin` is superseded by `propose_admin_transfer` /
+    `accept_admin_transfer`, now timelocked (`get_pending_admin`).
+  - `add_allowed_dst_token` / `remove_allowed_dst_token` are superseded by
+    `propose_add_dst_token` / `execute_add_dst_token` and
+    `propose_remove_dst_token` / `execute_remove_dst_token` (#118).
+    `execute_*` is permissionless once the delay has elapsed, since the
+    change was already authorized by the admin at proposal time.
+- **Enumerable dst_token allowlist** (#117): `list_allowed_dst_tokens()`
+  returns every token currently on the allowlist, so integrators and
+  auditors no longer have to replay `dst_token_allowed` /
+  `dst_token_disallowed` events to reconstruct the full list.
 
 ### Changed
 
@@ -57,3 +80,13 @@ first deploys to mainnet.
   intent lifecycle and an up-to-date entrypoint list.
 - Filled in missing rustdoc on `unpause`, `is_paused`, and the view
   functions.
+- Added `docs/110-monitoring-alerting-spec.md`: signals and thresholds an
+  ops team should watch, including slash rate, bond utilization, and
+  pause/unpause activity (#110).
+- Added `docs/111-expire-intent-event-coverage.md`: confirms and documents
+  the gap between the `intent_expired` event and an intent that is merely
+  past its deadline but not yet materialized as `Expired` (#111).
+- Added `docs/113-event-topic-naming-conventions.md`: documents the
+  current event topic conventions in `intent_settlement` and sets the
+  naming convention future contracts (e.g. `solver_registry`) should
+  follow (#113).
