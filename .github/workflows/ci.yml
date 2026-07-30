@@ -37,6 +37,27 @@ jobs:
       - name: Build wasm
         run: cargo build --target wasm32-unknown-unknown --release
 
+  proptest:
+    name: Bond-conservation proptest
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: intent_settlement
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: intent_settlement
+      - name: Bond conservation proptest
+        # PROPTEST_CASES controls how many random sequences are generated per
+        # test; 256 balances coverage against CI runtime.
+        run: PROPTEST_CASES=256 cargo test --features testutils -- bond_conservation
+
   audit:
     name: Dependency audit
     runs-on: ubuntu-latest
