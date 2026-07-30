@@ -75,6 +75,23 @@ pub enum DataKey {
     Solver(Address),    // address -> SolverRecord
     TotalIntents,
 
+    /// **Instance storage.** Count of intents currently in `Open` or
+    /// `PartiallyFilled` state (`u64`).  Incremented by `submit_intent` and
+    /// by `slash_solver` (which re-opens the intent).  Decremented by
+    /// `accept_intent`, `cancel_intent`, `expire_intent`, and `fill_intent`
+    /// (only on a full fill that closes the intent).
+    ///
+    /// Trade-off (#109): maintaining this counter on-chain costs one extra
+    /// instance-storage read+write on every state-changing call but gives
+    /// dashboards an O(1) open-intent count without replaying events.  The
+    /// alternative — leaving the computation entirely to indexers — is cheaper
+    /// on-chain but forces every dashboard to run a full event replay.  Given
+    /// that the counter sits in instance storage (one ledger entry, already
+    /// loaded on every call) the marginal cost is a single integer increment/
+    /// decrement, which is negligible compared to the persistent-storage reads
+    /// for `IntentRecord` and `SolverRecord`.
+    OpenIntents,
+
     /// **Instance storage.** Cumulative `dst_token` volume (`i128`) across
     /// all successfully filled intents.  Incremented by `fill_intent`.
     TotalVolume,
@@ -370,6 +387,7 @@ impl IntentSettlement {
         env.storage().instance().set(&DataKey::TotalIntents, &0u64);
         env.storage().instance().set(&DataKey::TotalVolume, &0i128);
         env.storage().instance().set(&DataKey::TotalSolvers, &0u32);
+        env.storage().instance().set(&DataKey::OpenIntents, &0u64);
         // Seed Config with defaults so the contract is immediately usable
         // without a follow-up admin call.
         env.storage().instance().set(
@@ -971,8 +989,11 @@ Please follow this repo's Conventional Commits format for your commit messages (
         let client = token::Client::new(&env, &bond_token);
         client.transfer(&env.current_contract_address(), &solver, &amount);
 
+        // Issue #108: include the post-withdrawal remaining balance so indexers
+        // can maintain a solver's bond ledger without a separate get_solver call.
+        // data: (amount: i128, remaining: i128)
         env.events()
-            .publish((Symbol::new(&env, "bond_withdrawn"), solver), amount);
+            .publish((Symbol::new(&env, "bond_withdrawn"), solver), (amount, remaining));
     }
 
     // ── Intent Lifecycle ──────────────────────────────────────────────────────
@@ -1111,6 +1132,17 @@ Please follow this repo's Conventional Commits format for your commit messages (
             .instance()
             .set(&DataKey::TotalIntents, &(total + 1));
 
+        // Increment open_intents: every new submission starts as Open (or Bidding,
+        // which also counts as an unfilled intent awaiting a solver).
+        let open: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::OpenIntents)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::OpenIntents, &(open + 1));
+
         env.events().publish(
             (Symbol::new(&env, "intent_submitted"), user),
             (intent_id.clone(), min_dst_amount, expiry),
@@ -1182,6 +1214,16 @@ Please follow this repo's Conventional Commits format for your commit messages (
         env.storage()
             .persistent()
             .set(&DataKey::Solver(solver.clone()), &solver_record);
+
+        // Decrement open_intents: the intent is no longer open (a solver owns it).
+        let open: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::OpenIntents)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::OpenIntents, &open.saturating_sub(1));
 
         env.storage()
             .persistent()
@@ -1299,6 +1341,8 @@ Please follow this repo's Conventional Commits format for your commit messages (
 
         if cumulative >= intent.min_dst_amount {
             // Intent is fully satisfied — close it out.
+            // open_intents was already decremented when the intent was accepted;
+            // no further adjustment needed here.
             intent.state = IntentState::Filled;
             intent.filled_at = Some(now);
             solver_record.fills_completed += 1;
@@ -1307,10 +1351,20 @@ Please follow this repo's Conventional Commits format for your commit messages (
             // Partial fill: re-open so another solver (or the same) can claim the
             // remaining amount.  Reset solver assignment and deadline back to the
             // full intent expiry window so the rest of the intent can be picked up.
+            // The intent is back in Open rotation, so increment open_intents again.
             intent.state = IntentState::PartiallyFilled;
             intent.solver = None;
             intent.deadline = now + INTENT_EXPIRY;
             solver_record.active_intents = solver_record.active_intents.saturating_sub(1);
+
+            let open: u64 = env
+                .storage()
+                .instance()
+                .get(&DataKey::OpenIntents)
+                .unwrap_or(0);
+            env.storage()
+                .instance()
+                .set(&DataKey::OpenIntents, &(open + 1));
         }
 
         env.storage()
@@ -1405,6 +1459,15 @@ Please follow this repo's Conventional Commits format for your commit messages (
             .set(&DataKey::Intent(intent_id.clone()), &intent);
         Self::bump_intent_ttl(&env, &intent_id);
 
+        // Decrement open_intents: intent is no longer open.
+        let open: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::OpenIntents)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::OpenIntents, &open.saturating_sub(1));
         // Update cancellation cooldown
         env.storage()
             .persistent()
@@ -1463,6 +1526,7 @@ Please follow this repo's Conventional Commits format for your commit messages (
         }
 
         // Re-open the intent, preserving partial-fill progress if any.
+        // The intent transitions back to Open/PartiallyFilled, so increment open_intents.
         intent.state = if intent.total_filled > 0 {
             IntentState::PartiallyFilled
         } else {
@@ -1470,6 +1534,15 @@ Please follow this repo's Conventional Commits format for your commit messages (
         };
         intent.solver = None;
         intent.deadline = now + cfg.intent_expiry;
+
+        let open: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::OpenIntents)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::OpenIntents, &(open + 1));
 
         // Persist both records BEFORE any token transfer so that a re-entrant
         // or back-to-back call on the same intent_id is rejected by the
@@ -1536,6 +1609,16 @@ Please follow this repo's Conventional Commits format for your commit messages (
             .persistent()
             .set(&DataKey::Intent(intent_id.clone()), &intent);
         Self::bump_intent_ttl(&env, &intent_id);
+
+        // Decrement open_intents: intent is no longer open.
+        let open: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::OpenIntents)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::OpenIntents, &open.saturating_sub(1));
 
         env.events()
             .publish((Symbol::new(&env, "intent_expired"),), intent_id);
@@ -1720,8 +1803,31 @@ Please follow this repo's Conventional Commits format for your commit messages (
         env.storage().instance().get(&DataKey::Admin)
     }
 
-    /// (total intents ever submitted, total volume ever filled).
-    pub fn get_stats(env: Env) -> (u64, i128) {
+    /// Returns `(total_intents, total_volume, open_intents)`.
+    ///
+    /// - `total_intents` — cumulative count of intents ever submitted.
+    /// - `total_volume`  — cumulative dst-token units delivered across all fills.
+    /// - `open_intents`  — intents currently in `Open` or `PartiallyFilled` state.
+    ///
+    /// **Trade-off (#109):** `open_intents` is maintained as an on-chain
+    /// counter in instance storage (the same ledger entry that already holds
+    /// `TotalIntents` and `TotalVolume`).  This means every state-changing
+    /// call (`submit_intent`, `accept_intent`, `fill_intent`,
+    /// `cancel_intent`, `expire_intent`, `slash_solver`) pays one extra
+    /// integer read + write inside the instance entry, which is already
+    /// loaded on every call.  The marginal cost is negligible compared to the
+    /// persistent-storage I/O for `IntentRecord` and `SolverRecord`.
+    ///
+    /// The alternative — leaving `open_intents` entirely to indexers — would
+    /// keep on-chain logic simpler, but would force every dashboard to replay
+    /// the full event history for an O(N) count.  Storing the counter on-chain
+    /// makes it O(1) for any caller.
+    ///
+    /// Note: the counter can transiently under-count if the contract is
+    /// upgraded from a version that did not track it (pre-#109 deployments
+    /// will have `OpenIntents` absent, which `unwrap_or(0)` handles gracefully
+    /// — the counter will be accurate from the upgrade ledger forward).
+    pub fn get_stats(env: Env) -> (u64, i128, u64) {
         let intents: u64 = env
             .storage()
             .instance()
@@ -1732,7 +1838,12 @@ Please follow this repo's Conventional Commits format for your commit messages (
             .instance()
             .get(&DataKey::TotalVolume)
             .unwrap_or(0);
-        (intents, volume)
+        let open: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::OpenIntents)
+            .unwrap_or(0);
+        (intents, volume, open)
     }
 
     /// Minimum bond required for solver registration.

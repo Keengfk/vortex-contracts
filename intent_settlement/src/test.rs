@@ -121,9 +121,10 @@ fn setup() -> Ctx {
 #[test]
 fn initialize_sets_initial_stats() {
     let ctx = setup();
-    let (intents, volume) = ctx.client().get_stats();
+    let (intents, volume, open) = ctx.client().get_stats();
     assert_eq!(intents, 0);
     assert_eq!(volume, 0);
+    assert_eq!(open, 0);
 }
 
 #[test]
@@ -1105,7 +1106,7 @@ fn full_lifecycle_submit_accept_fill() {
     assert_eq!(solver.fills_failed, 0);
     assert_eq!(solver.total_volume, FILL);
 
-    let (total_intents, total_volume) = c.get_stats();
+    let (total_intents, total_volume, _open) = c.get_stats();
     assert_eq!(total_intents, 1);
     assert_eq!(total_volume, FILL);
 }
