@@ -2451,3 +2451,390 @@ fn dst_allowlist_enabled_defaults_to_false() {
          enable it explicitly via set_dst_allowlist_enabled before mainnet launch"
     );
 }
+
+// ─── #126 src_chain enum / allowlist coverage ────────────────────────────────────
+// These tests document the full set of supported chain names and confirm that:
+//   (a) each supported chain is accepted when the allowlist contains it, and
+//   (b) an unsupported / typo'd chain is rejected when enforcement is on.
+
+/// All five EVM chains in the supported set are accepted when individually
+/// added to the allowlist and enforcement is enabled.
+#[test]
+fn src_chain_allowlist_accepts_all_supported_evm_chains() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    let chains = [
+        "ethereum", "base", "polygon", "arbitrum", "optimism",
+    ];
+
+    for chain_str in &chains {
+        let chain = String::from_str(&ctx.env, chain_str);
+        c.add_allowed_src_chain(&chain);
+    }
+    c.set_src_chain_allowlist_enabled(&true);
+
+    for chain_str in &chains {
+        let chain = String::from_str(&ctx.env, chain_str);
+        assert!(
+            c.is_src_chain_allowed(&chain),
+            "chain '{}' should be in allowlist",
+            chain_str
+        );
+    }
+
+    // submit_intent accepts each chain (uses a valid EVM token address).
+    for chain_str in &chains {
+        let deadline: Option<u64> = None;
+        c.submit_intent(
+            &ctx.user,
+            &String::from_str(&ctx.env, chain_str),
+            &String::from_str(&ctx.env, "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+            &SRC_AMT,
+            &ctx.dst_token,
+            &MIN_DST,
+            &deadline,
+        );
+    }
+}
+
+/// "solana" is accepted as a supported chain when on the allowlist.
+#[test]
+fn src_chain_allowlist_accepts_solana() {
+    let ctx = setup();
+    let c = ctx.client();
+    let chain = String::from_str(&ctx.env, "solana");
+    c.add_allowed_src_chain(&chain);
+    c.set_src_chain_allowlist_enabled(&true);
+
+    assert!(c.is_src_chain_allowed(&String::from_str(&ctx.env, "solana")));
+
+    let deadline: Option<u64> = None;
+    // Valid Solana SPL mint address (base58, 44 chars).
+    c.submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "solana"),
+        &String::from_str(&ctx.env, "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"),
+        &SRC_AMT,
+        &ctx.dst_token,
+        &MIN_DST,
+        &deadline,
+    );
+}
+
+/// A completely unknown chain (not in the supported set) is rejected when
+/// the allowlist is enabled, even if the name "looks" plausible.
+#[test]
+fn src_chain_allowlist_rejects_unknown_chain_when_enabled() {
+    let ctx = setup();
+    let c = ctx.client();
+    // Enable enforcement without adding anything — all chains are blocked.
+    c.set_src_chain_allowlist_enabled(&true);
+
+    let unknown_chains = ["avalanche", "bnb", "etherium", "ETHEREUM", "eth"];
+    for chain_str in &unknown_chains {
+        let deadline: Option<u64> = None;
+        let res = c.try_submit_intent(
+            &ctx.user,
+            &String::from_str(&ctx.env, chain_str),
+            &String::from_str(&ctx.env, "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+            &SRC_AMT,
+            &ctx.dst_token,
+            &MIN_DST,
+            &deadline,
+        );
+        assert_eq!(
+            res,
+            Err(Ok(Error::SrcChainNotAllowed.into())),
+            "chain '{}' should be rejected when not on allowlist",
+            chain_str
+        );
+    }
+}
+
+/// Removing a chain from the allowlist immediately blocks it.
+#[test]
+fn src_chain_allowlist_removal_is_immediate() {
+    let ctx = setup();
+    let c = ctx.client();
+    let chain = String::from_str(&ctx.env, "polygon");
+    c.add_allowed_src_chain(&chain);
+    c.set_src_chain_allowlist_enabled(&true);
+
+    // Confirm it was there.
+    assert!(c.is_src_chain_allowed(&String::from_str(&ctx.env, "polygon")));
+
+    c.remove_allowed_src_chain(&chain);
+    assert!(!c.is_src_chain_allowed(&String::from_str(&ctx.env, "polygon")));
+
+    let deadline: Option<u64> = None;
+    let res = c.try_submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "polygon"),
+        &String::from_str(&ctx.env, "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+        &SRC_AMT,
+        &ctx.dst_token,
+        &MIN_DST,
+        &deadline,
+    );
+    assert_eq!(res, Err(Ok(Error::SrcChainNotAllowed.into())));
+}
+
+// ─── #127 src_token address format validation ────────────────────────────────────
+
+// ── EVM chains ───────────────────────────────────────────────────────────────────
+
+/// A well-formed EVM address (0x + 40 hex chars) is accepted on all EVM chains.
+#[test]
+fn valid_evm_token_accepted_on_evm_chains() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    let evm_chains = ["ethereum", "base", "polygon", "arbitrum", "optimism"];
+    for chain_str in &evm_chains {
+        let deadline: Option<u64> = None;
+        c.submit_intent(
+            &ctx.user,
+            &String::from_str(&ctx.env, chain_str),
+            // Canonical mixed-case checksum address.
+            &String::from_str(&ctx.env, "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+            &SRC_AMT,
+            &ctx.dst_token,
+            &MIN_DST,
+            &deadline,
+        );
+    }
+}
+
+/// All-lowercase hex is also a valid EVM address format.
+#[test]
+fn valid_evm_token_lowercase_accepted() {
+    let ctx = setup();
+    let deadline: Option<u64> = None;
+    ctx.client().submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "ethereum"),
+        &String::from_str(&ctx.env, "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"),
+        &SRC_AMT,
+        &ctx.dst_token,
+        &MIN_DST,
+        &deadline,
+    );
+}
+
+/// Missing "0x" prefix on an EVM chain is rejected with InvalidSrcToken.
+#[test]
+fn evm_token_without_0x_prefix_rejected() {
+    let ctx = setup();
+    let deadline: Option<u64> = None;
+    let res = ctx.client().try_submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "ethereum"),
+        // No "0x" prefix — 40 hex chars only.
+        &String::from_str(&ctx.env, "A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+        &SRC_AMT,
+        &ctx.dst_token,
+        &MIN_DST,
+        &deadline,
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidSrcToken.into())));
+}
+
+/// An EVM address that is too short (< 42 chars) is rejected.
+#[test]
+fn evm_token_too_short_rejected() {
+    let ctx = setup();
+    let deadline: Option<u64> = None;
+    let res = ctx.client().try_submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "base"),
+        &String::from_str(&ctx.env, "0xabc"),   // only 5 chars
+        &SRC_AMT,
+        &ctx.dst_token,
+        &MIN_DST,
+        &deadline,
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidSrcToken.into())));
+}
+
+/// An EVM address that is too long (> 42 chars) is rejected.
+#[test]
+fn evm_token_too_long_rejected() {
+    let ctx = setup();
+    let deadline: Option<u64> = None;
+    // 43 chars total (0x + 41 hex).
+    let res = ctx.client().try_submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "polygon"),
+        &String::from_str(&ctx.env, "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB4800"),
+        &SRC_AMT,
+        &ctx.dst_token,
+        &MIN_DST,
+        &deadline,
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidSrcToken.into())));
+}
+
+/// Non-hex characters after "0x" are rejected on an EVM chain.
+#[test]
+fn evm_token_non_hex_chars_rejected() {
+    let ctx = setup();
+    let deadline: Option<u64> = None;
+    // 42 chars but contains 'g' which is not a hex digit.
+    let res = ctx.client().try_submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "arbitrum"),
+        &String::from_str(&ctx.env, "0xG0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+        &SRC_AMT,
+        &ctx.dst_token,
+        &MIN_DST,
+        &deadline,
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidSrcToken.into())));
+}
+
+/// An empty token string on an EVM chain is rejected.
+#[test]
+fn evm_token_empty_string_rejected() {
+    let ctx = setup();
+    let deadline: Option<u64> = None;
+    let res = ctx.client().try_submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "optimism"),
+        &String::from_str(&ctx.env, ""),
+        &SRC_AMT,
+        &ctx.dst_token,
+        &MIN_DST,
+        &deadline,
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidSrcToken.into())));
+}
+
+// ── Solana chain ──────────────────────────────────────────────────────────────────
+
+/// A valid Solana SPL mint address (44 base58 chars) is accepted.
+#[test]
+fn valid_solana_token_44_chars_accepted() {
+    let ctx = setup();
+    let deadline: Option<u64> = None;
+    ctx.client().submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "solana"),
+        // USDC on Solana mainnet — 44 base58 chars.
+        &String::from_str(&ctx.env, "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"),
+        &SRC_AMT,
+        &ctx.dst_token,
+        &MIN_DST,
+        &deadline,
+    );
+}
+
+/// A 32-character base58 Solana address (minimum valid length) is accepted.
+#[test]
+fn valid_solana_token_32_chars_accepted() {
+    let ctx = setup();
+    let deadline: Option<u64> = None;
+    ctx.client().submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "solana"),
+        // 32 valid base58 chars.
+        &String::from_str(&ctx.env, "So11111111111111111111111111111z"),
+        &SRC_AMT,
+        &ctx.dst_token,
+        &MIN_DST,
+        &deadline,
+    );
+}
+
+/// A Solana token address shorter than 32 chars is rejected.
+#[test]
+fn solana_token_too_short_rejected() {
+    let ctx = setup();
+    let deadline: Option<u64> = None;
+    let res = ctx.client().try_submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "solana"),
+        &String::from_str(&ctx.env, "EPjFWdd5AufqSSqeM2qN1xzybapC8"),  // 29 chars
+        &SRC_AMT,
+        &ctx.dst_token,
+        &MIN_DST,
+        &deadline,
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidSrcToken.into())));
+}
+
+/// A Solana token address longer than 44 chars is rejected.
+#[test]
+fn solana_token_too_long_rejected() {
+    let ctx = setup();
+    let deadline: Option<u64> = None;
+    // 45 chars — one too many.
+    let res = ctx.client().try_submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "solana"),
+        &String::from_str(&ctx.env, "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1vX"),
+        &SRC_AMT,
+        &ctx.dst_token,
+        &MIN_DST,
+        &deadline,
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidSrcToken.into())));
+}
+
+/// A Solana token with a "0x" prefix (EVM-style) is rejected.
+#[test]
+fn solana_token_with_0x_prefix_rejected() {
+    let ctx = setup();
+    let deadline: Option<u64> = None;
+    let res = ctx.client().try_submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "solana"),
+        &String::from_str(&ctx.env, "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+        &SRC_AMT,
+        &ctx.dst_token,
+        &MIN_DST,
+        &deadline,
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidSrcToken.into())));
+}
+
+/// A Solana token containing a character excluded from base58 ('0', 'I', 'O', 'l')
+/// is rejected.
+#[test]
+fn solana_token_invalid_base58_char_rejected() {
+    let ctx = setup();
+    let deadline: Option<u64> = None;
+    // Contains '0' which is not in the base58 alphabet.
+    let res = ctx.client().try_submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "solana"),
+        &String::from_str(&ctx.env, "0PjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"),
+        &SRC_AMT,
+        &ctx.dst_token,
+        &MIN_DST,
+        &deadline,
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidSrcToken.into())));
+}
+
+// ── Unknown chain — validation bypass ────────────────────────────────────────────
+
+/// An unknown (future) chain bypasses src_token format validation entirely.
+/// This ensures forward-compatibility: a chain added later won't silently
+/// reject all its tokens while the allowlist is off.
+#[test]
+fn unknown_chain_bypasses_token_format_validation() {
+    let ctx = setup();
+    let deadline: Option<u64> = None;
+    // "cosmos" is not a known chain — any token string should pass format validation.
+    // (The allowlist is off by default so this reaches the format check.)
+    ctx.client().submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "cosmos"),
+        &String::from_str(&ctx.env, "cosmos1qyqa2zn5c925lyz4gq5qxsrx5gq5qxsr"),
+        &SRC_AMT,
+        &ctx.dst_token,
+        &MIN_DST,
+        &deadline,
+    );
+}
