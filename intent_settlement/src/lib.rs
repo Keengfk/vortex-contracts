@@ -393,6 +393,10 @@ pub struct IntentSettlement;
 impl IntentSettlement {
     // ── Initialization ────────────────────────────────────────────────────────
 
+    /// One-time contract setup. Records the `admin`, `fee_recipient`, and
+    /// `bond_token` (USDC) addresses, seeds protocol stats to zero, writes the
+    /// default `ProtocolConfig`, and extends the instance TTL.
+    /// Panics with `AlreadyInitialized` if called a second time.
     pub fn initialize(env: Env, admin: Address, fee_recipient: Address, bond_token: Address) {
         if env.storage().instance().has(&DataKey::Admin) {
             panic_with_error!(&env, Error::AlreadyInitialized);
@@ -712,6 +716,8 @@ impl IntentSettlement {
             .publish((Symbol::new(&env, "dst_token_disallowed"),), token);
     }
 
+    /// Returns `true` if `token` is on the dst_token allowlist.
+    /// Does not check whether allowlist enforcement is currently active.
     pub fn is_dst_token_allowed(env: Env, token: Address) -> bool {
         env.storage()
             .instance()
@@ -736,6 +742,8 @@ impl IntentSettlement {
             .publish((Symbol::new(&env, "dst_allowlist_enabled"),), enabled);
     }
 
+    /// Returns `true` if the dst_token allowlist is currently being enforced
+    /// by `submit_intent`. Defaults to `false` on a fresh deployment.
     pub fn is_dst_allowlist_enabled(env: Env) -> bool {
         env.storage()
             .instance()
@@ -1023,6 +1031,9 @@ impl IntentSettlement {
         );
     }
 
+    /// Solver voluntarily exits the protocol. Returns the full bond to the
+    /// solver and removes their record. Requires no active (Accepted) intents —
+    /// use `slash_solver` to clear those first.
     pub fn deregister_solver(env: Env, solver: Address) {
         // Auth audit: require_auth() is correct. Only the solver themselves
         // may deregister and trigger bond return. require_auth_for_args is not
@@ -1921,6 +1932,7 @@ impl IntentSettlement {
         }
     }
 
+    /// Returns the current fee recipient address, or `None` before initialization.
     pub fn get_fee_recipient(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::FeeRecipient)
     }
@@ -1932,10 +1944,12 @@ impl IntentSettlement {
         env.storage().instance().get(&DataKey::PendingFeeRecipient)
     }
 
+    /// Returns the bond token address (USDC SAC), or `None` before initialization.
     pub fn get_bond_token(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::BondToken)
     }
 
+    /// Returns the current admin address, or `None` before initialization.
     pub fn get_admin(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::Admin)
     }
