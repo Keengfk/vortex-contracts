@@ -8,7 +8,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, token, xdr::ToXdr,
-    Address, Bytes, BytesN, Env, String, Symbol,
+    Address, Bytes, BytesN, Env, String, Symbol, Vec,
 };
 
 #[cfg(test)]
@@ -28,6 +28,14 @@ const PROTOCOL_FEE_BPS: i128 = 5; // 0.05%
 /// competing quotes via `bid_intent`; the best quote wins once the window
 /// closes.
 const BID_WINDOW: u64 = 120; // 2 minutes
+
+/// Delay enforced between proposing and executing a sensitive admin change
+/// (admin transfer, fee recipient handover, dst_token allowlist changes).
+/// Gives users and solvers a window to notice and react before the change
+/// takes effect (#115). Proposing also emits a distinct event immediately,
+/// so off-chain monitors get advance notice even before the delay elapses
+/// (#116).
+const ADMIN_TIMELOCK_DELAY: u64 = 172_800; // 48 hours
 
 // Upper sanity bound for src_amount and min_dst_amount.
 //
@@ -59,9 +67,10 @@ const INSTANCE_TTL_EXTEND_TO: u32 = DAY_IN_LEDGERS * 60;
 #[derive(Clone)]
 pub enum DataKey {
     /// **Instance storage.** The admin `Address` that may call privileged
-    /// functions (`pause`, `unpause`, `set_fee_recipient`, `transfer_admin`,
-    /// `add_allowed_dst_token`, etc.).  Written once by `initialize` and
-    /// rotated by `transfer_admin`.  Lives as long as the contract instance.
+    /// functions (`pause`, `unpause`, `propose_fee_recipient`,
+    /// `propose_admin_transfer`, `propose_add_dst_token`, etc.).  Written
+    /// once by `initialize` and rotated by `accept_admin_transfer`.  Lives as
+    /// long as the contract instance.
     Admin,
 
     /// **Instance storage.** The `Address` that receives protocol fees
@@ -69,7 +78,10 @@ pub enum DataKey {
     /// `slash_solver`).  Written by `initialize` and updated by
     /// `set_fee_recipient`.  Lives as long as the contract instance.
     FeeRecipient,
-    PendingFeeRecipient, // proposed-but-not-yet-accepted new fee recipient (issue #30)
+    /// Proposed-but-not-yet-accepted new fee recipient plus the ledger
+    /// timestamp at which `accept_fee_recipient` may execute it (issue #30,
+    /// timelock added by #115): `(Address, u64)`.
+    PendingFeeRecipient,
     BondToken,          // USDC address for bonds
     Intent(BytesN<32>), // intent_id -> IntentRecord
     Solver(Address),    // address -> SolverRecord
@@ -323,7 +335,8 @@ pub enum Error {
 
     /// An operation that requires the contract to be initialized (i.e. needs
     /// `Admin` in instance storage) was called before `initialize`.  Raised
-    /// by `require_admin` and by `set_fee_recipient` / `transfer_admin`.
+    /// by `require_admin` and by `propose_fee_recipient` /
+    /// `propose_admin_transfer`.
     NotInitialized = 16,
 
     /// `deregister_solver` was called while the solver's `active_intents`
@@ -417,12 +430,17 @@ impl IntentSettlement {
     // ── Admin ──────────────────────────────────────────────────────────────────
 
     /// Admin-only: propose a new fee recipient address. The proposal is stored
-    /// but not yet active. The new address must call `accept_fee_recipient` to
-    /// confirm, mirroring `transfer_admin`'s two-step pattern so a typo'd or
-    /// unreachable address can never silently misroute protocol fees.
+    /// (with the ledger timestamp at which it becomes executable) but not yet
+    /// active, and a `fee_recipient_proposed` event fires immediately so
+    /// off-chain monitors have advance notice (#116). The new address must
+    /// wait out the timelock and then call `accept_fee_recipient` to confirm,
+    /// mirroring `transfer_admin`'s two-step pattern so a typo'd or
+    /// unreachable address can never silently misroute protocol fees, and
+    /// giving affected parties a window to react before it's live (#115).
     ///
-    /// A new proposal overwrites any prior pending proposal, so the admin can
-    /// correct a mistake before the recipient has accepted.
+    /// A new proposal overwrites any prior pending proposal (and resets the
+    /// timelock), so the admin can correct a mistake before the recipient has
+    /// accepted.
     pub fn propose_fee_recipient(env: Env, new_fee_recipient: Address) {
         let admin: Address = env
             .storage()
@@ -434,20 +452,22 @@ impl IntentSettlement {
         // meaningful sub-scope within "being admin".
         admin.require_auth();
 
+        let eta = env.ledger().timestamp() + ADMIN_TIMELOCK_DELAY;
         env.storage()
             .instance()
-            .set(&DataKey::PendingFeeRecipient, &new_fee_recipient);
+            .set(&DataKey::PendingFeeRecipient, &(new_fee_recipient.clone(), eta));
 
         env.events().publish(
             (Symbol::new(&env, "fee_recipient_proposed"),),
-            new_fee_recipient,
+            (new_fee_recipient, eta),
         );
     }
 
-    /// The pending fee recipient confirms the handover. Until this is called
+    /// The pending fee recipient confirms the handover once the timelock
+    /// delay since `propose_fee_recipient` has elapsed. Until this is called
     /// the current fee recipient remains unchanged.
     pub fn accept_fee_recipient(env: Env, new_fee_recipient: Address) {
-        let pending: Address = env
+        let (pending, eta): (Address, u64) = env
             .storage()
             .instance()
             .get(&DataKey::PendingFeeRecipient)
@@ -455,6 +475,9 @@ impl IntentSettlement {
 
         if pending != new_fee_recipient {
             panic_with_error!(&env, Error::Unauthorized);
+        }
+        if env.ledger().timestamp() < eta {
+            panic_with_error!(&env, Error::TimelockNotElapsed);
         }
         new_fee_recipient.require_auth();
 
@@ -471,24 +494,57 @@ impl IntentSettlement {
         );
     }
 
-    /// Admin-only: transfer the admin role to a new address. The new admin
-    /// must authorize too, so a typo'd address can't accidentally brick
-    /// admin control of the contract.
-    pub fn transfer_admin(env: Env, new_admin: Address) {
+    /// Admin-only: propose transferring the admin role to a new address. A
+    /// `admin_transfer_proposed` event fires immediately for off-chain
+    /// monitors (#116); the transfer itself only takes effect once
+    /// `new_admin` calls `accept_admin_transfer` after the timelock delay
+    /// has elapsed (#115), so a typo'd address can't accidentally brick
+    /// admin control and affected parties get advance notice.
+    ///
+    /// A new proposal overwrites any prior pending proposal (and resets the
+    /// timelock).
+    pub fn propose_admin_transfer(env: Env, new_admin: Address) {
         let admin: Address = env
             .storage()
             .instance()
             .get(&DataKey::Admin)
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
-        // Auth audit: require_auth() is correct on both the outgoing and
-        // incoming admin. Requiring both prevents accidentally handing the role
-        // to a typo'd or uncontrolled address. require_auth_for_args is not
-        // applicable — both signers ARE the principals, there's nothing to
-        // sub-scope.
+        // Auth audit: require_auth() is correct here — the stored admin
+        // address must sign to propose handing off its own role.
         admin.require_auth();
+
+        let eta = env.ledger().timestamp() + ADMIN_TIMELOCK_DELAY;
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &(new_admin.clone(), eta));
+
+        env.events().publish(
+            (Symbol::new(&env, "admin_transfer_proposed"),),
+            (new_admin, eta),
+        );
+    }
+
+    /// The pending new admin confirms the handover once the timelock delay
+    /// since `propose_admin_transfer` has elapsed. Requiring the incoming
+    /// admin's own signature prevents accidentally handing the role to a
+    /// typo'd or uncontrolled address.
+    pub fn accept_admin_transfer(env: Env, new_admin: Address) {
+        let (pending, eta): (Address, u64) = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoPendingAdminTransfer));
+
+        if pending != new_admin {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+        if env.ledger().timestamp() < eta {
+            panic_with_error!(&env, Error::TimelockNotElapsed);
+        }
         new_admin.require_auth();
 
         env.storage().instance().set(&DataKey::Admin, &new_admin);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
 
         env.events()
             .publish((Symbol::new(&env, "admin_transferred"),), new_admin);
@@ -548,21 +604,26 @@ impl IntentSettlement {
 
     // ── Destination Token Allowlist ───────────────────────────────────────────
 
-    /// Admin-only: allow a dst_token to be targeted by new intents.
-    /// submit_intent had no validation on dst_token at all -- any address,
-    /// including a bogus or malicious "token" contract, could be named as
-    /// the destination.
+    /// Admin-only: propose allowing a dst_token to be targeted by new
+    /// intents. submit_intent had no validation on dst_token at all --
+    /// any address, including a bogus or malicious "token" contract, could
+    /// be named as the destination.
     ///
-    /// Before storing the allowance we call `decimals()` on the candidate
-    /// address as a lightweight SEP-41 interface probe (issue #33). If the
-    /// address doesn't implement the token interface the call traps and the
-    /// transaction reverts, surfacing the error at admin time rather than
-    /// silently allowing a non-token that would only fail later inside
-    /// fill_intent's transfer call.
+    /// We call `decimals()` on the candidate address as a lightweight SEP-41
+    /// interface probe (issue #33) at proposal time. If the address doesn't
+    /// implement the token interface the call traps and the transaction
+    /// reverts, surfacing the error at admin time rather than silently
+    /// storing a proposal that would only fail later.
+    ///
+    /// This only records the proposal and fires a `dst_token_add_proposed`
+    /// event for off-chain monitors (#116); the token isn't actually
+    /// allowed until `execute_add_dst_token` is called after the timelock
+    /// delay has elapsed (#115, #118), giving users and solvers a window to
+    /// notice and react before the allowlist changes.
     ///
     /// Note: `decimals()` is a read-only view, so this probe has no side
     /// effects on the token's state.
-    pub fn add_allowed_dst_token(env: Env, token: Address) {
+    pub fn propose_add_dst_token(env: Env, token: Address) {
         Self::require_admin(&env);
 
         // Probe the SEP-41 interface: if `token` isn't a real token contract
@@ -571,18 +632,82 @@ impl IntentSettlement {
         // decimals() is a pure view with no side-effects; we discard the value.
         let _decimals = token_client.decimals();
 
+        let eta = env.ledger().timestamp() + ADMIN_TIMELOCK_DELAY;
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingDstTokenAdd(token.clone()), &eta);
+
+        env.events().publish(
+            (Symbol::new(&env, "dst_token_add_proposed"),),
+            (token, eta),
+        );
+    }
+
+    /// Apply a previously proposed `propose_add_dst_token` once its timelock
+    /// delay has elapsed. Callable by anyone -- the change was already
+    /// authorized by the admin at proposal time, so there's nothing left to
+    /// gate once the delay has passed.
+    pub fn execute_add_dst_token(env: Env, token: Address) {
+        let eta: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingDstTokenAdd(token.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoPendingDstTokenChange));
+        if env.ledger().timestamp() < eta {
+            panic_with_error!(&env, Error::TimelockNotElapsed);
+        }
+
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingDstTokenAdd(token.clone()));
         env.storage()
             .instance()
             .set(&DataKey::AllowedDstToken(token.clone()), &true);
+        Self::add_to_dst_token_list(&env, &token);
+
         env.events()
             .publish((Symbol::new(&env, "dst_token_allowed"),), token);
     }
 
-    pub fn remove_allowed_dst_token(env: Env, token: Address) {
+    /// Admin-only: propose disallowing a dst_token. Fires a
+    /// `dst_token_remove_proposed` event immediately (#116); the token stays
+    /// allowed until `execute_remove_dst_token` is called after the timelock
+    /// delay elapses (#115).
+    pub fn propose_remove_dst_token(env: Env, token: Address) {
         Self::require_admin(&env);
+
+        let eta = env.ledger().timestamp() + ADMIN_TIMELOCK_DELAY;
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingDstTokenRemove(token.clone()), &eta);
+
+        env.events().publish(
+            (Symbol::new(&env, "dst_token_remove_proposed"),),
+            (token, eta),
+        );
+    }
+
+    /// Apply a previously proposed `propose_remove_dst_token` once its
+    /// timelock delay has elapsed. Callable by anyone, for the same reason
+    /// as `execute_add_dst_token`.
+    pub fn execute_remove_dst_token(env: Env, token: Address) {
+        let eta: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingDstTokenRemove(token.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoPendingDstTokenChange));
+        if env.ledger().timestamp() < eta {
+            panic_with_error!(&env, Error::TimelockNotElapsed);
+        }
+
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingDstTokenRemove(token.clone()));
         env.storage()
             .instance()
             .remove(&DataKey::AllowedDstToken(token.clone()));
+        Self::remove_from_dst_token_list(&env, &token);
+
         env.events()
             .publish((Symbol::new(&env, "dst_token_disallowed"),), token);
     }
@@ -618,6 +743,18 @@ impl IntentSettlement {
             .unwrap_or(false)
     }
 
+    /// List every dst_token currently present in the allowlist (#117).
+    /// `is_dst_token_allowed` only answers one-token-at-a-time queries; this
+    /// gives integrators and auditors a complete picture without replaying
+    /// every `dst_token_allowed` / `dst_token_disallowed` event. Returns an
+    /// empty `Vec` if nothing has ever been allowed.
+    pub fn list_allowed_dst_tokens(env: Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::AllowedDstTokenList)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
     // ── Per-Token Bond Multiplier ──────────────────────────────────────────────
 
     /// Admin-only: set a custom bond multiplier for a dst_token.
@@ -643,30 +780,9 @@ impl IntentSettlement {
             .persistent()
             .get(&DataKey::MinBondMultiplier(token))
             .unwrap_or(10)
+    }
+
     // ── Source Chain Allowlist ────────────────────────────────────────────────
-get_tiered_fee_bps is only called from fund_c_address (1320), reveal_fund (4164), fund_c_address_with_swap (4325), and execute_meta_fund (4498). batch_fund_c_address (1445) and fund_c_address_with_referral (2079) both compute the fee directly from the flat global rate via get_effective_fee_bps, never consulting the caller's volume tier — meaning the tiered-fee feature is silently bypassed on 2 of the bridge's 7 funding entry points.
-
-What needs to be done
- Route batch_fund_c_address and fund_c_address_with_referral through get_tiered_fee_bps the same way the other four funding paths do
- Add test_batch_fund_applies_tiered_fee and test_referral_fund_applies_tiered_fee
-Files to change
-contracts/onboarding-bridge/src/lib.rs
-Difficulty
-Medium
-
-Getting started
-This is a self-contained task — no additional repo access or secrets needed.
-
-git clone https://github.com/<your-fork>/C-Address-Onboarding-Bridge--Contract.git
-cd C-Address-Onboarding-Bridge--Contract
-rustup target add wasm32-unknown-unknown
-cargo test -p onboarding-bridge --features testutils
-Submitting your PR
-When you open your pull request, include Closes #123 in the PR description (using this issue's actual number in place of 123). This links the PR to the issue and closes it automatically on merge.
-
-Please follow this repo's Conventional Commits format for your commit messages (e.g. fix(contract): ..., test(sdk): ..., docs: ...).
-
-
 
     /// Admin-only: add a chain name to the src_chain allowlist.
     ///
@@ -1809,7 +1925,10 @@ Please follow this repo's Conventional Commits format for your commit messages (
         env.storage().instance().get(&DataKey::FeeRecipient)
     }
 
-    pub fn get_pending_fee_recipient(env: Env) -> Option<Address> {
+    /// Pending fee-recipient proposal, if any: `(new_fee_recipient, eta)`
+    /// where `eta` is the ledger timestamp at which `accept_fee_recipient`
+    /// may execute it.
+    pub fn get_pending_fee_recipient(env: Env) -> Option<(Address, u64)> {
         env.storage().instance().get(&DataKey::PendingFeeRecipient)
     }
 
@@ -1875,6 +1994,8 @@ Please follow this repo's Conventional Commits format for your commit messages (
             .persistent()
             .get(&DataKey::UserIntents(user))
             .unwrap_or_else(|| Vec::new(&env))
+    }
+
     /// Total number of solvers ever registered.
     pub fn get_solver_count(env: Env) -> u32 {
         env.storage()
@@ -2073,6 +2194,47 @@ Please follow this repo's Conventional Commits format for your commit messages (
         }
     }
 
+    /// Add `token` to the enumerable allowlist (#117), if not already present.
+    fn add_to_dst_token_list(env: &Env, token: &Address) {
+        let mut list: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AllowedDstTokenList)
+            .unwrap_or_else(|| Vec::new(env));
+        let mut already_present = false;
+        for i in 0..list.len() {
+            if list.get(i).unwrap() == *token {
+                already_present = true;
+                break;
+            }
+        }
+        if !already_present {
+            list.push_back(token.clone());
+            env.storage()
+                .instance()
+                .set(&DataKey::AllowedDstTokenList, &list);
+        }
+    }
+
+    /// Remove `token` from the enumerable allowlist (#117), if present.
+    fn remove_from_dst_token_list(env: &Env, token: &Address) {
+        let list: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AllowedDstTokenList)
+            .unwrap_or_else(|| Vec::new(env));
+        let mut new_list: Vec<Address> = Vec::new(env);
+        for i in 0..list.len() {
+            let item = list.get(i).unwrap();
+            if item != *token {
+                new_list.push_back(item);
+            }
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::AllowedDstTokenList, &new_list);
+    }
+
     fn get_adjusted_min_bond(env: &Env, dst_token: &Address) -> i128 {
         let multiplier = env
             .storage()
@@ -2080,6 +2242,8 @@ Please follow this repo's Conventional Commits format for your commit messages (
             .get::<_, i128>(&DataKey::MinBondMultiplier(dst_token.clone()))
             .unwrap_or(10);
         (MIN_BOND * multiplier) / 10
+    }
+
     /// Load the protocol config from storage, falling back to defaults for
     /// contracts that pre-date this upgrade (upgrade-safe).
     fn load_config(env: &Env) -> ProtocolConfig {

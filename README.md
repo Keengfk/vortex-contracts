@@ -26,9 +26,11 @@ Core protocol logic (`intent_settlement/src/lib.rs`):
 - `expire_intent()` — permissionless: materializes an unfilled intent's expiry
 - `slash_solver()` — permissionless: slashes a solver that failed to fill
 - `register_solver()` / `deregister_solver()` / `withdraw_bond()` — solver bond management
-- `set_fee_recipient()` / `transfer_admin()` — admin key management
+- `propose_fee_recipient()` / `accept_fee_recipient()` — timelocked fee-recipient handover (#115, #116)
+- `propose_admin_transfer()` / `accept_admin_transfer()` — timelocked admin-key handover (#115, #116)
 - `pause()` / `unpause()` — admin-only incident response
-- `add_allowed_dst_token()` / `remove_allowed_dst_token()` / `set_dst_allowlist_enabled()` — optional dst_token allowlist
+- `propose_add_dst_token()` / `execute_add_dst_token()` / `propose_remove_dst_token()` / `execute_remove_dst_token()` / `set_dst_allowlist_enabled()` — timelocked dst_token allowlist changes (#115, #116, #118)
+- `list_allowed_dst_tokens()` — enumerate the full current dst_token allowlist (#117)
 - `add_allowed_src_chain()` / `remove_allowed_src_chain()` / `set_src_chain_allowlist_enabled()` — optional src_chain allowlist (#34)
 - `rescue_tokens()` — admin-only recovery of non-bond tokens accidentally sent to the contract (#35)
 
@@ -186,12 +188,15 @@ the exact condition that triggers it.
 | 13 | `ZeroAmount` | `submit_intent`, `register_solver`, `withdraw_bond` | `src_amount ≤ 0`, `min_dst_amount ≤ 0`, or `bond_amount ≤ 0` |
 | 14 | `InvalidDeadline` | `submit_intent` | Supplied `deadline ≤ env.ledger().timestamp()` |
 | 15 | `IntentAlreadyFilled` | `fill_intent` | Intent state is `Filled` |
-| 16 | `NotInitialized` | `set_fee_recipient`, `transfer_admin`, `require_admin` | `DataKey::Admin` absent (contract not initialized) |
+| 16 | `NotInitialized` | `propose_fee_recipient`, `propose_admin_transfer`, `require_admin` | `DataKey::Admin` absent (contract not initialized) |
 | 17 | `SolverHasActiveIntents` | `deregister_solver` | `solver_record.active_intents > 0` |
 | 18 | `ContractPaused` | `submit_intent`, `accept_intent`, `fill_intent` (via `require_not_paused`) | `DataKey::Paused` is `true` |
 | 19 | `DeadlineNotReached` | `expire_intent` | `now < intent.deadline` |
 | 20 | `InsufficientBond` | `withdraw_bond` | Requested withdrawal `amount > solver_record.bond_amount` |
 | 21 | `DstTokenNotAllowed` | `submit_intent` | `DstAllowlistEnabled` is `true` and `dst_token` is not in the `AllowedDstToken` list |
+| 25 | `TimelockNotElapsed` | `accept_fee_recipient`, `accept_admin_transfer`, `execute_add_dst_token`, `execute_remove_dst_token` | Called before the `#115` timelock delay since the matching `propose_*` call has elapsed |
+| 26 | `NoPendingAdminTransfer` | `accept_admin_transfer` | No prior `propose_admin_transfer` on record |
+| 27 | `NoPendingDstTokenChange` | `execute_add_dst_token`, `execute_remove_dst_token` | No matching pending proposal for the given token |
 
 ---
 
@@ -364,9 +369,13 @@ solver bond management functions (`register_solver`, `deregister_solver`,
 meaning `submit_intent` accepts any `dst_token` address until an admin opts in.
 
 **Pre-launch action required:** before going live on mainnet, call
-`add_allowed_dst_token()` for every supported output token, then call
+`propose_add_dst_token()` for every supported output token, wait out the
+timelock delay (#115), then call `execute_add_dst_token()` followed by
 `set_dst_allowlist_enabled(true)` to enforce validation. This prevents users
-from accidentally targeting an unsupported or malicious token contract.
+from accidentally targeting an unsupported or malicious token contract, and
+gives them a window to notice the allowlist change before it takes effect.
+Call `list_allowed_dst_tokens()` at any time to see the full current
+allowlist (#117).
 
 The same pattern applies to the **source-chain allowlist** (`is_src_chain_allowlist_enabled`,
 also off by default). Call `add_allowed_src_chain()` for every supported source
