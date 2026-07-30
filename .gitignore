@@ -37,3 +37,7 @@ identity/
 
 # OS
 Thumbs.db
+
+# Testnet deployment — contains secret keys, never commit
+deploy-testnet.env
+.last-deploy-testnet

@@ -122,6 +122,16 @@ pub enum DataKey {
     UserNonce(Address),       // per-user submit counter to widen intent_id preimage
     AllowedSrcChain(String), // src_chain name -> present if allowed
     SrcChainAllowlistEnabled,
+
+    /// **Instance storage.** The `Address` authorized to call `pause` in
+    /// addition to `Admin` (issue #120). Lets an operator hand a hot key to
+    /// an incident-response process without exposing the admin key that
+    /// also controls fee routing and admin transfer. Absent until the admin
+    /// calls `set_pauser`, in which case `pause` remains admin-only.
+    /// `unpause` is intentionally *not* reachable via this role (narrow
+    /// unpause access) -- resuming the protocol always needs the full
+    /// admin's judgment.
+    Pauser,
 }
 
 // ─── Data Structs ─────────────────────────────────────────────────────────────
@@ -575,11 +585,18 @@ impl IntentSettlement {
     /// Off by default -- an admin opts in once they've populated the list
     /// via add_allowed_dst_token, rather than every intent submission
     /// suddenly requiring one.
+    ///
+    /// Issue #119: emits an event like every other admin toggle in this
+    /// contract (pause/unpause, fee_recipient_updated, admin_transferred),
+    /// so off-chain indexers can observe enforcement flips without polling
+    /// `is_dst_allowlist_enabled`.
     pub fn set_dst_allowlist_enabled(env: Env, enabled: bool) {
         Self::require_admin(&env);
         env.storage()
             .instance()
             .set(&DataKey::DstAllowlistEnabled, &enabled);
+        env.events()
+            .publish((Symbol::new(&env, "dst_allowlist_enabled"),), enabled);
     }
 
     pub fn is_dst_allowlist_enabled(env: Env) -> bool {
@@ -695,10 +712,29 @@ Please follow this repo's Conventional Commits format for your commit messages (
 
     // ── Pause Control ─────────────────────────────────────────────────────────
 
-    /// Admin-only: halt new intent submission, acceptance, and fills for
-    /// incident response. slash_solver stays permissionless throughout, so a
-    /// solver already holding an Accepted intent can't dodge accountability
-    /// by waiting out the pause.
+    /// Admin-only: designate (or rotate) the address that may call `pause`
+    /// in addition to the admin (issue #120). This lets incident response
+    /// use a narrower-scoped hot key instead of the full admin key, which
+    /// also controls fee routing and admin transfer. Calling this again
+    /// with a new address replaces the previous pauser; there is no way to
+    /// clear it back to "admin-only" other than pointing it at the admin's
+    /// own address.
+    pub fn set_pauser(env: Env, pauser: Address) {
+        Self::require_admin(&env);
+        env.storage().instance().set(&DataKey::Pauser, &pauser);
+        env.events()
+            .publish((Symbol::new(&env, "pauser_updated"),), pauser);
+    }
+
+    /// The current pauser address, if the admin has set one.
+    pub fn get_pauser(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Pauser)
+    }
+
+    /// Admin- or pauser-only: halt new intent submission, acceptance, and
+    /// fills for incident response. slash_solver stays permissionless
+    /// throughout, so a solver already holding an Accepted intent can't
+    /// dodge accountability by waiting out the pause.
     ///
     /// Issue #36 — pause scope decision: register_solver, deregister_solver,
     /// and withdraw_bond are also gated here. During a live incident an admin
@@ -707,13 +743,22 @@ Please follow this repo's Conventional Commits format for your commit messages (
     /// collateral exactly when the protocol most needs it as a backstop.
     /// cancel_intent is intentionally left open so users can always reclaim
     /// their Open intents.
-    pub fn pause(env: Env) {
-        Self::require_admin(&env);
+    ///
+    /// Issue #120 — `caller` must be either the admin or the address set via
+    /// `set_pauser`, so fast incident response doesn't require exposing the
+    /// full admin key.
+    pub fn pause(env: Env, caller: Address) {
+        Self::require_admin_or_pauser(&env, &caller);
         env.storage().instance().set(&DataKey::Paused, &true);
         env.events().publish((Symbol::new(&env, "paused"),), true);
     }
 
     /// Admin-only: lift a pause and restore normal operation.
+    ///
+    /// Issue #120 — deliberately narrower than `pause`: the pauser role can
+    /// freeze the protocol but cannot unfreeze it. Resuming money movement
+    /// after an incident always needs the full admin's judgment, not just
+    /// whoever holds the pause hot key.
     pub fn unpause(env: Env) {
         Self::require_admin(&env);
         env.storage().instance().set(&DataKey::Paused, &false);
@@ -1377,6 +1422,19 @@ Please follow this repo's Conventional Commits format for your commit messages (
         user.require_auth();
         Self::bump_instance_ttl(&env);
 
+        let now = env.ledger().timestamp();
+
+        // Check cancellation cooldown for spam-deterrence
+        if let Some(last_cancel_time) = env
+            .storage()
+            .persistent()
+            .get::<_, u64>(&DataKey::CancelCooldown(user.clone()))
+        {
+            if now < last_cancel_time + CANCEL_COOLDOWN {
+                panic_with_error!(&env, Error::CancelCooldownNotExpired);
+            }
+        }
+
         let mut intent: IntentRecord = env
             .storage()
             .persistent()
@@ -1410,6 +1468,10 @@ Please follow this repo's Conventional Commits format for your commit messages (
         env.storage()
             .instance()
             .set(&DataKey::OpenIntents, &open.saturating_sub(1));
+        // Update cancellation cooldown
+        env.storage()
+            .persistent()
+            .set(&DataKey::CancelCooldown(user.clone()), &now);
 
         env.events()
             .publish((Symbol::new(&env, "intent_cancelled"), user), intent_id);
@@ -1860,11 +1922,35 @@ Please follow this repo's Conventional Commits format for your commit messages (
             .get(&DataKey::Admin)
             .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
         // Auth audit: require_auth() is correct. All callers of require_admin
-        // are admin-only functions (pause, unpause, add/remove_allowed_dst_token,
-        // set_dst_allowlist_enabled). The admin is a single address with uniform
-        // authority over these functions; require_auth_for_args would add no
-        // meaningful scope reduction.
+        // are admin-only functions (unpause, set_pauser,
+        // add/remove_allowed_dst_token, set_dst_allowlist_enabled). The admin
+        // is a single address with uniform authority over these functions;
+        // require_auth_for_args would add no meaningful scope reduction.
         admin.require_auth();
+    }
+
+    /// Issue #120: `pause` accepts either the admin or the address set via
+    /// `set_pauser`. `caller` is an explicit argument (rather than looked up
+    /// implicitly, as `require_admin` does for the single-admin case)
+    /// because there are now two addresses that could legitimately be the
+    /// signer, so the contract needs to know which one is authorizing this
+    /// call before it can require that specific address's auth.
+    fn require_admin_or_pauser(env: &Env, caller: &Address) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
+        let is_pauser = env
+            .storage()
+            .instance()
+            .get::<_, Address>(&DataKey::Pauser)
+            .map(|pauser| pauser == *caller)
+            .unwrap_or(false);
+        if *caller != admin && !is_pauser {
+            panic_with_error!(env, Error::Unauthorized);
+        }
+        caller.require_auth();
     }
 
     fn require_not_paused(env: &Env) {

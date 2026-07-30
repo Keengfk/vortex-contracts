@@ -3,6 +3,7 @@
 **Soroban smart contracts for [Vortex Protocol](https://github.com/vortex-protocol) — intent-based cross-chain swaps settled on Stellar.**
 
 [![CI](https://github.com/vortex-protocol/vortex-contract/actions/workflows/ci.yml/badge.svg)](https://github.com/vortex-protocol/vortex-contract/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/vortex-protocol/vortex-contracts/branch/main/graph/badge.svg)](https://codecov.io/gh/vortex-protocol/vortex-contracts)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
 
 This repository holds the on-chain logic that guarantees settlement: intent
@@ -36,6 +37,10 @@ Core protocol logic (`intent_settlement/src/lib.rs`):
 All examples use the [Stellar CLI](https://developers.stellar.org/docs/tools/developer-tools/cli/stellar-cli)
 against a deployed contract. Swap `<CONTRACT_ID>` and `<SECRET_KEY>` for your
 deployment; addresses shown are placeholders.
+
+For a complete guide on building an off-chain solver bot (event subscription,
+eligibility checks, accept/fill flow), see
+[`docs/solver-integration-guide.md`](./docs/solver-integration-guide.md).
 
 ```bash
 # User submits a swap intent: 1 ETH on Ethereum for at least 3500 USDC on Stellar
@@ -140,6 +145,32 @@ Tiered solver staking with reputation scores. See the roadmap below.
 
 - Rust 1.78+ with the `wasm32-unknown-unknown` target
 - [Stellar CLI](https://developers.stellar.org/docs/tools/developer-tools/cli/stellar-cli)
+- [GNU Make](https://www.gnu.org/software/make/) or [`just`](https://just.systems/) (optional shortcuts)
+
+### Shortcut commands (recommended)
+
+A `Makefile` and `justfile` are provided at the repo root so you can run the
+full pre-push check with a single command:
+
+```bash
+make all          # fmt + lint + test + build
+# or, with just:
+just all
+```
+
+Individual targets:
+
+```bash
+make fmt          # cargo fmt --all
+make lint         # cargo clippy --all-targets -- -D warnings
+make test         # cargo test
+make build        # cargo build --target wasm32-unknown-unknown --release
+make help         # list all targets
+```
+
+### Raw commands
+
+If you prefer to run commands directly (or don't have Make/just installed):
 
 ```bash
 cd intent_settlement
@@ -151,12 +182,64 @@ stellar contract build
 
 ### Deploy (testnet)
 
+Using the Makefile shortcut:
+
+```bash
+export STELLAR_SOURCE=<SECRET_KEY>
+make deploy-testnet
+# or:
+just deploy-testnet STELLAR_SOURCE=<SECRET_KEY>
+```
+
+Or run the raw command directly:
+#### Automated (recommended)
+
+A config-driven script handles the build, deploy, and `initialize()` call in
+one step, reducing copy-paste errors across repeated deployments.
+
+```bash
+# 1. Create your config file (only needs to be done once)
+cp deploy-testnet.env.example deploy-testnet.env
+$EDITOR deploy-testnet.env          # fill in admin, fee_recipient, bond_token, secret key
+
+# 2. Deploy + initialize
+./deploy-testnet.sh
+
+# 3. Skip the build if the wasm is already built
+./deploy-testnet.sh --skip-build
+```
+
+The script saves the deployed contract ID to `.last-deploy-testnet` for
+reference. See `deploy-testnet.env.example` for all available options.
+
+#### Manual
+
 ```bash
 stellar contract deploy \
-  --wasm target/wasm32-unknown-unknown/release/vortex_intent_settlement.wasm \
+  --wasm intent_settlement/target/wasm32-unknown-unknown/release/vortex_intent_settlement.wasm \
   --source <SECRET_KEY> \
   --network testnet
 ```
+
+For a step-by-step mainnet promotion checklist (initialize parameters, bond
+token verification, post-deploy sanity checks, rollback procedures), see
+[`docs/mainnet-deployment-runbook.md`](./docs/mainnet-deployment-runbook.md).
+### Reproducible build verification
+
+Independently verify that your local build matches a deployed contract's
+on-chain binary (supply-chain integrity check):
+
+```bash
+# Print the SHA-256 of the locally-built wasm
+./verify-build.sh
+
+# Compare against a deployed contract
+./verify-build.sh <CONTRACT_ID>
+```
+
+The script pins the Rust toolchain version, cleans prior artifacts, and
+rebuilds with `--locked` to ensure a deterministic output. See comments
+inside `verify-build.sh` for the full list of reproducibility settings.
 
 ---
 
@@ -207,6 +290,41 @@ For the detailed threat model specific to `intent_settlement`, see
 
 ---
 
+## Intent ID Derivation
+
+Off-chain solver tooling that needs to predict or verify intent IDs can use the
+exact preimage scheme documented here.
+
+**Intent ID is a SHA-256 hash of a collision-resistant preimage.** The preimage
+is built by concatenating (in order):
+
+1. **User Address** — XDR-encoded Stellar account address
+2. **Source Chain** — XDR-encoded string (e.g., `"ethereum"`, `"polygon"`)
+3. **Source Amount** — 8 bytes, big-endian i128 (two's complement signed integer)
+4. **Timestamp** — 8 bytes, big-endian u64 (unsigned integer, seconds since Unix epoch)
+
+**Hash function:** `SHA-256(preimage)` → 32-byte intent ID
+
+This scheme ensures two otherwise-identical intents from different users or chains
+never collide. See [`compute_intent_id()`](./intent_settlement/src/lib.rs#L889)
+for the reference implementation.
+
+### Example (pseudocode)
+
+```python
+import hashlib
+
+def compute_intent_id(user_address: str, src_chain: str, src_amount: int, timestamp: int) -> bytes:
+    preimage = b''
+    preimage += xdr_encode_address(user_address)
+    preimage += xdr_encode_string(src_chain)
+    preimage += src_amount.to_bytes(8, 'big', signed=True)
+    preimage += timestamp.to_bytes(8, 'big', signed=False)
+    return hashlib.sha256(preimage).digest()
+```
+
+---
+
 ## Roadmap
 
 - [x] **Contract test suite** — `soroban_sdk` testutils coverage for the full intent
@@ -219,8 +337,16 @@ For the detailed threat model specific to `intent_settlement`, see
 
 ## Contributing
 
-See the org-wide
+See the repo-specific [`CONTRIBUTING.md`](./CONTRIBUTING.md) for Rust/Soroban
+toolchain setup, test conventions, and PR requirements. For org-wide process,
+see the org-wide
 [CONTRIBUTING.md](https://github.com/vortex-protocol/.github/blob/main/CONTRIBUTING.md).
+See [CONTRIBUTING.md](./CONTRIBUTING.md) for contributor and maintainer
+guidelines, including local dev commands, the pre-push checklist, and the
+branch-protection / required-checks maintainer guide.
+
+For org-wide policies see the
+[org CONTRIBUTING.md](https://github.com/vortex-protocol/.github/blob/main/CONTRIBUTING.md).
 
 ## License
 
