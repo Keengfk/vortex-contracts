@@ -208,6 +208,41 @@ For the detailed threat model specific to `intent_settlement`, see
 
 ---
 
+## Intent ID Derivation
+
+Off-chain solver tooling that needs to predict or verify intent IDs can use the
+exact preimage scheme documented here.
+
+**Intent ID is a SHA-256 hash of a collision-resistant preimage.** The preimage
+is built by concatenating (in order):
+
+1. **User Address** — XDR-encoded Stellar account address
+2. **Source Chain** — XDR-encoded string (e.g., `"ethereum"`, `"polygon"`)
+3. **Source Amount** — 8 bytes, big-endian i128 (two's complement signed integer)
+4. **Timestamp** — 8 bytes, big-endian u64 (unsigned integer, seconds since Unix epoch)
+
+**Hash function:** `SHA-256(preimage)` → 32-byte intent ID
+
+This scheme ensures two otherwise-identical intents from different users or chains
+never collide. See [`compute_intent_id()`](./intent_settlement/src/lib.rs#L889)
+for the reference implementation.
+
+### Example (pseudocode)
+
+```python
+import hashlib
+
+def compute_intent_id(user_address: str, src_chain: str, src_amount: int, timestamp: int) -> bytes:
+    preimage = b''
+    preimage += xdr_encode_address(user_address)
+    preimage += xdr_encode_string(src_chain)
+    preimage += src_amount.to_bytes(8, 'big', signed=True)
+    preimage += timestamp.to_bytes(8, 'big', signed=False)
+    return hashlib.sha256(preimage).digest()
+```
+
+---
+
 ## Roadmap
 
 - [x] **Contract test suite** — `soroban_sdk` testutils coverage for the full intent
