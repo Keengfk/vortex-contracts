@@ -12,6 +12,21 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  fmt:
+    name: Formatting
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: intent_settlement
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
   contract:
     name: Contract (${{ matrix.toolchain }})
     runs-on: ubuntu-latest
@@ -32,6 +47,10 @@ jobs:
         with:
           toolchain: ${{ matrix.toolchain }}
           targets: wasm32-unknown-unknown
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: intent_settlement
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
@@ -54,8 +73,42 @@ jobs:
       - name: Test
         run: cargo test
 
+  wasm-size:
+    name: Wasm size budget
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: intent_settlement
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: intent_settlement
       - name: Build wasm
         run: cargo build --target wasm32-unknown-unknown --release
+      - name: Check wasm size
+        shell: bash
+        run: |
+          # Soroban network limit is 64 KB for a contract wasm binary.
+          # We budget at 90 % of that to leave headroom: 58 982 bytes.
+          MAX_BYTES=58982
+          WASM=$(ls target/wasm32-unknown-unknown/release/*.wasm | head -n1)
+          SIZE=$(wc -c < "$WASM")
+          echo "### Wasm size report" >> "$GITHUB_STEP_SUMMARY"
+          echo "| File | Size (bytes) | Budget (bytes) | Status |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| ---- | -----------: | -------------: | ------ |" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$SIZE" -le "$MAX_BYTES" ]; then
+            echo "| \`$(basename $WASM)\` | $SIZE | $MAX_BYTES | ✅ under budget |" >> "$GITHUB_STEP_SUMMARY"
+            echo "Wasm size OK: $SIZE bytes (limit $MAX_BYTES bytes)"
+          else
+            echo "| \`$(basename $WASM)\` | $SIZE | $MAX_BYTES | ❌ over budget |" >> "$GITHUB_STEP_SUMMARY"
+            echo "ERROR: Wasm size $SIZE bytes exceeds budget of $MAX_BYTES bytes." >&2
+            exit 1
+          fi
 
   proptest:
     name: Bond-conservation proptest
