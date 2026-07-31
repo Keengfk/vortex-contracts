@@ -1047,7 +1047,7 @@ impl IntentSettlement {
         }
 
         // ── Interaction: pull bond in ────────────────────────────────────────
-        let bond_token: Address = env.storage().instance().get(&DataKey::BondToken).unwrap();
+        let bond_token = Self::load_bond_token(&env);
         let client = token::Client::new(&env, &bond_token);
         client.transfer(&solver, &env.current_contract_address(), &bond_amount);
 
@@ -1097,7 +1097,7 @@ impl IntentSettlement {
 
         // ── Interaction: return bond ─────────────────────────────────────────
         if record.bond_amount > 0 {
-            let bond_token: Address = env.storage().instance().get(&DataKey::BondToken).unwrap();
+            let bond_token = Self::load_bond_token(&env);
             let client = token::Client::new(&env, &bond_token);
             client.transfer(
                 &env.current_contract_address(),
@@ -1150,7 +1150,7 @@ impl IntentSettlement {
             .set(&DataKey::Solver(solver.clone()), &record);
         Self::bump_solver_ttl(&env, &solver);
 
-        let bond_token: Address = env.storage().instance().get(&DataKey::BondToken).unwrap();
+        let bond_token = Self::load_bond_token(&env);
         let client = token::Client::new(&env, &bond_token);
         client.transfer(&env.current_contract_address(), &solver, &amount);
 
@@ -1729,7 +1729,7 @@ impl IntentSettlement {
 
         // Send slash to fee recipient (state already committed above)
         if slash_amount > 0 {
-            let bond_token: Address = env.storage().instance().get(&DataKey::BondToken).unwrap();
+            let bond_token = Self::load_bond_token(&env);
             let fee_recipient: Address = env
                 .storage()
                 .instance()
@@ -2329,6 +2329,13 @@ impl IntentSettlement {
                 intent_expiry: DEFAULT_INTENT_EXPIRY,
                 protocol_fee_bps: DEFAULT_PROTOCOL_FEE_BPS,
             })
+    }
+
+    fn load_bond_token(env: &Env) -> Address {
+        env.storage()
+            .instance()
+            .get(&DataKey::BondToken)
+            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized))
     }
 
     /// Returns `true` when bid-window mode is active (an admin has stored a
