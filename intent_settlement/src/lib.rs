@@ -17,6 +17,9 @@ mod test;
 #[cfg(test)]
 mod proptest_bond;
 
+#[cfg(test)]
+mod bench;
+
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const INTENT_EXPIRY: u64 = 1800; // 30 minutes
