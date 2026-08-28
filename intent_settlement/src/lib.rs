@@ -61,6 +61,56 @@ const PERSISTENT_TTL_EXTEND_TO: u32 = DAY_IN_LEDGERS * 30;
 const INSTANCE_TTL_THRESHOLD: u32 = DAY_IN_LEDGERS * 30;
 const INSTANCE_TTL_EXTEND_TO: u32 = DAY_IN_LEDGERS * 60;
 
+// ─── Default protocol parameters (#202) ──────────────────────────────────────
+//
+// `initialize` seeds `DataKey::Config` with these, and `load_config` falls
+// back to them for deployments that pre-date the configurable-params upgrade.
+// They are defined as aliases of the historical compile-time constants above
+// so moving to a stored `ProtocolConfig` changes no observable behaviour — a
+// freshly initialized contract behaves exactly as it did when the parameters
+// were hard-coded.
+const DEFAULT_MIN_BOND: i128 = MIN_BOND; // 50 USDC
+const DEFAULT_FILL_WINDOW: u64 = FILL_WINDOW; // 300 s
+const DEFAULT_INTENT_EXPIRY: u64 = INTENT_EXPIRY; // 1800 s
+const DEFAULT_PROTOCOL_FEE_BPS: i128 = PROTOCOL_FEE_BPS; // 5 bps (0.05%)
+
+// ─── `set_config` bounds (#202) ──────────────────────────────────────────────
+//
+// Guard rails enforced by `set_config` so an admin cannot move a parameter to
+// an economically unsafe value. Values match the bounds already documented in
+// `set_config`'s own doc comment.
+const MAX_PROTOCOL_FEE_BPS: i128 = 1_000; // 10% — hard ceiling on the protocol fee
+const MIN_FILL_WINDOW_SECS: u64 = 60; // a solver needs at least a minute to deliver a fill
+const MIN_INTENT_EXPIRY_SECS: u64 = 300; // an intent must stay live for at least five minutes
+const MIN_BOND_FLOOR: i128 = 10_000_000; // 1 USDC (7 decimals) — absolute floor for `min_bond`
+
+// ─── Cooldowns (#202) ────────────────────────────────────────────────────────
+
+/// Seconds a solver must wait after being slashed before `accept_intent` will
+/// let it take on a new intent. Long enough to blunt a griefing loop where a
+/// solver repeatedly accepts and abandons intents, short enough that an honest
+/// solver that hit one bad fill window recovers within the hour.
+const SLASH_COOLDOWN: u64 = 3_600; // 1 hour
+
+/// Minimum gap the same user must leave between `cancel_intent` calls. Deters
+/// cancel spam (e.g. submit → cancel loops used to grief solvers mid-quote)
+/// without getting in the way of a user correcting a single mistaken intent.
+const CANCEL_COOLDOWN: u64 = 60; // 1 minute
+
+// ─── Batch + extension limits (#202) ─────────────────────────────────────────
+
+/// Upper bound on the number of items any `batch_*` entrypoint processes in a
+/// single call. Keeps the worst-case resource cost (and therefore fee) of one
+/// transaction bounded regardless of caller input. 20 covers realistic solver
+/// batching while staying well inside Soroban's per-transaction limits.
+const MAX_BATCH_SIZE: u32 = 20;
+
+/// Longest additional time `request_extension` can add to an Accepted intent's
+/// deadline. One extension is allowed per intent; this is the same order of
+/// magnitude as `FILL_WINDOW` so a single extension can at most roughly double
+/// the solver's delivery window.
+const MAX_EXTENSION_DURATION: u64 = 300; // 5 minutes
+
 // ─── Storage Keys ─────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -82,9 +132,39 @@ pub enum DataKey {
     /// timestamp at which `accept_fee_recipient` may execute it (issue #30,
     /// timelock added by #115): `(Address, u64)`.
     PendingFeeRecipient,
+
+    /// **Instance storage.** Proposed-but-not-yet-accepted new admin plus the
+    /// ledger timestamp at which `accept_admin_transfer` may execute it
+    /// (#115/#116): `(Address, u64)`. Cleared once the handover completes.
+    PendingAdmin,
+
+    /// **Instance storage.** The stored `ProtocolConfig` (min bond, fill
+    /// window, intent expiry, protocol fee bps). Seeded by `initialize` and
+    /// replaced atomically by `set_config`. `load_config` falls back to the
+    /// `DEFAULT_*` constants when this key is absent (pre-upgrade safety).
+    Config,
+
     BondToken,          // USDC address for bonds
     Intent(BytesN<32>), // intent_id -> IntentRecord
     Solver(Address),    // address -> SolverRecord
+
+    /// **Persistent storage.** All currently-registered solver addresses
+    /// (`Vec<Address>`), kept in sync by `register_solver` (append if absent)
+    /// and `deregister_solver` (remove). Backs the paginated `list_solvers`
+    /// view (#198) so integrators can enumerate solvers without replaying
+    /// every `solver_registered` / `solver_deregistered` event. Mirror of the
+    /// `AllowedDstTokenList` pattern used for the dst_token allowlist (#117).
+    ///
+    /// Trade-off: maintaining this list costs one extra persistent read+write
+    /// on `register_solver` / `deregister_solver`, and the entry grows O(n)
+    /// with the registered-solver count. Registration already does a
+    /// persistent write and is not a hot path (unlike `accept_intent` /
+    /// `fill_intent`), and the paginated reader keeps any single `list_solvers`
+    /// call bounded, so the marginal cost is acceptable up to the low
+    /// thousands of solvers. If the set ever grows past that, this should move
+    /// to a chunked/paged storage layout.
+    SolverList,
+
     TotalIntents,
 
     /// **Instance storage.** Count of intents currently in `Open` or
@@ -131,9 +211,44 @@ pub enum DataKey {
     /// `submit_intent`, letting an admin pre-populate the list before
     /// switching enforcement on.
     DstAllowlistEnabled,
+
+    /// **Instance storage.** Enumerable mirror of the `AllowedDstToken`
+    /// presence flags (`Vec<Address>`), maintained by
+    /// `add_to_dst_token_list` / `remove_from_dst_token_list`. Backs
+    /// `list_allowed_dst_tokens` (#117).
+    AllowedDstTokenList,
+
+    /// **Persistent storage.** Per-`dst_token` bond multiplier (`i128`, where
+    /// `10` = 1.0×). Set by `set_min_bond_multiplier`; consulted by
+    /// `get_adjusted_min_bond` in `accept_intent`. Absent ⇒ 1.0×.
+    MinBondMultiplier(Address),
+
+    /// **Persistent storage.** All intent ids ever submitted by a given user
+    /// (`Vec<BytesN<32>>`), appended by `submit_intent`. Backs
+    /// `list_intents_by_user`.
+    UserIntents(Address),
+
+    /// **Persistent storage.** Ledger timestamp of a user's most recent
+    /// `cancel_intent` (`u64`). Enforces `CANCEL_COOLDOWN` between cancels.
+    CancelCooldown(Address),
+
+    /// **Persistent storage.** Presence flag (`true`) recording that an intent
+    /// has already used its single permitted `request_extension`.
+    ExtensionGranted(BytesN<32>),
+
     UserNonce(Address),       // per-user submit counter to widen intent_id preimage
     AllowedSrcChain(String), // src_chain name -> present if allowed
     SrcChainAllowlistEnabled,
+
+    /// **Instance storage.** Pending `propose_add_dst_token` proposal: maps a
+    /// candidate `dst_token` to the ledger timestamp (`u64`) at which
+    /// `execute_add_dst_token` may apply it (#118).
+    PendingDstTokenAdd(Address),
+
+    /// **Instance storage.** Pending `propose_remove_dst_token` proposal: maps
+    /// a `dst_token` to the ledger timestamp (`u64`) at which
+    /// `execute_remove_dst_token` may apply it (#118).
+    PendingDstTokenRemove(Address),
 
     /// **Instance storage.** The `Address` authorized to call `pause` in
     /// addition to `Admin` (issue #120). Lets an operator hand a hot key to
@@ -388,14 +503,19 @@ pub enum Error {
 
     /// Duplicate `intent_id` detected in `submit_intent` (hash collision guard).
     IntentAlreadyExists = 22,
-    /// #30: no pending fee-recipient proposal to accept
-    NoPendingFeeRecipient = 22,
     /// #31: fee arithmetic overflowed (fill_amount is astronomically large)
     FeeOverflow = 23,
-    /// #33: the address passed to add_allowed_dst_token doesn't implement SEP-41
+    /// #33: the address passed to `propose_add_dst_token` doesn't implement SEP-41
     InvalidTokenInterface = 24,
-    SrcChainNotAllowed = 22,
-    RescueProtectedToken = 23,
+    /// #30: `accept_fee_recipient` was called with no pending fee-recipient
+    /// proposal in storage.
+    NoPendingFeeRecipient = 25,
+    /// #34: `submit_intent` was called with a `src_chain` that is not on the
+    /// allowlist while `SrcChainAllowlistEnabled` is `true`.
+    SrcChainNotAllowed = 26,
+    /// #35: `rescue_tokens` was called for the bond token, which the rescue
+    /// path is not allowed to move.
+    RescueProtectedToken = 27,
     /// #127: `submit_intent` was called with a `src_token` whose format does
     /// not match the conventions of the declared `src_chain`.
     ///
@@ -408,6 +528,43 @@ pub enum Error {
     /// If `src_chain` is unknown this error is never raised — unknown chains
     /// bypass token-format validation so the allowlist remains the sole gate.
     InvalidSrcToken = 28,
+
+    /// #202: `submit_intent` was called with `src_amount` or `min_dst_amount`
+    /// greater than `MAX_AMOUNT` (the out-of-range guard for fat-fingered
+    /// inputs; distinct from `ZeroAmount` which catches non-positive values).
+    AmountTooLarge = 29,
+
+    /// #202: `set_config` was called with a parameter outside its allowed
+    /// bounds — `protocol_fee_bps` above `MAX_PROTOCOL_FEE_BPS`, `fill_window`
+    /// below `MIN_FILL_WINDOW_SECS`, `intent_expiry` below
+    /// `MIN_INTENT_EXPIRY_SECS` or not strictly greater than `fill_window`, or
+    /// `min_bond` below `MIN_BOND_FLOOR`.
+    InvalidConfig = 30,
+
+    /// #115/#116: a timelocked admin action (`accept_fee_recipient`,
+    /// `accept_admin_transfer`, `execute_add_dst_token`,
+    /// `execute_remove_dst_token`) was executed before its ETA.
+    TimelockNotElapsed = 31,
+
+    /// #115: `accept_admin_transfer` was called with no pending admin-transfer
+    /// proposal in storage.
+    NoPendingAdminTransfer = 32,
+
+    /// #118: `execute_add_dst_token` / `execute_remove_dst_token` was called
+    /// with no matching pending proposal in storage.
+    NoPendingDstTokenChange = 33,
+
+    /// Spam-deterrence: `cancel_intent` was called again by the same user
+    /// before `CANCEL_COOLDOWN` seconds had elapsed since their last cancel.
+    CancelCooldownNotExpired = 34,
+
+    /// A `batch_*` entrypoint was handed more than `MAX_BATCH_SIZE` items. The
+    /// guard fires before any state change, so the whole call is a no-op.
+    BatchTooLarge = 35,
+
+    /// `request_extension` was called on an intent that has already used its
+    /// one permitted fill-window extension.
+    ExtensionAlreadyGranted = 36,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -1458,25 +1615,11 @@ impl IntentSettlement {
             panic_with_error!(&env, Error::ZeroAmount);
         }
 
-        // Deliver this fill's tokens to the user.
-        let dst_client = token::Client::new(&env, &intent.dst_token);
-        dst_client.transfer(&solver, &intent.user, &fill_amount);
-
-        // Solver also pays the protocol fee on each fill.
-        let fee = fill_amount * PROTOCOL_FEE_BPS / 10_000;
-        // ── Effects first (CEI) ──────────────────────────────────────────────
-        // Mark the intent Filled and write every state change to storage
-        // *before* any external token transfer executes. A hostile SEP-41
-        // token that attempts to re-enter fill_intent or slash_solver during
-        // the transfer would see the intent already Filled and be rejected.
-        // Solver delivers the full requested output to the user.
-        let dst_client = token::Client::new(&env, &intent.dst_token);
-        dst_client.transfer(&solver, &intent.user, &fill_amount);
-
-        // Solver also pays the protocol fee (priced into their quote). Taking the
-        // fee from the solver — rather than clawing it back from the user — keeps
-        // the user's received amount at or above `min_dst_amount`, and keeps every
-        // token transfer authorized by the solver who signed this call.
+        // Solver also pays the protocol fee (priced into their quote) on each
+        // fill. Taking the fee from the solver — rather than clawing it back
+        // from the user — keeps the user's received amount at or above
+        // `min_dst_amount`, and keeps every token transfer authorized by the
+        // solver who signed this call.
         //
         // Explicit checked_mul/checked_div makes the overflow-safety property
         // visible in code, rather than relying solely on the Cargo.toml
@@ -1486,14 +1629,13 @@ impl IntentSettlement {
             .unwrap_or_else(|| panic_with_error!(&env, Error::FeeOverflow))
             .checked_div(10_000)
             .unwrap_or_else(|| panic_with_error!(&env, Error::FeeOverflow));
-        if fee > 0 {
-            let fee_recipient: Address = env
-                .storage()
-                .instance()
-                .get(&DataKey::FeeRecipient)
-                .unwrap();
-            dst_client.transfer(&solver, &fee_recipient, &fee);
-        }
+
+        // ── Effects first (CEI) ──────────────────────────────────────────────
+        // Every state change below is written to storage *before* the token
+        // transfers at the end of this function. A hostile SEP-41 token that
+        // tries to re-enter `fill_intent` / `slash_solver` during a transfer
+        // sees the already-committed state (intent Filled, or re-opened with
+        // no assigned solver) and is rejected by the guards above.
 
         // Accumulate the fill.
         intent.total_filled += fill_amount;
@@ -1558,16 +1700,12 @@ impl IntentSettlement {
             .set(&DataKey::Intent(intent_id.clone()), &intent);
         Self::bump_intent_ttl(&env, &intent_id);
 
-        // ── Interactions: token transfers ────────────────────────────────────
-        // Solver delivers the full requested output to the user.
+        // ── Interactions: token transfers (state already committed above) ────
+        // Solver delivers this fill's output to the user, then separately pays
+        // the protocol fee. Each transfer happens exactly once.
         let dst_client = token::Client::new(&env, &intent.dst_token);
         dst_client.transfer(&solver, &intent.user, &fill_amount);
 
-        // Solver also pays the protocol fee (priced into their quote). Taking the
-        // fee from the solver — rather than clawing it back from the user — keeps
-        // the user's received amount at or above `min_dst_amount`, and keeps every
-        // token transfer authorized by the solver who signed this call.
-        let fee = fill_amount * PROTOCOL_FEE_BPS / 10_000;
         if fee > 0 {
             let fee_recipient: Address = env
                 .storage()
@@ -1583,7 +1721,8 @@ impl IntentSettlement {
         );
     }
 
-    /// User can cancel an Open intent (not yet accepted)
+    /// User can cancel an Open (or PartiallyFilled) intent that no solver
+    /// currently holds. Rate-limited per user by `CANCEL_COOLDOWN`.
     pub fn cancel_intent(env: Env, user: Address, intent_id: BytesN<32>) {
         // Auth audit: require_auth() is correct. Only the intent owner may
         // cancel. An additional ownership check (`intent.user != user`) follows
@@ -1594,41 +1733,61 @@ impl IntentSettlement {
         Self::bump_instance_ttl(&env);
 
         let now = env.ledger().timestamp();
+        Self::check_cancel_cooldown(&env, &user, now);
+        Self::cancel_intent_core(&env, &user, &intent_id);
+        Self::stamp_cancel_cooldown(&env, &user, now);
+    }
 
-        // Check cancellation cooldown for spam-deterrence
+    /// Spam-deterrence gate shared by `cancel_intent` and `batch_cancel_intent`:
+    /// panics if `user` cancelled within the last `CANCEL_COOLDOWN` seconds.
+    fn check_cancel_cooldown(env: &Env, user: &Address, now: u64) {
         if let Some(last_cancel_time) = env
             .storage()
             .persistent()
             .get::<_, u64>(&DataKey::CancelCooldown(user.clone()))
         {
             if now < last_cancel_time + CANCEL_COOLDOWN {
-                panic_with_error!(&env, Error::CancelCooldownNotExpired);
+                panic_with_error!(env, Error::CancelCooldownNotExpired);
             }
         }
+    }
 
+    /// Records `now` as `user`'s most recent cancel, starting a fresh cooldown.
+    /// A `batch_cancel_intent` call stamps this once for the whole batch, so a
+    /// batch counts as a single cancel action for rate-limiting.
+    fn stamp_cancel_cooldown(env: &Env, user: &Address, now: u64) {
+        env.storage()
+            .persistent()
+            .set(&DataKey::CancelCooldown(user.clone()), &now);
+    }
+
+    /// The actual cancellation: ownership + state checks, flip to `Cancelled`,
+    /// decrement `OpenIntents`, emit `intent_cancelled`. No cooldown handling —
+    /// callers gate that around one or more invocations.
+    fn cancel_intent_core(env: &Env, user: &Address, intent_id: &BytesN<32>) {
         let mut intent: IntentRecord = env
             .storage()
             .persistent()
             .get(&DataKey::Intent(intent_id.clone()))
-            .unwrap_or_else(|| panic_with_error!(&env, Error::IntentNotFound));
+            .unwrap_or_else(|| panic_with_error!(env, Error::IntentNotFound));
 
-        if intent.user != user {
-            panic_with_error!(&env, Error::Unauthorized);
+        if intent.user != *user {
+            panic_with_error!(env, Error::Unauthorized);
         }
 
         if intent.state == IntentState::Accepted {
-            panic_with_error!(&env, Error::CannotCancelAccepted);
+            panic_with_error!(env, Error::CannotCancelAccepted);
         }
 
         if intent.state != IntentState::Open && intent.state != IntentState::PartiallyFilled {
-            panic_with_error!(&env, Error::IntentNotOpen);
+            panic_with_error!(env, Error::IntentNotOpen);
         }
 
         intent.state = IntentState::Cancelled;
         env.storage()
             .persistent()
             .set(&DataKey::Intent(intent_id.clone()), &intent);
-        Self::bump_intent_ttl(&env, &intent_id);
+        Self::bump_intent_ttl(env, intent_id);
 
         // Decrement open_intents: intent is no longer open.
         let open: u64 = env
@@ -1639,13 +1798,11 @@ impl IntentSettlement {
         env.storage()
             .instance()
             .set(&DataKey::OpenIntents, &open.saturating_sub(1));
-        // Update cancellation cooldown
-        env.storage()
-            .persistent()
-            .set(&DataKey::CancelCooldown(user.clone()), &now);
 
-        env.events()
-            .publish((Symbol::new(&env, "intent_cancelled"), user), intent_id);
+        env.events().publish(
+            (Symbol::new(env, "intent_cancelled"), user.clone()),
+            intent_id.clone(),
+        );
     }
 
     /// Permissionless: slash a solver that accepted but didn't fill within FILL_WINDOW
@@ -1796,18 +1953,30 @@ impl IntentSettlement {
     }
 
     // ── Batch Operations ──────────────────────────────────────────────────────
+    //
+    // Each `batch_*` entrypoint is a thin loop over the corresponding
+    // single-item entrypoint. They exist purely to amortise per-transaction
+    // overhead for solvers and users that operate on many intents at once.
+    //
+    // Atomicity: a batch is one Soroban transaction, so a failure on any item
+    // reverts every earlier item in the same call — there is no partial
+    // success. Callers that want per-item isolation must send separate
+    // transactions.
+    //
+    // Resource bound: every batch is capped at `MAX_BATCH_SIZE` items, checked
+    // up front so an over-sized batch panics with `BatchTooLarge` before any
+    // state change or token movement.
 
-    /// Submit multiple intents in a single transaction.
-    /// Processes all intents in the batch; a failure partway through will
-    /// revert the entire batch (Soroban transaction atomicity).
-    /// Bounded by MAX_BATCH_SIZE to prevent resource exhaustion.
+    /// Submit multiple intents in a single transaction. Returns the new intent
+    /// ids in input order. Reverts the whole batch on any failure; capped at
+    /// `MAX_BATCH_SIZE`.
     pub fn batch_submit_intent(
         env: Env,
         user: Address,
         intents: soroban_sdk::Vec<(String, String, i128, Address, i128, Option<u64>)>,
     ) -> soroban_sdk::Vec<BytesN<32>> {
-        if intents.len() > MAX_BATCH_SIZE as usize {
-            panic_with_error!(&env, Error::ZeroAmount); // No dedicated error; reuse nearest
+        if intents.len() > MAX_BATCH_SIZE {
+            panic_with_error!(&env, Error::BatchTooLarge);
         }
 
         let mut result = soroban_sdk::Vec::new(&env);
@@ -1827,22 +1996,64 @@ impl IntentSettlement {
         result
     }
 
-    /// Accept multiple intents in a single transaction.
-    /// Processes all intents in the batch; a failure partway through will
-    /// revert the entire batch (Soroban transaction atomicity).
-    /// Bounded by MAX_BATCH_SIZE to prevent resource exhaustion.
-    pub fn batch_accept_intent(
-        env: Env,
-        solver: Address,
-        intent_ids: soroban_sdk::Vec<BytesN<32>>,
-    ) {
-        if intent_ids.len() > MAX_BATCH_SIZE as usize {
-            panic_with_error!(&env, Error::ZeroAmount); // No dedicated error; reuse nearest
+    /// Accept multiple intents in a single transaction. Reverts the whole
+    /// batch on any failure; capped at `MAX_BATCH_SIZE`.
+    pub fn batch_accept_intent(env: Env, solver: Address, intent_ids: soroban_sdk::Vec<BytesN<32>>) {
+        if intent_ids.len() > MAX_BATCH_SIZE {
+            panic_with_error!(&env, Error::BatchTooLarge);
         }
 
         for intent_id in intent_ids {
             Self::accept_intent(env.clone(), solver.clone(), intent_id);
         }
+    }
+
+    /// Fill multiple intents in a single transaction (#199).
+    ///
+    /// `fills` is a list of `(intent_id, fill_amount)` pairs. Each pair is
+    /// handed to `fill_intent` unchanged, so mixed outcomes within one batch
+    /// are fine: some pairs may complete their intent (`Filled`) while others
+    /// only advance it (`PartiallyFilled` and re-opened). Every intent must be
+    /// currently `Accepted` by `solver`, and `solver` must be funded for the
+    /// sum of all `fill_amount`s plus fees, or the whole batch reverts.
+    /// Capped at `MAX_BATCH_SIZE`.
+    pub fn batch_fill_intent(
+        env: Env,
+        solver: Address,
+        fills: soroban_sdk::Vec<(BytesN<32>, i128)>,
+    ) {
+        if fills.len() > MAX_BATCH_SIZE {
+            panic_with_error!(&env, Error::BatchTooLarge);
+        }
+
+        for (intent_id, fill_amount) in fills {
+            Self::fill_intent(env.clone(), solver.clone(), intent_id, fill_amount);
+        }
+    }
+
+    /// Cancel multiple intents in a single transaction (#199).
+    ///
+    /// Every id must belong to `user` and be in a cancellable state
+    /// (`Open` / `PartiallyFilled`), or the whole batch reverts. The per-user
+    /// `CANCEL_COOLDOWN` is checked once for the whole call and stamped once at
+    /// the end, so one batch counts as a single cancel action for
+    /// rate-limiting — a user can clear all of their open intents in one
+    /// transaction without tripping the anti-spam gate on themselves. Capped
+    /// at `MAX_BATCH_SIZE`.
+    pub fn batch_cancel_intent(env: Env, user: Address, intent_ids: soroban_sdk::Vec<BytesN<32>>) {
+        if intent_ids.len() > MAX_BATCH_SIZE {
+            panic_with_error!(&env, Error::BatchTooLarge);
+        }
+
+        user.require_auth();
+        Self::bump_instance_ttl(&env);
+
+        let now = env.ledger().timestamp();
+        Self::check_cancel_cooldown(&env, &user, now);
+        for intent_id in intent_ids {
+            Self::cancel_intent_core(&env, &user, &intent_id);
+        }
+        Self::stamp_cancel_cooldown(&env, &user, now);
     }
 
     // ── Fill Window Extension ─────────────────────────────────────────────────
@@ -1877,7 +2088,7 @@ impl IntentSettlement {
             .persistent()
             .has(&DataKey::ExtensionGranted(intent_id.clone()))
         {
-            panic_with_error!(&env, Error::ZeroAmount); // No dedicated error; reuse nearest
+            panic_with_error!(&env, Error::ExtensionAlreadyGranted);
         }
 
         let now = env.ledger().timestamp();
@@ -1968,6 +2179,13 @@ impl IntentSettlement {
     /// may execute it.
     pub fn get_pending_fee_recipient(env: Env) -> Option<(Address, u64)> {
         env.storage().instance().get(&DataKey::PendingFeeRecipient)
+    }
+
+    /// Pending admin-transfer proposal, if any: `(new_admin, eta)` where `eta`
+    /// is the ledger timestamp at which `accept_admin_transfer` may execute it
+    /// (#115/#116).
+    pub fn get_pending_admin(env: Env) -> Option<(Address, u64)> {
+        env.storage().instance().get(&DataKey::PendingAdmin)
     }
 
     /// Returns the bond token address (USDC SAC), or `None` before initialization.
@@ -2099,7 +2317,11 @@ impl IntentSettlement {
     ///   all failures → 0
     ///   perfect rate, no volume → 9 000  (90% × 10 000)
     ///   perfect rate, high vol  → approaches 10 000
-    pub fn compute_reputation_score(record: &SolverRecord) -> u32 {
+    ///
+    /// Not a contract entrypoint: it takes `&SolverRecord` by reference, which
+    /// is not a valid Soroban ABI parameter, so it is `pub(crate)` (callable
+    /// from tests and from `get_reputation_score`) rather than `pub`.
+    pub(crate) fn compute_reputation_score(record: &SolverRecord) -> u32 {
         let total_fills = record.fills_completed as u64 + record.fills_failed as u64;
         if total_fills == 0 {
             return 0;
@@ -2142,85 +2364,89 @@ impl IntentSettlement {
     /// src_chain allowlist is disabled, obviously malformed tokens are rejected
     /// early.
     fn validate_src_token(env: &Env, src_chain: &String, src_token: &String) {
-        let token_len = src_token.len();
-        let chain_len = src_chain.len();
+        // `soroban_sdk::String` is not byte-indexable; copy both values into
+        // fixed ASCII buffers so the format checks can work on raw bytes.
+        // Any `src_chain` longer than the longest name we recognise, or any
+        // `src_token` longer than the longest address format we accept, cannot
+        // be a match — treat over-long inputs as an unknown chain (chain) or a
+        // rejected token (token) without touching the buffers.
+        const MAX_CHAIN_LEN: usize = 16;
+        const MAX_TOKEN_LEN: usize = 64;
 
-        // Compare `src_chain` byte-by-byte against a known ASCII literal.
-        let chain_is = |literal: &[u8]| -> bool {
-            if chain_len as usize != literal.len() {
-                return false;
-            }
-            let mut i = 0u32;
-            while i < chain_len {
-                if src_chain.get(i) != literal[i as usize] as u32 {
-                    return false;
-                }
-                i += 1;
-            }
-            true
+        let chain_len = src_chain.len() as usize;
+        let token_len = src_token.len() as usize;
+
+        let mut chain_buf = [0u8; MAX_CHAIN_LEN];
+        let chain_bytes: &[u8] = if chain_len <= MAX_CHAIN_LEN {
+            src_chain.copy_into_slice(&mut chain_buf[..chain_len]);
+            &chain_buf[..chain_len]
+        } else {
+            &chain_buf[..0]
         };
+
+        let chain_is = |literal: &[u8]| -> bool { chain_bytes == literal };
 
         let is_evm = chain_is(b"ethereum")
             || chain_is(b"base")
             || chain_is(b"polygon")
             || chain_is(b"arbitrum")
             || chain_is(b"optimism");
+        let is_solana = chain_is(b"solana");
+
+        if !is_evm && !is_solana {
+            // Unknown chain: skip validation — forward-compatible with future
+            // chains, and keeps the src_chain allowlist as the sole gate.
+            return;
+        }
+
+        if token_len > MAX_TOKEN_LEN {
+            panic_with_error!(env, Error::InvalidSrcToken);
+        }
+        let mut token_buf = [0u8; MAX_TOKEN_LEN];
+        src_token.copy_into_slice(&mut token_buf[..token_len]);
+        let token = &token_buf[..token_len];
 
         if is_evm {
             // EVM token address: exactly "0x" + 40 hex chars = 42 characters.
-            if token_len != 42 {
-                panic_with_error!(env, Error::InvalidSrcToken);
-            }
-            // Must start with "0x".
-            if src_token.get(0) != b'0' as u32 || src_token.get(1) != b'x' as u32 {
+            if token_len != 42 || token[0] != b'0' || token[1] != b'x' {
                 panic_with_error!(env, Error::InvalidSrcToken);
             }
             // Remaining 40 characters must all be hex digits [0-9a-fA-F].
-            let mut i = 2u32;
-            while i < 42 {
-                let ch = src_token.get(i);
-                let is_hex = (ch >= b'0' as u32 && ch <= b'9' as u32)
-                    || (ch >= b'a' as u32 && ch <= b'f' as u32)
-                    || (ch >= b'A' as u32 && ch <= b'F' as u32);
+            for &ch in &token[2..] {
+                let is_hex = ch.is_ascii_digit()
+                    || (b'a'..=b'f').contains(&ch)
+                    || (b'A'..=b'F').contains(&ch);
                 if !is_hex {
                     panic_with_error!(env, Error::InvalidSrcToken);
                 }
-                i += 1;
             }
             return;
         }
 
-        if chain_is(b"solana") {
-            // Solana token (SPL mint): base58-encoded public key, 32–44 chars,
-            // no "0x" prefix.
-            if token_len < 32 || token_len > 44 {
+        // Solana token (SPL mint): base58-encoded 32-byte public key. Mint
+        // addresses are 32–44 characters (a 32-byte value is at most 44 base58
+        // digits, at least 32) with no "0x" prefix. Alphabet is Bitcoin base58
+        // — 123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz — which
+        // excludes 0, I, O and l. Verified against the published SPL mints in
+        // `docs/132-supported-chains.md` §4.8 (e.g. USDC
+        // `EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v`, 44 chars).
+        if !(32..=44).contains(&token_len) {
+            panic_with_error!(env, Error::InvalidSrcToken);
+        }
+        if token_len >= 2 && token[0] == b'0' && token[1] == b'x' {
+            panic_with_error!(env, Error::InvalidSrcToken);
+        }
+        for &ch in token {
+            let is_b58 = (b'1'..=b'9').contains(&ch)
+                || (b'A'..=b'H').contains(&ch)
+                || (b'J'..=b'N').contains(&ch)
+                || (b'P'..=b'Z').contains(&ch)
+                || (b'a'..=b'k').contains(&ch)
+                || (b'm'..=b'z').contains(&ch);
+            if !is_b58 {
                 panic_with_error!(env, Error::InvalidSrcToken);
-            }
-            if token_len >= 2
-                && src_token.get(0) == b'0' as u32
-                && src_token.get(1) == b'x' as u32
-            {
-                panic_with_error!(env, Error::InvalidSrcToken);
-            }
-            // Validate base58 alphabet:
-            // 123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz
-            // (excludes: '0', 'I', 'O', 'l')
-            let mut i = 0u32;
-            while i < token_len {
-                let ch = src_token.get(i);
-                let is_b58 = (ch >= b'1' as u32 && ch <= b'9' as u32)
-                    || (ch >= b'A' as u32 && ch <= b'H' as u32)
-                    || (ch >= b'J' as u32 && ch <= b'N' as u32)
-                    || (ch >= b'P' as u32 && ch <= b'Z' as u32)
-                    || (ch >= b'a' as u32 && ch <= b'k' as u32)
-                    || (ch >= b'm' as u32 && ch <= b'z' as u32);
-                if !is_b58 {
-                    panic_with_error!(env, Error::InvalidSrcToken);
-                }
-                i += 1;
             }
         }
-        // Unknown chain: skip validation — forward-compatible with future chains.
     }
 
     fn require_admin(env: &Env) {
@@ -2358,14 +2584,15 @@ impl IntentSettlement {
         // first-accept-wins flow working while the bidding feature is gated.
     }
 
-    /// Returns the effective fee in basis points for a given `fill_amount`,
-    /// consulting the stored `ProtocolConfig` for the per-contract rate.
+    /// Returns the effective protocol fee in basis points from the stored
+    /// `ProtocolConfig`.
     ///
-    /// Future work (tiered-fee feature): this function can be extended to
-    /// accept a solver address and apply volume-tier discounts based on the
-    /// solver's historical `total_volume`.  For now it returns the flat
-    /// `protocol_fee_bps` from config so all existing call-sites get a single
-    /// source of truth for fee calculation.
+    /// Future work (tiered-fee feature): this can be extended to take a solver
+    /// address and apply volume-tier discounts from the solver's historical
+    /// `total_volume`. It is retained as the single intended lookup point for
+    /// that logic; `#[allow(dead_code)]` because `fill_intent` still reads the
+    /// flat `PROTOCOL_FEE_BPS` constant directly today.
+    #[allow(dead_code)]
     fn get_tiered_fee_bps(env: &Env) -> i128 {
         Self::load_config(env).protocol_fee_bps
     }
