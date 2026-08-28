@@ -1768,7 +1768,10 @@ fn set_min_bond_multiplier_updates_requirement() {
 
     // Solver with 1000 USDC bond (10x MIN_BOND) can still accept
     ctx.client().accept_intent(&ctx.solver, &id2);
-    assert_eq!(ctx.client().get_intent(&id2).unwrap().solver, Some(ctx.solver.clone()));
+    assert_eq!(
+        ctx.client().get_intent(&id2).unwrap().solver,
+        Some(ctx.solver.clone())
+    );
 }
 
 #[test]
@@ -2199,7 +2202,10 @@ fn slash_tiny_bond_always_yields_nonzero_slash() {
         "bond should have decreased after slash"
     );
     let slashed = tiny_bond - solver.bond_amount;
-    assert!(slashed >= 1, "slash_amount must be at least 1, got {slashed}");
+    assert!(
+        slashed >= 1,
+        "slash_amount must be at least 1, got {slashed}"
+    );
 }
 
 // ─── Issue #33: add_allowed_dst_token validates SEP-41 interface ─────────────────
@@ -2214,17 +2220,12 @@ fn propose_add_dst_token_rejects_non_token_contract() {
 
     // ctx.contract_id is a real deployed contract (IntentSettlement) but it
     // does not implement the SEP-41 token interface, so decimals() will trap.
-    let res = ctx
-        .client()
-        .try_propose_add_dst_token(&ctx.contract_id);
+    let res = ctx.client().try_propose_add_dst_token(&ctx.contract_id);
 
     // The call must fail — either with InvalidTokenInterface or a generic
     // contract-trap error (the host converts a trapped cross-contract call
     // into an Err result in the test environment).
-    assert!(
-        res.is_err(),
-        "proposing a non-token address should fail"
-    );
+    assert!(res.is_err(), "proposing a non-token address should fail");
 
     // No storage entry must have been written for the bogus address.
     assert!(
@@ -2525,9 +2526,7 @@ fn src_chain_allowlist_accepts_all_supported_evm_chains() {
     let ctx = setup();
     let c = ctx.client();
 
-    let chains = [
-        "ethereum", "base", "polygon", "arbitrum", "optimism",
-    ];
+    let chains = ["ethereum", "base", "polygon", "arbitrum", "optimism"];
 
     for chain_str in &chains {
         let chain = String::from_str(&ctx.env, chain_str);
@@ -2709,7 +2708,7 @@ fn evm_token_too_short_rejected() {
     let res = ctx.client().try_submit_intent(
         &ctx.user,
         &String::from_str(&ctx.env, "base"),
-        &String::from_str(&ctx.env, "0xabc"),   // only 5 chars
+        &String::from_str(&ctx.env, "0xabc"), // only 5 chars
         &SRC_AMT,
         &ctx.dst_token,
         &MIN_DST,
@@ -2815,7 +2814,7 @@ fn solana_token_too_short_rejected() {
     let res = ctx.client().try_submit_intent(
         &ctx.user,
         &String::from_str(&ctx.env, "solana"),
-        &String::from_str(&ctx.env, "EPjFWdd5AufqSSqeM2qN1xzybapC8"),  // 29 chars
+        &String::from_str(&ctx.env, "EPjFWdd5AufqSSqeM2qN1xzybapC8"), // 29 chars
         &SRC_AMT,
         &ctx.dst_token,
         &MIN_DST,
@@ -2898,4 +2897,350 @@ fn unknown_chain_bypasses_token_format_validation() {
         &MIN_DST,
         &deadline,
     );
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// #198 — Paginated, enumerable solver listing
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Register a fresh, distinct solver with `bond` and return its address.
+fn register_extra_solver(ctx: &Ctx, bond: i128) -> Address {
+    let s = Address::generate(&ctx.env);
+    ctx.bond_admin().mint(&s, &bond);
+    ctx.client().register_solver(&s, &bond);
+    s
+}
+
+#[test]
+fn list_solvers_is_empty_before_any_registration() {
+    let ctx = setup();
+    assert_eq!(ctx.client().list_solvers(&0u32, &50u32).len(), 0);
+    assert_eq!(ctx.client().get_solver_count(), 0);
+}
+
+#[test]
+fn list_solvers_tracks_register_and_deregister_exactly() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    let a = register_extra_solver(&ctx, MIN_BOND);
+    let b = register_extra_solver(&ctx, MIN_BOND);
+    let d = register_extra_solver(&ctx, MIN_BOND);
+
+    let all = c.list_solvers(&0u32, &50u32);
+    assert_eq!(all.len(), 3);
+    assert!(all.contains(a.clone()) && all.contains(b.clone()) && all.contains(d.clone()));
+    assert_eq!(c.get_solver_count(), 3);
+
+    // Deregister the middle registration.
+    c.deregister_solver(&b);
+
+    let all = c.list_solvers(&0u32, &50u32);
+    assert_eq!(all.len(), 2);
+    assert!(all.contains(a.clone()) && all.contains(d.clone()));
+    assert!(!all.contains(b.clone()));
+    assert_eq!(c.get_solver_count(), 2);
+}
+
+#[test]
+fn list_solvers_has_no_duplicate_after_topup_or_reregister() {
+    let ctx = setup();
+    let c = ctx.client();
+    let a = register_extra_solver(&ctx, MIN_BOND);
+
+    // Top-up keeps a single list entry.
+    ctx.bond_admin().mint(&a, &MIN_BOND);
+    c.register_solver(&a, &MIN_BOND);
+    assert_eq!(c.list_solvers(&0u32, &50u32).len(), 1);
+
+    // Deregister then re-register: still exactly one entry, no duplicate.
+    c.deregister_solver(&a);
+    assert_eq!(c.list_solvers(&0u32, &50u32).len(), 0);
+    ctx.bond_admin().mint(&a, &MIN_BOND);
+    c.register_solver(&a, &MIN_BOND);
+
+    let all = c.list_solvers(&0u32, &50u32);
+    assert_eq!(all.len(), 1);
+    assert_eq!(all.get(0), Some(a));
+}
+
+#[test]
+fn list_solvers_pagination_boundaries() {
+    let ctx = setup();
+    let c = ctx.client();
+    for _ in 0..5 {
+        register_extra_solver(&ctx, MIN_BOND);
+    }
+
+    assert_eq!(c.list_solvers(&0u32, &2u32).len(), 2); // first page
+    assert_eq!(c.list_solvers(&4u32, &2u32).len(), 1); // last page, partial
+    assert_eq!(c.list_solvers(&5u32, &2u32).len(), 0); // start == len
+    assert_eq!(c.list_solvers(&99u32, &2u32).len(), 0); // start past end
+    assert_eq!(c.list_solvers(&0u32, &0u32).len(), 0); // limit 0
+
+    // limit above MAX_BATCH_SIZE is clamped, not an error.
+    assert_eq!(
+        c.list_solvers(&0u32, &(MAX_BATCH_SIZE + 100)).len(),
+        5.min(MAX_BATCH_SIZE)
+    );
+
+    // A full paginated sweep visits exactly get_solver_count() solvers.
+    let mut seen = 0u32;
+    let mut start = 0u32;
+    loop {
+        let page = c.list_solvers(&start, &2u32);
+        if page.is_empty() {
+            break;
+        }
+        seen += page.len();
+        start += page.len();
+    }
+    assert_eq!(seen, c.get_solver_count());
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// #199 — batch_fill_intent / batch_cancel_intent
+// ════════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn batch_fill_intent_handles_mixed_full_and_partial_fills() {
+    let ctx = setup();
+    let c = ctx.client();
+    ctx.register_solver();
+
+    let id_full = ctx.submit();
+    ctx.pass_time(1);
+    let id_partial = ctx.submit();
+
+    c.accept_intent(&ctx.solver, &id_full);
+    c.accept_intent(&ctx.solver, &id_partial);
+    assert_eq!(c.get_solver(&ctx.solver).unwrap().active_intents, 2);
+
+    let full = FILL; // >= MIN_DST → completes the intent
+    let partial = MIN_DST / 4; // < MIN_DST → re-opens the intent
+    let funding = full + partial + (full + partial) * 5 / 10_000 + 4;
+    ctx.dst_admin().mint(&ctx.solver, &funding);
+
+    c.batch_fill_intent(
+        &ctx.solver,
+        &soroban_sdk::vec![
+            &ctx.env,
+            (id_full.clone(), full),
+            (id_partial.clone(), partial)
+        ],
+    );
+
+    // Full fill closed out; partial fill re-opened with progress preserved.
+    assert_eq!(c.get_intent(&id_full).unwrap().state, IntentState::Filled);
+    let p = c.get_intent(&id_partial).unwrap();
+    assert_eq!(p.state, IntentState::PartiallyFilled);
+    assert_eq!(p.total_filled, partial);
+    assert!(p.solver.is_none());
+
+    // Bookkeeping across the mixed batch: both obligations released, one intent
+    // back in the open pool.
+    assert_eq!(c.get_solver(&ctx.solver).unwrap().active_intents, 0);
+    let (_, _, open) = c.get_stats();
+    assert_eq!(open, 1);
+    assert_eq!(ctx.dst().balance(&ctx.user), full + partial);
+}
+
+#[test]
+fn batch_fill_intent_reverts_entire_batch_on_one_bad_item() {
+    let ctx = setup();
+    let c = ctx.client();
+    ctx.register_solver();
+
+    let id_ok = ctx.submit();
+    ctx.pass_time(1);
+    let id_unaccepted = ctx.submit(); // never accepted → fill_intent rejects it
+
+    c.accept_intent(&ctx.solver, &id_ok);
+    let fee = FILL * 5 / 10_000;
+    ctx.dst_admin().mint(&ctx.solver, &((FILL + fee) * 2));
+
+    let res = c.try_batch_fill_intent(
+        &ctx.solver,
+        &soroban_sdk::vec![
+            &ctx.env,
+            (id_ok.clone(), FILL),
+            (id_unaccepted.clone(), FILL)
+        ],
+    );
+    assert_eq!(res, Err(Ok(Error::IntentNotAccepted.into())));
+
+    // Whole-transaction atomicity: the first (valid) fill was rolled back.
+    assert_eq!(c.get_intent(&id_ok).unwrap().state, IntentState::Accepted);
+    assert_eq!(ctx.dst().balance(&ctx.user), 0);
+    assert_eq!(c.get_solver(&ctx.solver).unwrap().total_volume, 0);
+}
+
+#[test]
+fn batch_fill_intent_size_guard_fires_before_any_work() {
+    let ctx = setup();
+    let c = ctx.client();
+    ctx.register_solver();
+
+    let mut fills = soroban_sdk::Vec::new(&ctx.env);
+    for i in 0..(MAX_BATCH_SIZE + 1) {
+        fills.push_back((BytesN::from_array(&ctx.env, &[i as u8; 32]), 1i128));
+    }
+    let res = c.try_batch_fill_intent(&ctx.solver, &fills);
+    assert_eq!(res, Err(Ok(Error::BatchTooLarge.into())));
+}
+
+#[test]
+fn batch_cancel_intent_clears_many_intents_in_one_cooldown() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    let id1 = ctx.submit();
+    ctx.pass_time(1);
+    let id2 = ctx.submit();
+    ctx.pass_time(1);
+    let id3 = ctx.submit();
+
+    c.batch_cancel_intent(
+        &ctx.user,
+        &soroban_sdk::vec![&ctx.env, id1.clone(), id2.clone(), id3.clone()],
+    );
+
+    assert_eq!(c.get_intent(&id1).unwrap().state, IntentState::Cancelled);
+    assert_eq!(c.get_intent(&id2).unwrap().state, IntentState::Cancelled);
+    assert_eq!(c.get_intent(&id3).unwrap().state, IntentState::Cancelled);
+    let (_, _, open) = c.get_stats();
+    assert_eq!(open, 0);
+
+    // The batch counts as a single cancel action for rate-limiting, so an
+    // immediate follow-up single cancel is on cooldown.
+    let id4 = ctx.submit();
+    let res = c.try_cancel_intent(&ctx.user, &id4);
+    assert_eq!(res, Err(Ok(Error::CancelCooldownNotExpired.into())));
+}
+
+#[test]
+fn batch_cancel_intent_reverts_entire_batch_on_one_bad_item() {
+    let ctx = setup();
+    let c = ctx.client();
+    ctx.register_solver();
+
+    let id1 = ctx.submit();
+    ctx.pass_time(1);
+    let id2 = ctx.submit();
+    c.accept_intent(&ctx.solver, &id2); // Accepted → not cancellable
+
+    let res = c.try_batch_cancel_intent(
+        &ctx.user,
+        &soroban_sdk::vec![&ctx.env, id1.clone(), id2.clone()],
+    );
+    assert_eq!(res, Err(Ok(Error::CannotCancelAccepted.into())));
+
+    // Atomicity: id1's cancellation was rolled back.
+    assert_eq!(c.get_intent(&id1).unwrap().state, IntentState::Open);
+    // id2 was Accepted (so no longer "open"); id1 is still open → count is 1.
+    let (_, _, open) = c.get_stats();
+    assert_eq!(open, 1);
+}
+
+#[test]
+fn batch_cancel_intent_size_guard_fires_before_any_work() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    let real = ctx.submit(); // a genuinely cancellable intent
+    let mut ids = soroban_sdk::Vec::new(&ctx.env);
+    ids.push_back(real.clone());
+    for i in 0..MAX_BATCH_SIZE {
+        ids.push_back(BytesN::from_array(&ctx.env, &[i as u8; 32]));
+    }
+    assert_eq!(ids.len(), MAX_BATCH_SIZE + 1);
+
+    let res = c.try_batch_cancel_intent(&ctx.user, &ids);
+    assert_eq!(res, Err(Ok(Error::BatchTooLarge.into())));
+    // The real intent is untouched — the guard fired before any cancel ran.
+    assert_eq!(c.get_intent(&real).unwrap().state, IntentState::Open);
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// #201 — Solana as a fully-supported source chain (end-to-end)
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Full submit_intent → src_chain allowlist → src_token format-validation path
+/// for Solana alongside the EVM chains, with the allowlist enforced. Addresses
+/// are the real mainnet USDC contracts / SPL mint from
+/// docs/132-supported-chains.md §4.
+#[test]
+fn src_chain_end_to_end_evm_and_solana_with_allowlist_enabled() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    let cases: [(&str, &str); 3] = [
+        ("ethereum", "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+        ("base", "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"),
+        ("solana", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"),
+    ];
+    for (chain, _) in &cases {
+        c.add_allowed_src_chain(&String::from_str(&ctx.env, chain));
+    }
+    c.set_src_chain_allowlist_enabled(&true);
+
+    for (chain, token) in &cases {
+        let id = c.submit_intent(
+            &ctx.user,
+            &String::from_str(&ctx.env, chain),
+            &String::from_str(&ctx.env, token),
+            &SRC_AMT,
+            &ctx.dst_token,
+            &MIN_DST,
+            &None,
+        );
+        let rec = c.get_intent(&id).unwrap();
+        assert_eq!(rec.src_chain, String::from_str(&ctx.env, chain));
+        assert_eq!(rec.src_token, String::from_str(&ctx.env, token));
+        assert_eq!(rec.state, IntentState::Open);
+        ctx.pass_time(1); // keep the next derived intent id distinct
+    }
+}
+
+/// An out-of-range-length base58 token is rejected end-to-end on `"solana"`
+/// with the allowlist enabled (31 chars — one below the 32-char floor).
+#[test]
+fn solana_token_below_min_length_rejected_end_to_end() {
+    let ctx = setup();
+    let c = ctx.client();
+    c.add_allowed_src_chain(&String::from_str(&ctx.env, "solana"));
+    c.set_src_chain_allowlist_enabled(&true);
+
+    let res = c.try_submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "solana"),
+        &String::from_str(&ctx.env, "1111111111111111111111111111111"), // 31 base58 chars
+        &SRC_AMT,
+        &ctx.dst_token,
+        &MIN_DST,
+        &None,
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidSrcToken.into())));
+}
+
+/// A 0x-prefixed EVM-style address submitted with src_chain = "solana" is
+/// rejected as InvalidSrcToken even with the allowlist enabled — Solana mint
+/// addresses never carry an 0x prefix.
+#[test]
+fn solana_rejects_0x_prefixed_token_end_to_end() {
+    let ctx = setup();
+    let c = ctx.client();
+    c.add_allowed_src_chain(&String::from_str(&ctx.env, "solana"));
+    c.set_src_chain_allowlist_enabled(&true);
+
+    let res = c.try_submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "solana"),
+        &String::from_str(&ctx.env, "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+        &SRC_AMT,
+        &ctx.dst_token,
+        &MIN_DST,
+        &None,
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidSrcToken.into())));
 }

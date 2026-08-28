@@ -125,8 +125,7 @@ impl Fixture {
         let contract_bal = self.contract_bond_balance();
         let sum = self.sum_bond_amounts();
         assert_eq!(
-            contract_bal,
-            sum,
+            contract_bal, sum,
             "Bond conservation violated: contract holds {contract_bal} but Σ bond_amounts = {sum}"
         );
     }
