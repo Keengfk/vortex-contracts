@@ -31,13 +31,15 @@ It is intended for auditors and integrators.
 The contract has **no on-chain proof** that a solver actually sent tokens on the
 source chain. `fill_intent` trusts the solver to transfer `dst_token` to the
 user on Stellar; the economic incentive not to default is the bond slash
-(`slash_solver` takes 10 % of the bond permissionlessly once the fill window
-expires).
+(`slash_solver` is permissionless once the fill window expires and slashes an
+amount proportional to the unfilled intent — see "Bond slash" under Known
+Limitations, issue #193 — capped at 10 % of the bond).
 
-**Implication:** A solver with a large enough bond can accept an intent, fail to
-fill, absorb the 10 % slash, and profit if the spread on the source-chain trade
-is more valuable than 10 % of their bond.  The bond size is the primary
-economic deterrent.
+**Implication:** A solver can still accept an intent, fail to fill, absorb the
+slash, and profit if the source-chain spread outweighs it. The proportional
+formula removes the old asymmetry where a large bond made a small-intent default
+disproportionately expensive (or a small bond made a large-intent default
+cheap); the bond size remains the primary economic deterrent.
 
 #### 2. Admin key custody
 
@@ -184,8 +186,14 @@ unilaterally by the admin without other protocol preconditions being met first
 - **Single admin key.** There is no multi-sig or timelock on admin operations.
   Protocol operators should secure the admin key with a hardware wallet or
   multi-sig wrapper before mainnet.
-- **Bond slash is fixed at 10 %.** A solver with a very large bond can default
-  cheaply.  A dynamic slash proportional to intent size is on the roadmap.
+- **Bond slash is proportional to intent size (issue #193).** `slash_solver`
+  slashes `min(unfilled_output, bond) / 10` — an amount scaled to the intent the
+  solver failed to fill — capped at 10 % of the bond (so a well-matched bond is
+  never punished harder than the old flat rate) and floored at 1 stroop (issue
+  #32). Cross-token value comparison between the bond token and the destination
+  token is still out of scope and assumes same-token comparability or an
+  admin-set per-token minimum; a price-oracle-based comparison remains on the
+  roadmap.
 - **Intent re-open after slash.** After `slash_solver` the intent is reset to
   `Open` with a fresh `INTENT_EXPIRY` deadline.  There is currently no cap on
   how many times an intent can cycle through `Open → Accepted → Slashed`.

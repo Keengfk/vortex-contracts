@@ -2004,6 +2004,8 @@ fn make_record(
         is_active: true,
         registered_at: env.ledger().timestamp(),
         active_intents: 0,
+        last_slash_time: 0,
+        bond_tokens: soroban_sdk::Vec::new(env),
     }
 }
 
@@ -2870,4 +2872,426 @@ fn unknown_chain_bypasses_token_format_validation() {
         &MIN_DST,
         &deadline,
     );
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// Issue #193 — dynamic, proportional bond slashing
+// ════════════════════════════════════════════════════════════════════════════════
+
+use crate::{DisputeResolution, BID_WINDOW, DISPUTE_WINDOW, ARBITER_WINDOW, MAX_BOND_TOKENS};
+
+/// Accept `id` with `ctx.solver`, let the fill window lapse, and slash.
+/// Returns `(bond_before, bond_after)`.
+fn accept_then_slash(ctx: &Ctx, id: &BytesN<32>) -> (i128, i128) {
+    let c = ctx.client();
+    let before = c.get_solver(&ctx.solver).unwrap().bond_amount;
+    c.accept_intent(&ctx.solver, id);
+    ctx.pass_time(FILL_WINDOW + 1);
+    c.slash_solver(id);
+    let after = c.get_solver(&ctx.solver).unwrap().bond_amount;
+    (before, after)
+}
+
+/// A solver with a huge bond who fails a tiny intent loses an amount
+/// proportional to the *intent* (≈10% of min_dst_amount), not 10% of the bond.
+#[test]
+fn slash_is_proportional_to_intent_not_bond() {
+    let ctx = setup();
+    // 500,000 USDC bond.
+    let big_bond = 500_000 * 10_000_000;
+    ctx.bond_admin().mint(&ctx.solver, &big_bond);
+    ctx.client().register_solver(&ctx.solver, &big_bond);
+
+    // Tiny intent: min_dst_amount = 10 USDC.
+    let tiny_dst = 10 * 10_000_000;
+    let deadline: Option<u64> = None;
+    let id = ctx.client().submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "ethereum"),
+        &String::from_str(&ctx.env, "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+        &SRC_AMT,
+        &ctx.dst_token,
+        &tiny_dst,
+        &deadline,
+    );
+    let (before, after) = accept_then_slash(&ctx, &id);
+    let slashed = before - after;
+
+    // Old behaviour would have taken big_bond / 10 = 50,000 USDC.
+    assert!(slashed < big_bond / 10, "slash must be far below the flat 10%");
+    // New behaviour: ~10% of the 10 USDC intent = 1 USDC.
+    assert_eq!(slashed, tiny_dst / 10);
+}
+
+/// When bond and intent size are well matched, the slash is still capped at the
+/// old flat-10%-of-bond baseline (never more punitive).
+#[test]
+fn slash_capped_at_ten_percent_of_bond() {
+    let ctx = setup();
+    ctx.register_solver(); // BOND = 1,000 USDC
+    // Intent far larger than the bond.
+    let huge_dst = 100_000 * 10_000_000;
+    let deadline: Option<u64> = None;
+    let id = ctx.client().submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "ethereum"),
+        &String::from_str(&ctx.env, "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+        &SRC_AMT,
+        &ctx.dst_token,
+        &huge_dst,
+        &deadline,
+    );
+    let (before, after) = accept_then_slash(&ctx, &id);
+    assert_eq!(before - after, before / 10, "capped at 10% of bond");
+}
+
+/// Issue #32 regression: a sub-10-stroop bond is still slashed by at least 1.
+#[test]
+fn slash_floor_of_one_preserved() {
+    let ctx = setup();
+    ctx.register_solver();
+    // Plant a tiny bond directly (mirrors the existing tiny-bond slash test).
+    ctx.env.as_contract(&ctx.contract_id, || {
+        let mut r: SolverRecord = ctx
+            .env
+            .storage()
+            .persistent()
+            .get(&DataKey::Solver(ctx.solver.clone()))
+            .unwrap();
+        r.bond_amount = 5;
+        ctx.env
+            .storage()
+            .persistent()
+            .set(&DataKey::Solver(ctx.solver.clone()), &r);
+    });
+    let id = ctx.submit();
+    let (before, after) = accept_then_slash(&ctx, &id);
+    assert_eq!(before, 5);
+    assert_eq!(before - after, 1, "non-zero bond always loses at least 1");
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// Issue #191 — competitive bid-window
+// ════════════════════════════════════════════════════════════════════════════════
+
+fn enable_bidding(ctx: &Ctx) {
+    ctx.client().set_bid_window_enabled(&true);
+    assert!(ctx.client().is_bid_window_enabled());
+}
+
+/// With no bid received before the window closes, `settle_bids` re-opens the
+/// intent as `Open` rather than leaving it stuck in `Bidding`.
+#[test]
+fn settle_bids_no_bid_reopens_as_open() {
+    let ctx = setup();
+    enable_bidding(&ctx);
+    let id = ctx.submit();
+    assert_eq!(ctx.client().get_intent(&id).unwrap().state, IntentState::Bidding);
+
+    ctx.pass_time(BID_WINDOW + 1);
+    ctx.client().settle_bids(&id);
+    assert_eq!(ctx.client().get_intent(&id).unwrap().state, IntentState::Open);
+}
+
+/// A single bid, once settled, moves the intent to `Accepted` with the bidder
+/// assigned and a fresh fill window.
+#[test]
+fn settle_bids_single_bid_assigns_winner() {
+    let ctx = setup();
+    ctx.register_solver();
+    enable_bidding(&ctx);
+    let id = ctx.submit();
+
+    ctx.client().bid_intent(&ctx.solver, &id, &(MIN_DST + 5));
+    ctx.pass_time(BID_WINDOW + 1);
+    ctx.client().settle_bids(&id);
+
+    let intent = ctx.client().get_intent(&id).unwrap();
+    assert_eq!(intent.state, IntentState::Accepted);
+    assert_eq!(intent.solver, Some(ctx.solver.clone()));
+}
+
+/// A strictly-higher bid replaces the incumbent; an equal bid does not.
+#[test]
+fn bid_replaces_only_when_strictly_higher() {
+    let ctx = setup();
+    ctx.register_solver();
+    let solver2 = Address::generate(&ctx.env);
+    ctx.bond_admin().mint(&solver2, &BOND);
+    ctx.client().register_solver(&solver2, &BOND);
+    enable_bidding(&ctx);
+    let id = ctx.submit();
+
+    ctx.client().bid_intent(&ctx.solver, &id, &(MIN_DST + 10));
+    // Equal bid rejected — incumbent keeps the lead.
+    let equal = ctx.client().try_bid_intent(&solver2, &id, &(MIN_DST + 10));
+    assert_eq!(equal, Err(Ok(Error::BidNotHigher)));
+    // Strictly higher wins.
+    ctx.client().bid_intent(&solver2, &id, &(MIN_DST + 11));
+    assert_eq!(
+        ctx.client().get_best_bid(&id).unwrap().solver,
+        solver2
+    );
+
+    ctx.pass_time(BID_WINDOW + 1);
+    ctx.client().settle_bids(&id);
+    assert_eq!(ctx.client().get_intent(&id).unwrap().solver, Some(solver2));
+}
+
+/// Regression for the storage-key collision: toggling the dst-token allowlist
+/// must have no effect on bid-window state, and vice-versa.
+#[test]
+fn dst_allowlist_toggle_does_not_touch_bid_window() {
+    let ctx = setup();
+    assert!(!ctx.client().is_bid_window_enabled());
+    ctx.client().set_dst_allowlist_enabled(&true);
+    assert!(
+        !ctx.client().is_bid_window_enabled(),
+        "dst allowlist toggle must not enable bidding"
+    );
+
+    ctx.client().set_bid_window_enabled(&true);
+    assert!(ctx.client().is_bid_window_enabled());
+    assert!(
+        !ctx.client().is_dst_allowlist_enabled(),
+        "bid-window toggle must not enable the dst allowlist"
+    );
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// Issue #188 — dispute-resolution state machine
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Drive an intent to the `Filling` state (escrow held by the contract).
+fn begin_filling(ctx: &Ctx) -> BytesN<32> {
+    ctx.register_solver();
+    let id = ctx.submit();
+    ctx.client().accept_intent(&ctx.solver, &id);
+    ctx.dst_admin().mint(&ctx.solver, &FILL);
+    ctx.client().begin_fill(&ctx.solver, &id, &FILL);
+    assert_eq!(ctx.client().get_intent(&id).unwrap().state, IntentState::Filling);
+    // Tokens are in the contract, not the user, during the window.
+    assert_eq!(ctx.dst().balance(&ctx.contract_id), FILL);
+    assert_eq!(ctx.dst().balance(&ctx.user), 0);
+    id
+}
+
+/// Happy path: no dispute, `release_fill` after the window pays the user
+/// (minus the protocol fee) and closes the intent.
+#[test]
+fn dispute_happy_path_release_after_window() {
+    let ctx = setup();
+    let id = begin_filling(&ctx);
+
+    ctx.pass_time(DISPUTE_WINDOW + 1);
+    ctx.client().release_fill(&id);
+
+    let fee = FILL * crate::PROTOCOL_FEE_BPS / 10_000;
+    assert_eq!(ctx.client().get_intent(&id).unwrap().state, IntentState::Filled);
+    assert_eq!(ctx.dst().balance(&ctx.user), FILL - fee);
+    assert_eq!(ctx.dst().balance(&ctx.fee_recipient), fee);
+}
+
+/// Disputed + upheld: user is made whole with the FULL escrow (no fee) and the
+/// solver's bond is slashed.
+#[test]
+fn dispute_upheld_refunds_user_and_slashes_solver() {
+    let ctx = setup();
+    let id = begin_filling(&ctx);
+    let bond_before = ctx.client().get_solver(&ctx.solver).unwrap().bond_amount;
+
+    ctx.client().dispute_fill(&ctx.user, &id);
+    assert_eq!(ctx.client().get_intent(&id).unwrap().state, IntentState::Disputed);
+    ctx.client()
+        .resolve_dispute(&ctx.admin, &id, &DisputeResolution::Upheld);
+
+    let intent = ctx.client().get_intent(&id).unwrap();
+    assert_eq!(intent.state, IntentState::Resolved);
+    assert_eq!(intent.resolution, Some(DisputeResolution::Upheld));
+    assert_eq!(ctx.dst().balance(&ctx.user), FILL, "full escrow, no fee");
+    assert!(
+        ctx.client().get_solver(&ctx.solver).unwrap().bond_amount < bond_before,
+        "solver slashed on upheld dispute"
+    );
+}
+
+/// Disputed + dismissed: user still receives the tokens (minus fee), no slash.
+#[test]
+fn dispute_dismissed_releases_to_user_no_slash() {
+    let ctx = setup();
+    let id = begin_filling(&ctx);
+    let bond_before = ctx.client().get_solver(&ctx.solver).unwrap().bond_amount;
+
+    ctx.client().dispute_fill(&ctx.user, &id);
+    ctx.client()
+        .resolve_dispute(&ctx.admin, &id, &DisputeResolution::Dismissed);
+
+    let fee = FILL * crate::PROTOCOL_FEE_BPS / 10_000;
+    let intent = ctx.client().get_intent(&id).unwrap();
+    assert_eq!(intent.resolution, Some(DisputeResolution::Dismissed));
+    assert_eq!(ctx.dst().balance(&ctx.user), FILL - fee);
+    assert_eq!(
+        ctx.client().get_solver(&ctx.solver).unwrap().bond_amount,
+        bond_before,
+        "no slash on a dismissed dispute"
+    );
+}
+
+/// Timeout with no arbiter resolution: after ARBITER_WINDOW anyone can call
+/// `release_fill` to hand the user the full escrow (conservative default).
+#[test]
+fn dispute_arbiter_timeout_releases_to_user() {
+    let ctx = setup();
+    let id = begin_filling(&ctx);
+
+    ctx.client().dispute_fill(&ctx.user, &id);
+    ctx.pass_time(ARBITER_WINDOW + 1);
+    ctx.client().release_fill(&id);
+
+    let intent = ctx.client().get_intent(&id).unwrap();
+    assert_eq!(intent.state, IntentState::Resolved);
+    assert_eq!(intent.resolution, None, "None marks an arbiter timeout");
+    assert_eq!(ctx.dst().balance(&ctx.user), FILL);
+}
+
+/// A hostile dst_token cannot be used to pull escrow back out during the
+/// window — the contract, not the solver, custodies it, and state is committed
+/// before any transfer.
+#[test]
+fn escrow_is_held_by_contract_during_window() {
+    let ctx = setup();
+    let id = begin_filling(&ctx);
+    // Solver no longer holds the tokens; a re-entrant `release_fill` before the
+    // window closes is rejected.
+    let early = ctx.client().try_release_fill(&id);
+    assert_eq!(early, Err(Ok(Error::DisputeWindowStillOpen)));
+    assert_eq!(ctx.dst().balance(&ctx.contract_id), FILL);
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// Issue #187 — multi-bond-token support
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Register a second approved bond token and return its address + admin client.
+fn second_bond_token(ctx: &Ctx) -> Address {
+    let t = ctx
+        .env
+        .register_stellar_asset_contract_v2(ctx.admin.clone())
+        .address();
+    ctx.client().add_allowed_bond_token(&t);
+    ctx.client().set_bond_token_min(&t, &MIN_BOND);
+    t
+}
+
+/// A solver can hold bonds in two different approved tokens simultaneously.
+#[test]
+fn register_with_multiple_bond_tokens() {
+    let ctx = setup();
+    ctx.register_solver(); // default token, BOND
+    let t2 = second_bond_token(&ctx);
+    let t2_admin = token::StellarAssetClient::new(&ctx.env, &t2);
+    t2_admin.mint(&ctx.solver, &MIN_BOND);
+    ctx.client()
+        .register_solver_with_token(&ctx.solver, &t2, &MIN_BOND);
+
+    assert_eq!(ctx.client().get_solver_bond(&ctx.solver, &ctx.bond_token), BOND);
+    assert_eq!(ctx.client().get_solver_bond(&ctx.solver, &t2), MIN_BOND);
+    assert_eq!(ctx.client().get_solver_bonds(&ctx.solver).len(), 2);
+}
+
+/// Slashing an intent backed by token B leaves the solver's token-A bond
+/// untouched, and the slash is paid out in token B.
+#[test]
+fn slash_is_per_bond_token() {
+    let ctx = setup();
+    ctx.register_solver();
+    let t2 = second_bond_token(&ctx);
+    let t2_client = token::Client::new(&ctx.env, &t2);
+    let t2_admin = token::StellarAssetClient::new(&ctx.env, &t2);
+    t2_admin.mint(&ctx.solver, &(MIN_BOND * 4));
+    ctx.client()
+        .register_solver_with_token(&ctx.solver, &t2, &(MIN_BOND * 4));
+
+    let id = ctx.submit();
+    ctx.client().accept_intent_with_bond(&ctx.solver, &id, &t2);
+    ctx.pass_time(FILL_WINDOW + 1);
+    ctx.client().slash_solver(&id);
+
+    // Token-A (default) bond unchanged.
+    assert_eq!(ctx.client().get_solver_bond(&ctx.solver, &ctx.bond_token), BOND);
+    // Token-B bond reduced, and the fee recipient received token B.
+    assert!(ctx.client().get_solver_bond(&ctx.solver, &t2) < MIN_BOND * 4);
+    assert!(t2_client.balance(&ctx.fee_recipient) > 0);
+}
+
+/// Deregistering refunds every token the solver holds a bond in.
+#[test]
+fn deregister_refunds_all_bond_tokens() {
+    let ctx = setup();
+    ctx.register_solver();
+    let t2 = second_bond_token(&ctx);
+    let t2_client = token::Client::new(&ctx.env, &t2);
+    let t2_admin = token::StellarAssetClient::new(&ctx.env, &t2);
+    t2_admin.mint(&ctx.solver, &MIN_BOND);
+    ctx.client()
+        .register_solver_with_token(&ctx.solver, &t2, &MIN_BOND);
+
+    ctx.client().deregister_solver(&ctx.solver);
+    assert_eq!(ctx.bond().balance(&ctx.solver), BOND);
+    assert_eq!(t2_client.balance(&ctx.solver), MIN_BOND);
+}
+
+/// An unapproved bond token is rejected.
+#[test]
+fn register_with_unapproved_bond_token_fails() {
+    let ctx = setup();
+    let bogus = ctx
+        .env
+        .register_stellar_asset_contract_v2(ctx.admin.clone())
+        .address();
+    token::StellarAssetClient::new(&ctx.env, &bogus).mint(&ctx.solver, &MIN_BOND);
+    let res = ctx
+        .client()
+        .try_register_solver_with_token(&ctx.solver, &bogus, &MIN_BOND);
+    assert_eq!(res, Err(Ok(Error::BondTokenNotAllowed)));
+}
+
+/// Withdrawing below the per-token minimum is rejected.
+#[test]
+fn withdraw_below_token_minimum_fails() {
+    let ctx = setup();
+    ctx.register_solver();
+    let res = ctx.client().try_withdraw_bond(&ctx.solver, &(BOND - MIN_BOND + 1));
+    assert_eq!(res, Err(Ok(Error::SolverBondTooLow)));
+}
+
+/// The per-solver bond-token cap is enforced.
+#[test]
+fn too_many_bond_tokens_rejected() {
+    let ctx = setup();
+    ctx.register_solver(); // token #1 (default)
+    for _ in 1..MAX_BOND_TOKENS {
+        let t = second_bond_token(&ctx);
+        token::StellarAssetClient::new(&ctx.env, &t).mint(&ctx.solver, &MIN_BOND);
+        ctx.client()
+            .register_solver_with_token(&ctx.solver, &t, &MIN_BOND);
+    }
+    // One past the cap.
+    let extra = second_bond_token(&ctx);
+    token::StellarAssetClient::new(&ctx.env, &extra).mint(&ctx.solver, &MIN_BOND);
+    let res = ctx
+        .client()
+        .try_register_solver_with_token(&ctx.solver, &extra, &MIN_BOND);
+    assert_eq!(res, Err(Ok(Error::TooManyBondTokens)));
+}
+
+/// Legacy single-token path is unchanged: `register_solver` still bonds in the
+/// default token and `bond_amount` still mirrors it.
+#[test]
+fn legacy_single_token_registration_unchanged() {
+    let ctx = setup();
+    ctx.register_solver();
+    let r = ctx.client().get_solver(&ctx.solver).unwrap();
+    assert_eq!(r.bond_amount, BOND);
+    assert_eq!(ctx.client().get_solver_bond(&ctx.solver, &ctx.bond_token), BOND);
 }
