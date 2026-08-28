@@ -4,8 +4,11 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+# `rlib` in addition to `cdylib` so `intent_settlement` can depend on this
+# crate as a library (for `ProofRegistryClient`) while `stellar contract build`
+# still emits the cdylib wasm (issue #190).
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [profile.release]
 opt-level = "z"
