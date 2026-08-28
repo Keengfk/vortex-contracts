@@ -10,7 +10,7 @@
 //!
 //! A second table reports the serialised XDR size of the two persistent
 //! records (`IntentRecord`, `SolverRecord`) read back from storage — the
-//! per-write ledger footprint issue #196 is trying to shrink.
+//! per-write ledger footprint.
 //!
 //! ## Methodology & caveats
 //!
@@ -280,7 +280,8 @@ fn collect_batch_rows() -> StdVec<(StdString, Measurement, u64)> {
     rows
 }
 
-/// Serialised XDR size of the two persistent records, read back from storage.
+/// Serialised XDR size of the two persistent records rewritten on the hot
+/// paths, read back from storage after `accept_intent`.
 fn record_sizes() -> (u32, u32) {
     let f = Fixture::new();
     f.register_solver();
@@ -289,16 +290,9 @@ fn record_sizes() -> (u32, u32) {
 
     let env = &f.env;
     env.as_contract(&f.contract, || {
-        let intent: IntentRecord = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Intent(id.clone()))
-            .unwrap();
-        let solver: SolverRecord = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Solver(f.solver.clone()))
-            .unwrap();
+        let p = env.storage().persistent();
+        let intent: IntentRecord = p.get(&DataKey::Intent(id.clone())).unwrap();
+        let solver: SolverRecord = p.get(&DataKey::Solver(f.solver.clone())).unwrap();
         (intent.to_xdr(env).len(), solver.to_xdr(env).len())
     })
 }

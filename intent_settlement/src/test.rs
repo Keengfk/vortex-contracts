@@ -7,7 +7,8 @@
 
 use crate::{
     DataKey, Error, IntentSettlement, IntentSettlementClient, IntentState, SolverRecord,
-    ADMIN_TIMELOCK_DELAY, CANCEL_COOLDOWN, FILL_WINDOW, INTENT_EXPIRY, MIN_BOND, SLASH_COOLDOWN,
+    ADMIN_TIMELOCK_DELAY, CANCEL_COOLDOWN, FILL_WINDOW, INTENT_EXPIRY, MIN_BOND, PROTOCOL_FEE_BPS,
+    SLASH_COOLDOWN,
 };
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
@@ -1767,12 +1768,6 @@ fn get_bond_token_returns_configured_token() {
 }
 
 #[test]
-fn get_min_bond_returns_enforced_minimum() {
-    let ctx = setup();
-    assert_eq!(ctx.client().get_min_bond(), MIN_BOND);
-}
-
-#[test]
 fn get_min_bond_multiplier_defaults_to_one() {
     let ctx = setup();
     assert_eq!(ctx.client().get_min_bond_multiplier(&ctx.dst_token), 10);
@@ -1877,22 +1872,6 @@ fn slash_cooldown_expires_after_time_window() {
         ctx.client().get_intent(&id2).unwrap().solver,
         Some(ctx.solver.clone())
     );
-}
-
-// ─── get_protocol_params view ────────────────────────────────────────────────────
-
-#[test]
-fn get_protocol_params_returns_current_constants() {
-    use crate::{FILL_WINDOW, INTENT_EXPIRY, MIN_BOND};
-    const PROTOCOL_FEE_BPS: i128 = 5;
-
-    let ctx = setup();
-    let params = ctx.client().get_protocol_params();
-
-    assert_eq!(params.min_bond, MIN_BOND);
-    assert_eq!(params.fill_window, FILL_WINDOW);
-    assert_eq!(params.intent_expiry, INTENT_EXPIRY);
-    assert_eq!(params.protocol_fee_bps, PROTOCOL_FEE_BPS);
 }
 
 // ─── Partial fills ───────────────────────────────────────────────────────────────
@@ -2918,4 +2897,271 @@ fn unknown_chain_bypasses_token_format_validation() {
         &MIN_DST,
         &deadline,
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────
+// #194 — contract upgrade / storage migration
+// ─────────────────────────────────────────────────────────────────────────────────
+
+use soroban_sdk::Vec as SVec;
+
+fn wasm_hash(env: &Env, byte: u8) -> BytesN<32> {
+    BytesN::from_array(env, &[byte; 32])
+}
+
+#[test]
+fn propose_upgrade_stores_pending_and_is_readable() {
+    let ctx = setup();
+    let c = ctx.client();
+    let h = wasm_hash(&ctx.env, 0xAB);
+
+    assert!(c.get_pending_upgrade().is_none());
+    c.propose_upgrade(&h);
+
+    let (pending, eta) = c.get_pending_upgrade().unwrap();
+    assert_eq!(pending, h);
+    assert_eq!(eta, ctx.env.ledger().timestamp() + ADMIN_TIMELOCK_DELAY);
+}
+
+#[test]
+fn execute_upgrade_before_timelock_fails() {
+    let ctx = setup();
+    let c = ctx.client();
+    let h = wasm_hash(&ctx.env, 1);
+    c.propose_upgrade(&h);
+
+    // One second short of the delay.
+    ctx.pass_time(ADMIN_TIMELOCK_DELAY - 1);
+    let res = c.try_execute_upgrade(&h);
+    assert_eq!(res, Err(Ok(Error::TimelockNotElapsed.into())));
+}
+
+#[test]
+fn execute_upgrade_wrong_hash_fails() {
+    let ctx = setup();
+    let c = ctx.client();
+    c.propose_upgrade(&wasm_hash(&ctx.env, 1));
+    ctx.pass_time(ADMIN_TIMELOCK_DELAY);
+
+    let res = c.try_execute_upgrade(&wasm_hash(&ctx.env, 2));
+    assert_eq!(res, Err(Ok(Error::Unauthorized.into())));
+}
+
+#[test]
+fn execute_upgrade_without_proposal_fails() {
+    let ctx = setup();
+    let res = ctx.client().try_execute_upgrade(&wasm_hash(&ctx.env, 9));
+    assert_eq!(res, Err(Ok(Error::NoPendingUpgrade.into())));
+}
+
+#[test]
+fn propose_upgrade_overwrites_prior_proposal() {
+    let ctx = setup();
+    let c = ctx.client();
+    c.propose_upgrade(&wasm_hash(&ctx.env, 1));
+    ctx.pass_time(10);
+    let h2 = wasm_hash(&ctx.env, 2);
+    c.propose_upgrade(&h2);
+
+    let (pending, eta) = c.get_pending_upgrade().unwrap();
+    assert_eq!(pending, h2);
+    // Timelock reset from the second proposal.
+    assert_eq!(eta, ctx.env.ledger().timestamp() + ADMIN_TIMELOCK_DELAY);
+}
+
+#[test]
+fn migrate_on_fresh_contract_is_rejected() {
+    // initialize() stamps the current MIGRATION_VERSION, so migrate() is a
+    // no-op it refuses to run.
+    let ctx = setup();
+    let res = ctx.client().try_migrate();
+    assert_eq!(res, Err(Ok(Error::AlreadyMigrated.into())));
+}
+
+#[test]
+fn migrate_runs_once_from_an_unmigrated_contract() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    // Simulate a contract deployed before #194: no stored version.
+    ctx.env.as_contract(&ctx.contract_id, || {
+        ctx.env
+            .storage()
+            .instance()
+            .remove(&DataKey::MigrationVersion);
+    });
+
+    // First migrate succeeds and stamps the version.
+    c.migrate();
+    let stored: u32 = ctx.env.as_contract(&ctx.contract_id, || {
+        ctx.env
+            .storage()
+            .instance()
+            .get(&DataKey::MigrationVersion)
+            .unwrap()
+    });
+    assert_eq!(stored, crate::MIGRATION_VERSION);
+
+    // Second call is the one-time guard.
+    let res = c.try_migrate();
+    assert_eq!(res, Err(Ok(Error::AlreadyMigrated.into())));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────
+// #192 — tiered protocol-fee discounts
+// ─────────────────────────────────────────────────────────────────────────────────
+
+/// Build a discount schedule: `(min_volume, discount_bps)` pairs.
+fn tiers(env: &Env, pairs: &[(i128, u32)]) -> SVec<(i128, u32)> {
+    let mut v = SVec::new(env);
+    for &(mv, d) in pairs {
+        v.push_back((mv, d));
+    }
+    v
+}
+
+/// Overwrite a registered solver's cumulative volume directly.
+fn set_volume(ctx: &Ctx, vol: i128) {
+    ctx.env.as_contract(&ctx.contract_id, || {
+        let mut r: SolverRecord = ctx
+            .env
+            .storage()
+            .persistent()
+            .get(&DataKey::Solver(ctx.solver.clone()))
+            .unwrap();
+        r.total_volume = vol;
+        ctx.env
+            .storage()
+            .persistent()
+            .set(&DataKey::Solver(ctx.solver.clone()), &r);
+    });
+}
+
+#[test]
+fn no_discount_schedule_means_flat_fee() {
+    let ctx = setup();
+    ctx.register_solver();
+    let (sched, eff) = ctx.client().get_fee_schedule(&ctx.solver);
+    assert_eq!(sched.len(), 0);
+    assert_eq!(eff, PROTOCOL_FEE_BPS); // 5
+}
+
+#[test]
+fn zero_volume_solver_pays_full_fee_even_with_a_schedule() {
+    let ctx = setup();
+    ctx.register_solver();
+    ctx.client()
+        .set_fee_discount_tiers(&tiers(&ctx.env, &[(1_000, 2_000), (1_000_000, 5_000)]));
+
+    let (_, eff) = ctx.client().get_fee_schedule(&ctx.solver);
+    assert_eq!(eff, PROTOCOL_FEE_BPS);
+}
+
+#[test]
+fn high_volume_solver_gets_the_top_tier_discount() {
+    let ctx = setup();
+    ctx.register_solver();
+    // 5 bps base; top tier waives 50% of it -> 5 - floor(5*5000/10000) = 5 - 2 = 3.
+    ctx.client()
+        .set_fee_discount_tiers(&tiers(&ctx.env, &[(1_000, 2_000), (1_000_000, 5_000)]));
+    set_volume(&ctx, 2_000_000);
+
+    let (_, eff) = ctx.client().get_fee_schedule(&ctx.solver);
+    assert_eq!(eff, 3);
+}
+
+#[test]
+fn discount_tier_boundary_is_inclusive() {
+    let ctx = setup();
+    ctx.register_solver();
+    ctx.client()
+        .set_fee_discount_tiers(&tiers(&ctx.env, &[(1_000_000, 2_000)]));
+
+    set_volume(&ctx, 999_999);
+    assert_eq!(ctx.client().get_fee_schedule(&ctx.solver).1, 5); // below
+
+    set_volume(&ctx, 1_000_000);
+    assert_eq!(ctx.client().get_fee_schedule(&ctx.solver).1, 4); // exactly at: 5 - floor(5*2000/10000)=5-1
+}
+
+#[test]
+fn full_discount_waives_the_fee_but_never_goes_negative() {
+    let ctx = setup();
+    ctx.register_solver();
+    ctx.client()
+        .set_fee_discount_tiers(&tiers(&ctx.env, &[(1, 10_000)]));
+    set_volume(&ctx, 10);
+    assert_eq!(ctx.client().get_fee_schedule(&ctx.solver).1, 0);
+}
+
+#[test]
+fn set_fee_discount_tiers_rejects_non_ascending() {
+    let ctx = setup();
+    let res = ctx
+        .client()
+        .try_set_fee_discount_tiers(&tiers(&ctx.env, &[(1_000, 1_000), (500, 2_000)]));
+    assert_eq!(res, Err(Ok(Error::InvalidFeeTiers.into())));
+}
+
+#[test]
+fn set_fee_discount_tiers_rejects_discount_over_100_percent() {
+    let ctx = setup();
+    let res = ctx
+        .client()
+        .try_set_fee_discount_tiers(&tiers(&ctx.env, &[(1_000, 10_001)]));
+    assert_eq!(res, Err(Ok(Error::InvalidFeeTiers.into())));
+}
+
+#[test]
+fn fill_intent_charges_the_discounted_fee() {
+    let ctx = setup();
+    let c = ctx.client();
+    ctx.register_solver();
+
+    // 50%-off tier, and put the solver above it.
+    c.set_fee_discount_tiers(&tiers(&ctx.env, &[(1_000_000, 5_000)]));
+    set_volume(&ctx, 5_000_000);
+
+    let id = ctx.submit();
+    c.accept_intent(&ctx.solver, &id);
+
+    // effective fee = 3 bps (see high_volume test); fee = FILL * 3 / 10_000.
+    let expected_fee = FILL * 3 / 10_000;
+    let flat_fee = FILL * PROTOCOL_FEE_BPS / 10_000;
+    assert!(expected_fee < flat_fee);
+
+    ctx.dst_admin().mint(&ctx.solver, &(FILL + expected_fee));
+    c.fill_intent(&ctx.solver, &id, &FILL);
+
+    assert_eq!(ctx.dst().balance(&ctx.fee_recipient), expected_fee);
+    assert_eq!(ctx.dst().balance(&ctx.user), FILL);
+}
+
+#[test]
+fn fee_discount_curve_is_locked_in() {
+    // Regression guard: pin the exact effective bps for a fixed schedule and
+    // a spread of volumes so a future change to the discount math is
+    // deliberate.
+    let ctx = setup();
+    ctx.register_solver();
+    ctx.client().set_fee_discount_tiers(&tiers(
+        &ctx.env,
+        &[(100, 1_000), (10_000, 4_000), (1_000_000, 8_000)],
+    ));
+
+    for (vol, want) in [
+        (0i128, 5i128),
+        (99, 5),
+        (100, 5),    // 5 - floor(5*1000/10000)=5-0
+        (10_000, 3), // 5 - floor(5*4000/10000)=5-2
+        (999_999, 3),
+        (1_000_000, 1), // 5 - floor(5*8000/10000)=5-4
+    ] {
+        set_volume(&ctx, vol);
+        assert_eq!(
+            ctx.client().get_fee_schedule(&ctx.solver).1,
+            want,
+            "volume {vol}"
+        );
+    }
 }

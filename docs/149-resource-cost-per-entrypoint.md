@@ -66,18 +66,22 @@ version.
 
 | Entrypoint | CPU instructions | Memory bytes |
 |---|--:|--:|
-| `submit_intent` | 277,759 | 38,508 |
-| `accept_intent` | 289,315 | 45,974 |
-| `fill_intent` (full fill — closes the intent) | 609,248 | 95,091 |
-| `fill_intent` (partial fill — re-opens the intent) | 628,355 | 95,807 |
-| `cancel_intent` | 231,527 | 38,032 |
-| `expire_intent` | 196,158 | 30,634 |
-| `slash_solver` | 434,756 | 63,741 |
-| `request_extension` | 173,160 | 32,070 |
-| `register_solver` (first registration) | 330,084 | 50,389 |
-| `register_solver` (top-up of an existing bond) | 304,036 | 43,334 |
-| `withdraw_bond` | 306,530 | 43,951 |
-| `deregister_solver` | 320,996 | 46,832 |
+| `submit_intent` | 281,113 | 39,630 |
+| `accept_intent` | 297,608 | 47,422 |
+| `fill_intent` (full fill — closes the intent) | 622,328 | 96,723 |
+| `fill_intent` (partial fill — re-opens the intent) | 642,020 | 97,463 |
+| `cancel_intent` | 239,820 | 39,480 |
+| `expire_intent` | 204,451 | 32,082 |
+| `slash_solver` | 443,049 | 65,189 |
+| `request_extension` | 176,128 | 32,790 |
+| `register_solver` (first registration) | 342,082 | 51,837 |
+| `register_solver` (top-up of an existing bond) | 311,498 | 44,278 |
+| `withdraw_bond` | 313,992 | 44,895 |
+| `deregister_solver` | 332,088 | 48,280 |
+
+`fill_intent` also resolves the caller's volume-tier fee discount (#192): with
+no schedule set this is one extra instance read; with a schedule it also loads
+the `SolverRecord` to read `total_volume`.
 
 Notes:
 
@@ -90,24 +94,21 @@ Notes:
 - `slash_solver` is the next most expensive — one token transfer plus a full
   rewrite of both records.
 
-### Batch operations (per-item)
+### Multi-item throughput (per-item)
 
-`batch_submit_intent` / `batch_accept_intent` are thin loops over the
-single-item entrypoint plus a one-off `MAX_BATCH_SIZE` check, so per-item
-cost is measured by running N sequential single calls:
+Cost of N sequential `submit_intent` / `accept_intent` calls:
 
 | Sequence | CPU total | CPU / item | Mem total | Mem / item |
 |---|--:|--:|--:|--:|
-| `submit_intent` ×1 | 277,759 | 277,759 | 38,508 | 38,508 |
-| `submit_intent` ×5 | 1,526,222 | 305,244 | 212,024 | 42,404 |
-| `submit_intent` ×10 | 3,224,140 | 322,414 | 465,819 | 46,581 |
-| `accept_intent` ×1 | 289,315 | 289,315 | 45,974 | 45,974 |
-| `accept_intent` ×5 | 1,486,982 | 297,396 | 247,334 | 49,466 |
-| `accept_intent` ×10 | 3,152,960 | 315,296 | 550,559 | 55,055 |
+| `submit_intent` ×1 | 281,113 | 281,113 | 39,630 | 39,630 |
+| `submit_intent` ×5 | 1,529,308 | 305,861 | 217,634 | 43,526 |
+| `submit_intent` ×10 | 3,226,891 | 322,689 | 477,039 | 47,703 |
+| `accept_intent` ×1 | 297,608 | 297,608 | 47,422 | 47,422 |
+| `accept_intent` ×5 | 1,528,447 | 305,689 | 254,574 | 50,914 |
+| `accept_intent` ×10 | 3,235,890 | 323,589 | 565,039 | 56,503 |
 
 Per-item cost is roughly flat (a mild upward drift from the growing
-`UserIntents` vector on `submit_intent`); batching amortises only the
-transaction envelope, not the per-item work.
+`UserIntents` vector on `submit_intent`).
 
 ## 4. Persistent record sizes
 
@@ -121,18 +122,20 @@ from storage after `accept_intent`:
 
 `accept_intent` and both `fill_intent` paths rewrite the **entire**
 `IntentRecord` (624 bytes) even though only a few fields change, plus the
-full `SolverRecord` (340 bytes). This is the write-bytes cost issue #196
-targets: splitting the write-once fields (`src_chain`, `src_token`,
-`src_amount`, `user`, `created_at`) out of the frequently-mutated state would
-cut the bytes rewritten on every transition.
+full `SolverRecord` (340 bytes). Trimming this is issue #196 — splitting the
+write-once `src_chain` / `src_token` (~110 bytes) into a separate entry that
+state transitions never touch cuts the per-transition write by ~8%; a deeper
+split cuts more. It is deferred until the wasm-size budget has room for the
+extra `#[contracttype]` codegen (the contract currently sits ~120 bytes under
+the 65,536-byte limit).
 
 ## 5. Follow-up
 
-- Issue #196 uses the `IntentRecord` size above as its before/after baseline.
 - A CI job that regenerates this table on every change is intentionally out
   of scope here (separate DevOps issue); for now, rerun the harness manually
   after any change to `lib.rs` storage shape or the SDK version and update
   sections 3–4.
+- Issue #196 (the `IntentRecord` split), once the wasm-size budget allows it.
 
 ---
 
