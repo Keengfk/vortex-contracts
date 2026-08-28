@@ -11,6 +11,10 @@ use soroban_sdk::{
     Address, Bytes, BytesN, Env, String, Symbol, Vec,
 };
 
+/// Cross-contract client for the `ProofRegistry` contract (issue #190).
+/// Used only on the `fill_intent(..., require_proof = true)` path.
+use vortex_proof_registry::ProofRegistryClient;
+
 #[cfg(test)]
 mod test;
 
@@ -144,6 +148,14 @@ pub enum DataKey {
     /// unpause access) -- resuming the protocol always needs the full
     /// admin's judgment.
     Pauser,
+
+    /// **Instance storage.** `Address` of the deployed `ProofRegistry`
+    /// contract (issue #190, docs/124 §4.1). Absent until the admin calls
+    /// `set_proof_registry`. Only read by `fill_intent` when it is invoked
+    /// with `require_proof = true`; a `require_proof = false` fill never
+    /// touches this key, so proof-gating is fully opt-in and defaults off
+    /// exactly like `DstAllowlistEnabled`.
+    ProofRegistry,
 }
 
 // ─── Data Structs ─────────────────────────────────────────────────────────────
@@ -408,6 +420,36 @@ pub enum Error {
     /// If `src_chain` is unknown this error is never raised — unknown chains
     /// bypass token-format validation so the allowlist remains the sole gate.
     InvalidSrcToken = 28,
+
+    // ── Proof-gated fills (issue #190, docs/129-proof-mismatch-fallback.md) ──
+    //
+    // docs/129 §6 assigns these the logical codes 24–27, but 24 is already
+    // taken in this enum (`InvalidTokenInterface`) and 22/23 currently carry
+    // duplicate discriminants from earlier merges. To avoid making that worse
+    // these use a fresh contiguous block; the doc's semantic mapping is noted
+    // on each variant.
+    /// docs/129 §2.4 (code 24). `fill_intent` was called with
+    /// `require_proof = true` but no `DataKey::ProofRegistry` has been set by
+    /// the admin. Configuration error — no slash, intent stays `Accepted`.
+    ProofRegistryNotSet = 30,
+    /// docs/129 §2.3 (code 25). `ProofRegistry.get_proof(intent_id)` returned
+    /// `None`: no verified source-chain deposit for this intent yet. Intent
+    /// stays `Accepted`; the solver should retry once the VAA is relayed, or
+    /// be slashed if the fill window elapses first.
+    ProofNotFound = 31,
+    /// docs/129 §2.2 (code 26). The proof's `src_chain_id` does not equal the
+    /// Wormhole chain ID mapped from `intent.src_chain`. Hard reject; intent
+    /// stays `Accepted`.
+    ProofChainMismatch = 32,
+    /// docs/129 §2.1 (code 27). `proof.src_amount < intent.src_amount` — the
+    /// source deposit was smaller than the intent requires. Hard reject;
+    /// intent stays `Accepted` so the solver can supply a corrected VAA or be
+    /// slashed at deadline.
+    ProofAmountInsufficient = 33,
+    /// docs/129 §4. `intent.src_chain` is not in the canonical
+    /// chain-name → Wormhole-chain-ID table, so the proof's chain cannot be
+    /// validated against it.
+    SrcChainNotSupported = 34,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -891,6 +933,31 @@ impl IntentSettlement {
     /// The current pauser address, if the admin has set one.
     pub fn get_pauser(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::Pauser)
+    }
+
+    // ── Proof Registry (issue #190) ──────────────────────────────────────────
+
+    /// Admin-only: point this contract at a deployed `ProofRegistry`
+    /// (docs/124 §4.1). Required before any solver can call
+    /// `fill_intent(..., require_proof = true)`. Until this is set, proof-gated
+    /// fills panic with `ProofRegistryNotSet`; ungated fills
+    /// (`require_proof = false`) are unaffected.
+    ///
+    /// Calling again rotates the address (e.g. after a registry upgrade).
+    pub fn set_proof_registry(env: Env, registry: Address) {
+        Self::require_admin(&env);
+        env.storage()
+            .instance()
+            .set(&DataKey::ProofRegistry, &registry);
+        Self::bump_instance_ttl(&env);
+        env.events()
+            .publish((Symbol::new(&env, "proof_registry_set"),), registry);
+    }
+
+    /// The configured `ProofRegistry` address, or `None` if proof-gating has
+    /// not been enabled by the admin.
+    pub fn get_proof_registry(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::ProofRegistry)
     }
 
     /// Admin- or pauser-only: halt new intent submission, acceptance, and
@@ -1417,7 +1484,40 @@ impl IntentSettlement {
     ///
     /// The protocol fee is taken on each individual fill so the fee accounting
     /// stays consistent regardless of how many fills it takes.
-    pub fn fill_intent(env: Env, solver: Address, intent_id: BytesN<32>, fill_amount: i128) {
+    ///
+    /// ## Proof gating (issue #190, docs/124 §4.2, docs/129)
+    ///
+    /// When `require_proof == true`, the fill is cross-checked against a
+    /// `ProofRegistry` record for `intent_id` before any tokens move:
+    ///
+    /// * no `ProofRegistry` configured → `ProofRegistryNotSet`;
+    /// * no proof for this intent      → `ProofNotFound`   (docs/129 §2.3);
+    /// * `proof.src_chain_id` ≠ mapped `intent.src_chain` → `ProofChainMismatch`
+    ///   (docs/129 §2.2);
+    /// * `proof.src_amount < intent.src_amount` → `ProofAmountInsufficient`
+    ///   (docs/129 §2.1).
+    ///
+    /// Every rejection is a `panic_with_error!` before any storage write or
+    /// transfer, so the intent stays `Accepted`, the fill window keeps running,
+    /// and `slash_solver` remains callable if the solver never produces a valid
+    /// proof — exactly the state machine in docs/129 §3.
+    ///
+    /// The check is against the immutable `intent.src_amount` (the whole-intent
+    /// source deposit), not a per-fill quantity, so partial fills each simply
+    /// re-assert the same condition against the same proof record — no
+    /// cumulative accounting is involved.
+    ///
+    /// `require_proof == false` is 100% backward compatible: the
+    /// `ProofRegistry` is never read and behaviour is byte-for-byte identical
+    /// to the pre-#190 contract, mirroring how `DstAllowlistEnabled` defaults
+    /// off.
+    pub fn fill_intent(
+        env: Env,
+        solver: Address,
+        intent_id: BytesN<32>,
+        fill_amount: i128,
+        require_proof: bool,
+    ) {
         // Auth audit: require_auth() is correct. The solver must sign to
         // authorise the token transfer from their address to the user and fee
         // recipient. This is the highest-value call site: the solver authorises
@@ -1456,6 +1556,13 @@ impl IntentSettlement {
 
         if fill_amount <= 0 {
             panic_with_error!(&env, Error::ZeroAmount);
+        }
+
+        // ── Proof gate (issue #190) ─────────────────────────────────────────
+        // Runs before any token transfer or storage write. Every failure path
+        // leaves the intent untouched in `Accepted` (docs/129 §3).
+        if require_proof {
+            Self::validate_proof(&env, &intent, &intent_id);
         }
 
         // Deliver this fill's tokens to the user.
@@ -2221,6 +2328,61 @@ impl IntentSettlement {
             }
         }
         // Unknown chain: skip validation — forward-compatible with future chains.
+    }
+
+    // ── Proof gating (issue #190) ────────────────────────────────────────────
+
+    /// Cross-check an `Accepted` intent against its `ProofRegistry` record.
+    /// Called from `fill_intent` only when `require_proof == true`. Panics —
+    /// leaving the intent untouched — on any of the four docs/129 failure
+    /// modes; returns normally when the proof matches.
+    fn validate_proof(env: &Env, intent: &IntentRecord, intent_id: &BytesN<32>) {
+        let registry_addr: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProofRegistry)
+            .unwrap_or_else(|| panic_with_error!(env, Error::ProofRegistryNotSet));
+
+        // One extra cross-contract read per gated fill (docs/124 §4.3). This is
+        // the resource-fee cost the issue calls out; it is only paid when the
+        // caller opts in via `require_proof = true`.
+        let registry = ProofRegistryClient::new(env, &registry_addr);
+        let proof = registry
+            .get_proof(intent_id)
+            .unwrap_or_else(|| panic_with_error!(env, Error::ProofNotFound));
+
+        let want_chain_id = Self::wormhole_chain_id(env, &intent.src_chain);
+        if proof.src_chain_id != want_chain_id {
+            panic_with_error!(env, Error::ProofChainMismatch);
+        }
+
+        if proof.src_amount < intent.src_amount {
+            panic_with_error!(env, Error::ProofAmountInsufficient);
+        }
+    }
+
+    /// Map a canonical `src_chain` name to its Wormhole chain ID
+    /// (docs/129 §4, kept in sync with docs/132-supported-chains.md). Panics
+    /// with `SrcChainNotSupported` for any name not in the table.
+    fn wormhole_chain_id(env: &Env, src_chain: &String) -> u32 {
+        let len = src_chain.len() as usize;
+        // Longest supported name ("avalanche") is 9 bytes.
+        if len == 0 || len > 16 {
+            panic_with_error!(env, Error::SrcChainNotSupported);
+        }
+        let mut buf = [0u8; 16];
+        src_chain.copy_into_slice(&mut buf[..len]);
+        match &buf[..len] {
+            b"solana" => 1,
+            b"ethereum" => 2,
+            b"bsc" => 4,
+            b"polygon" => 5,
+            b"avalanche" => 6,
+            b"arbitrum" => 23,
+            b"optimism" => 24,
+            b"base" => 30,
+            _ => panic_with_error!(env, Error::SrcChainNotSupported),
+        }
     }
 
     fn require_admin(env: &Env) {
