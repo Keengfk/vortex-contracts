@@ -17,13 +17,16 @@
 
 #![cfg(test)]
 
+extern crate std;
+
 use proptest::prelude::*;
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
     token, Address, Env, String,
 };
+use std::vec::Vec;
 
-use crate::{IntentSettlement, IntentSettlementClient, FILL_WINDOW, MIN_BOND};
+use crate::{IntentSettlement, IntentSettlementClient, FILL_WINDOW, MIN_BOND, SLASH_COOLDOWN};
 
 // ─── Tunables ────────────────────────────────────────────────────────────────────
 
@@ -89,10 +92,6 @@ impl Fixture {
         token::StellarAssetClient::new(&self.env, &self.bond_token)
     }
 
-    fn dst_admin(&self) -> token::StellarAssetClient<'_> {
-        token::StellarAssetClient::new(&self.env, &self.dst_token)
-    }
-
     fn pass_time(&self, secs: u64) {
         self.env.ledger().with_mut(|li| li.timestamp += secs);
     }
@@ -117,8 +116,7 @@ impl Fixture {
         let contract_bal = self.contract_bond_balance();
         let sum = self.sum_bond_amounts();
         assert_eq!(
-            contract_bal,
-            sum,
+            contract_bal, sum,
             "Bond conservation violated: contract holds {contract_bal} but Σ bond_amounts = {sum}"
         );
     }
@@ -237,7 +235,10 @@ fn execute_step(f: &mut Fixture, step: &Step) {
             }
 
             // Submit a fresh intent and immediately accept + slash it.
-            f.pass_time(1); // ensure unique timestamp → unique intent_id
+            // Advance past SLASH_COOLDOWN so a solver slashed on an earlier
+            // step is eligible to accept again (accept_intent enforces the
+            // post-slash cooldown), and so each intent_id gets a unique ts.
+            f.pass_time(SLASH_COOLDOWN + 1);
             let intent_id = c.submit_intent(
                 &f.user,
                 &String::from_str(&f.env, "ethereum"),

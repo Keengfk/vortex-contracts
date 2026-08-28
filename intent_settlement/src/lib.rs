@@ -37,6 +37,27 @@ const BID_WINDOW: u64 = 120; // 2 minutes
 /// (#116).
 const ADMIN_TIMELOCK_DELAY: u64 = 172_800; // 48 hours
 
+// ── Defaults seeded into `ProtocolConfig` by `initialize`, and the fallback
+// `load_config` returns for contracts deployed before the configurable-params
+// feature existed.  They mirror the historical compile-time constants above.
+const DEFAULT_MIN_BOND: i128 = MIN_BOND;
+const DEFAULT_FILL_WINDOW: u64 = FILL_WINDOW;
+const DEFAULT_INTENT_EXPIRY: u64 = INTENT_EXPIRY;
+const DEFAULT_PROTOCOL_FEE_BPS: i128 = PROTOCOL_FEE_BPS;
+
+// ── `set_config` bounds.  A parameter outside any of these ranges is rejected
+// with `Error::InvalidConfig`.
+const MAX_PROTOCOL_FEE_BPS: i128 = 1_000; // 10% hard cap on the protocol fee
+const MIN_FILL_WINDOW_SECS: u64 = 60; // a solver needs at least a minute to fill
+const MIN_INTENT_EXPIRY_SECS: u64 = 300; // and must always exceed the fill window
+const MIN_BOND_FLOOR: i128 = 10_000_000; // one 7-decimal USDC unit
+
+// ── Cooldowns / limits enforced outside `ProtocolConfig`.
+const SLASH_COOLDOWN: u64 = 3600; // 1 hour a slashed solver must wait before accepting again
+const CANCEL_COOLDOWN: u64 = 3600; // 1 hour between a user's successive intent cancellations
+const MAX_EXTENSION_DURATION: u64 = 300; // one extra fill window granted by `request_extension`
+const MAX_BATCH_SIZE: u32 = 50; // upper bound on items in a batch_* call
+
 // Upper sanity bound for src_amount and min_dst_amount.
 //
 // Largest realistic token amounts use 18-decimal ETH units.
@@ -131,7 +152,7 @@ pub enum DataKey {
     /// `submit_intent`, letting an admin pre-populate the list before
     /// switching enforcement on.
     DstAllowlistEnabled,
-    UserNonce(Address),       // per-user submit counter to widen intent_id preimage
+    UserNonce(Address),      // per-user submit counter to widen intent_id preimage
     AllowedSrcChain(String), // src_chain name -> present if allowed
     SrcChainAllowlistEnabled,
 
@@ -144,6 +165,52 @@ pub enum DataKey {
     /// unpause access) -- resuming the protocol always needs the full
     /// admin's judgment.
     Pauser,
+
+    /// **Instance storage.** Admin-configurable `ProtocolConfig` (min bond,
+    /// fill window, intent expiry, protocol fee bps).  Seeded by `initialize`
+    /// and replaced atomically by `set_config`.  Absent on contracts that
+    /// pre-date the configurable-params feature, in which case `load_config`
+    /// falls back to the compile-time `DEFAULT_*` values.
+    Config,
+
+    /// **Instance storage.** Pending admin-transfer proposal plus the ledger
+    /// timestamp at which `accept_admin_transfer` may execute it:
+    /// `(Address, u64)`.  Written by `propose_admin_transfer`, cleared by
+    /// `accept_admin_transfer`.
+    PendingAdmin,
+
+    /// **Instance storage.** Per-`dst_token` pending "add to allowlist"
+    /// proposal: the ledger timestamp (`u64`) at which `execute_add_dst_token`
+    /// becomes callable.  Written by `propose_add_dst_token`.
+    PendingDstTokenAdd(Address),
+
+    /// **Instance storage.** Per-`dst_token` pending "remove from allowlist"
+    /// proposal: the ledger timestamp (`u64`) at which
+    /// `execute_remove_dst_token` becomes callable.
+    PendingDstTokenRemove(Address),
+
+    /// **Instance storage.** Enumerable mirror of the `AllowedDstToken`
+    /// presence-flags: `Vec<Address>` of every currently-allowed dst_token,
+    /// so `list_allowed_dst_tokens` can answer without an event replay (#117).
+    AllowedDstTokenList,
+
+    /// **Persistent storage.** Per-`dst_token` bond multiplier in tenths
+    /// (`i128`; `10` = 1.0x, `15` = 1.5x).  Unset tokens default to `10`.
+    /// Written by `set_min_bond_multiplier`.
+    MinBondMultiplier(Address),
+
+    /// **Persistent storage.** Per-user list of every `intent_id` the user
+    /// has submitted (`Vec<BytesN<32>>`), backing `list_intents_by_user`.
+    UserIntents(Address),
+
+    /// **Persistent storage.** Per-user ledger timestamp (`u64`) of the last
+    /// successful `cancel_intent`, enforcing `CANCEL_COOLDOWN` between a
+    /// user's successive cancellations (spam deterrence).
+    CancelCooldown(Address),
+
+    /// **Persistent storage.** Presence-flag (value `true`) recording that an
+    /// intent has already consumed its single `request_extension` grant.
+    ExtensionGranted(BytesN<32>),
 }
 
 // ─── Data Structs ─────────────────────────────────────────────────────────────
@@ -388,14 +455,17 @@ pub enum Error {
 
     /// Duplicate `intent_id` detected in `submit_intent` (hash collision guard).
     IntentAlreadyExists = 22,
-    /// #30: no pending fee-recipient proposal to accept
-    NoPendingFeeRecipient = 22,
     /// #31: fee arithmetic overflowed (fill_amount is astronomically large)
     FeeOverflow = 23,
     /// #33: the address passed to add_allowed_dst_token doesn't implement SEP-41
     InvalidTokenInterface = 24,
-    SrcChainNotAllowed = 22,
-    RescueProtectedToken = 23,
+    /// #30: no pending fee-recipient proposal to accept in `accept_fee_recipient`.
+    NoPendingFeeRecipient = 25,
+    /// `submit_intent` named a `src_chain` that is not on the allowlist while
+    /// src-chain allowlist enforcement is enabled (#34).
+    SrcChainNotAllowed = 26,
+    /// `rescue_tokens` was asked to move the protocol's own bond token (#35).
+    RescueProtectedToken = 27,
     /// #127: `submit_intent` was called with a `src_token` whose format does
     /// not match the conventions of the declared `src_chain`.
     ///
@@ -408,6 +478,31 @@ pub enum Error {
     /// If `src_chain` is unknown this error is never raised — unknown chains
     /// bypass token-format validation so the allowlist remains the sole gate.
     InvalidSrcToken = 28,
+
+    /// A timelocked admin action (`accept_admin_transfer`,
+    /// `accept_fee_recipient`, `execute_add_dst_token`,
+    /// `execute_remove_dst_token`) was attempted before its
+    /// `ADMIN_TIMELOCK_DELAY` had elapsed (#115).
+    TimelockNotElapsed = 29,
+
+    /// `accept_admin_transfer` was called with no pending proposal stored.
+    NoPendingAdminTransfer = 30,
+
+    /// `set_config` was called with a parameter outside its allowed bound
+    /// (see the `MAX_PROTOCOL_FEE_BPS` / `MIN_*` constants).
+    InvalidConfig = 31,
+
+    /// `execute_add_dst_token` / `execute_remove_dst_token` found no matching
+    /// pending proposal for the given token.
+    NoPendingDstTokenChange = 32,
+
+    /// `submit_intent` was called with `src_amount` or `min_dst_amount`
+    /// exceeding `MAX_AMOUNT`.
+    AmountTooLarge = 33,
+
+    /// `cancel_intent` was called again before `CANCEL_COOLDOWN` had elapsed
+    /// since the caller's previous cancellation.
+    CancelCooldownNotExpired = 34,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -483,9 +578,10 @@ impl IntentSettlement {
         admin.require_auth();
 
         let eta = env.ledger().timestamp() + ADMIN_TIMELOCK_DELAY;
-        env.storage()
-            .instance()
-            .set(&DataKey::PendingFeeRecipient, &(new_fee_recipient.clone(), eta));
+        env.storage().instance().set(
+            &DataKey::PendingFeeRecipient,
+            &(new_fee_recipient.clone(), eta),
+        );
 
         env.events().publish(
             (Symbol::new(&env, "fee_recipient_proposed"),),
@@ -667,10 +763,8 @@ impl IntentSettlement {
             .instance()
             .set(&DataKey::PendingDstTokenAdd(token.clone()), &eta);
 
-        env.events().publish(
-            (Symbol::new(&env, "dst_token_add_proposed"),),
-            (token, eta),
-        );
+        env.events()
+            .publish((Symbol::new(&env, "dst_token_add_proposed"),), (token, eta));
     }
 
     /// Apply a previously proposed `propose_add_dst_token` once its timelock
@@ -818,7 +912,7 @@ impl IntentSettlement {
 
     // ── Source Chain Allowlist ────────────────────────────────────────────────
 
-        /// Admin-only: add a chain name to the src_chain allowlist.
+    /// Admin-only: add a chain name to the src_chain allowlist.
     ///
     /// Issue #34: submit_intent accepted src_chain as free-text with zero
     /// validation, so a typo ("etherium") or unsupported name would create an
@@ -1157,8 +1251,10 @@ impl IntentSettlement {
         // Issue #108: include the post-withdrawal remaining balance so indexers
         // can maintain a solver's bond ledger without a separate get_solver call.
         // data: (amount: i128, remaining: i128)
-        env.events()
-            .publish((Symbol::new(&env, "bond_withdrawn"), solver), (amount, remaining));
+        env.events().publish(
+            (Symbol::new(&env, "bond_withdrawn"), solver),
+            (amount, remaining),
+        );
     }
 
     // ── Intent Lifecycle ──────────────────────────────────────────────────────
@@ -1344,7 +1440,8 @@ impl IntentSettlement {
         }
 
         let now = env.ledger().timestamp();
-        if solver_record.last_slash_time > 0 && now < solver_record.last_slash_time + SLASH_COOLDOWN {
+        if solver_record.last_slash_time > 0 && now < solver_record.last_slash_time + SLASH_COOLDOWN
+        {
             panic_with_error!(&env, Error::SolverInactive);
         }
 
@@ -1458,43 +1555,26 @@ impl IntentSettlement {
             panic_with_error!(&env, Error::ZeroAmount);
         }
 
-        // Deliver this fill's tokens to the user.
-        let dst_client = token::Client::new(&env, &intent.dst_token);
-        dst_client.transfer(&solver, &intent.user, &fill_amount);
-
-        // Solver also pays the protocol fee on each fill.
-        let fee = fill_amount * PROTOCOL_FEE_BPS / 10_000;
-        // ── Effects first (CEI) ──────────────────────────────────────────────
-        // Mark the intent Filled and write every state change to storage
-        // *before* any external token transfer executes. A hostile SEP-41
-        // token that attempts to re-enter fill_intent or slash_solver during
-        // the transfer would see the intent already Filled and be rejected.
-        // Solver delivers the full requested output to the user.
-        let dst_client = token::Client::new(&env, &intent.dst_token);
-        dst_client.transfer(&solver, &intent.user, &fill_amount);
-
-        // Solver also pays the protocol fee (priced into their quote). Taking the
-        // fee from the solver — rather than clawing it back from the user — keeps
-        // the user's received amount at or above `min_dst_amount`, and keeps every
-        // token transfer authorized by the solver who signed this call.
-        //
-        // Explicit checked_mul/checked_div makes the overflow-safety property
-        // visible in code, rather than relying solely on the Cargo.toml
-        // overflow-checks = true release-profile setting (issue #31).
+        // Protocol fee on this fill, taken from the solver (priced into their
+        // quote) so the user always receives at least `min_dst_amount`.
+        // `get_tiered_fee_bps` is the single source of truth for the effective
+        // rate (it reads the admin-configurable `ProtocolConfig`).  Explicit
+        // checked_mul/checked_div makes the overflow-safety property visible in
+        // code rather than relying solely on the release profile's
+        // `overflow-checks = true` setting (issue #31).
+        let fee_bps = Self::get_tiered_fee_bps(&env);
         let fee = fill_amount
-            .checked_mul(PROTOCOL_FEE_BPS)
+            .checked_mul(fee_bps)
             .unwrap_or_else(|| panic_with_error!(&env, Error::FeeOverflow))
             .checked_div(10_000)
             .unwrap_or_else(|| panic_with_error!(&env, Error::FeeOverflow));
-        if fee > 0 {
-            let fee_recipient: Address = env
-                .storage()
-                .instance()
-                .get(&DataKey::FeeRecipient)
-                .unwrap();
-            dst_client.transfer(&solver, &fee_recipient, &fee);
-        }
 
+        // ── Effects first (CEI) ──────────────────────────────────────────────
+        // Every state change is written to storage *before* the external token
+        // transfers below. A hostile SEP-41 token that tries to re-enter
+        // fill_intent or slash_solver during a transfer sees the intent already
+        // in its post-fill state and is rejected by the guards above.
+        //
         // Accumulate the fill.
         intent.total_filled += fill_amount;
         let cumulative = intent.total_filled;
@@ -1558,16 +1638,13 @@ impl IntentSettlement {
             .set(&DataKey::Intent(intent_id.clone()), &intent);
         Self::bump_intent_ttl(&env, &intent_id);
 
-        // ── Interactions: token transfers ────────────────────────────────────
-        // Solver delivers the full requested output to the user.
+        // ── Interactions last (CEI): token transfers ─────────────────────────
+        // Solver delivers this fill's output to the user, then pays the
+        // protocol fee. Both transfers are authorized by the solver who signed
+        // this call, and the user's received amount is never reduced by the fee.
         let dst_client = token::Client::new(&env, &intent.dst_token);
         dst_client.transfer(&solver, &intent.user, &fill_amount);
 
-        // Solver also pays the protocol fee (priced into their quote). Taking the
-        // fee from the solver — rather than clawing it back from the user — keeps
-        // the user's received amount at or above `min_dst_amount`, and keeps every
-        // token transfer authorized by the solver who signed this call.
-        let fee = fill_amount * PROTOCOL_FEE_BPS / 10_000;
         if fee > 0 {
             let fee_recipient: Address = env
                 .storage()
@@ -1806,7 +1883,7 @@ impl IntentSettlement {
         user: Address,
         intents: soroban_sdk::Vec<(String, String, i128, Address, i128, Option<u64>)>,
     ) -> soroban_sdk::Vec<BytesN<32>> {
-        if intents.len() > MAX_BATCH_SIZE as usize {
+        if intents.len() > MAX_BATCH_SIZE {
             panic_with_error!(&env, Error::ZeroAmount); // No dedicated error; reuse nearest
         }
 
@@ -1836,7 +1913,7 @@ impl IntentSettlement {
         solver: Address,
         intent_ids: soroban_sdk::Vec<BytesN<32>>,
     ) {
-        if intent_ids.len() > MAX_BATCH_SIZE as usize {
+        if intent_ids.len() > MAX_BATCH_SIZE {
             panic_with_error!(&env, Error::ZeroAmount); // No dedicated error; reuse nearest
         }
 
@@ -1935,11 +2012,8 @@ impl IntentSettlement {
     /// Callers that only need the numeric value and already hold the
     /// SolverRecord can call `compute_reputation_score` directly.
     pub fn get_reputation_score(env: Env, solver: Address) -> Option<u32> {
-        let record: SolverRecord = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Solver(solver))?;
-        Some(Self::compute_reputation_score(&record))
+        let record: SolverRecord = env.storage().persistent().get(&DataKey::Solver(solver))?;
+        Some(Self::compute_reputation_score(record))
     }
 
     /// Whether `solver` currently meets accept_intent's requirements
@@ -1968,6 +2042,12 @@ impl IntentSettlement {
     /// may execute it.
     pub fn get_pending_fee_recipient(env: Env) -> Option<(Address, u64)> {
         env.storage().instance().get(&DataKey::PendingFeeRecipient)
+    }
+
+    /// Pending admin-transfer proposal, if any: `(new_admin, eta)` where `eta`
+    /// is the ledger timestamp at which `accept_admin_transfer` may execute it.
+    pub fn get_pending_admin(env: Env) -> Option<(Address, u64)> {
+        env.storage().instance().get(&DataKey::PendingAdmin)
     }
 
     /// Returns the bond token address (USDC SAC), or `None` before initialization.
@@ -2099,7 +2179,7 @@ impl IntentSettlement {
     ///   all failures → 0
     ///   perfect rate, no volume → 9 000  (90% × 10 000)
     ///   perfect rate, high vol  → approaches 10 000
-    pub fn compute_reputation_score(record: &SolverRecord) -> u32 {
+    pub fn compute_reputation_score(record: SolverRecord) -> u32 {
         let total_fills = record.fills_completed as u64 + record.fills_failed as u64;
         if total_fills == 0 {
             return 0;
@@ -2112,11 +2192,11 @@ impl IntentSettlement {
         // the curve. Only the shape matters — the constant can be tuned later.
         const VOLUME_SCALE: i128 = 1_000 * 100 * 10_000_000;
 
-        // decay_bps = VOLUME_SCALE / (VOLUME_SCALE + vol + 1) × 10_000
-        // ∈ (0, 10_000].  High volume → low decay_bps.
+        // decay_bps = VOLUME_SCALE / (VOLUME_SCALE + vol) × 10_000
+        // ∈ (0, 10_000].  High volume → low decay_bps.  `VOLUME_SCALE` is a
+        // positive constant and `vol >= 0`, so the denominator is never zero.
         let vol = record.total_volume.max(0);
-        let decay_bps = ((VOLUME_SCALE as u64) * 10_000)
-            / ((VOLUME_SCALE + vol + 1) as u64);
+        let decay_bps = ((VOLUME_SCALE as u64) * 10_000) / ((VOLUME_SCALE + vol) as u64);
 
         // volume_multiplier_bps ∈ [9_000, 10_000)
         // At zero volume: decay_bps = ~10_000, multiplier = 9_000
@@ -2142,85 +2222,78 @@ impl IntentSettlement {
     /// src_chain allowlist is disabled, obviously malformed tokens are rejected
     /// early.
     fn validate_src_token(env: &Env, src_chain: &String, src_token: &String) {
-        let token_len = src_token.len();
-        let chain_len = src_chain.len();
+        // `soroban_sdk::String` has no byte indexing; copy each string into a
+        // fixed stack buffer (guarding the length first) and inspect the bytes.
+        let chain_len = src_chain.len() as usize;
+        let token_len = src_token.len() as usize;
 
-        // Compare `src_chain` byte-by-byte against a known ASCII literal.
-        let chain_is = |literal: &[u8]| -> bool {
-            if chain_len as usize != literal.len() {
-                return false;
-            }
-            let mut i = 0u32;
-            while i < chain_len {
-                if src_chain.get(i) != literal[i as usize] as u32 {
-                    return false;
-                }
-                i += 1;
-            }
-            true
-        };
+        // Longest chain name we recognise is 8 bytes ("ethereum"/"arbitrum"/
+        // "optimism"); anything longer can't match, so treat it as unknown.
+        let mut chain_buf = [0u8; 16];
+        if chain_len == 0 || chain_len > chain_buf.len() {
+            return;
+        }
+        src_chain.copy_into_slice(&mut chain_buf[..chain_len]);
+        let chain = &chain_buf[..chain_len];
+        let chain_is = |literal: &[u8]| chain == literal;
 
         let is_evm = chain_is(b"ethereum")
             || chain_is(b"base")
             || chain_is(b"polygon")
             || chain_is(b"arbitrum")
             || chain_is(b"optimism");
+        let is_solana = chain_is(b"solana");
+
+        // Unknown chain: skip validation — forward-compatible with future chains.
+        if !is_evm && !is_solana {
+            return;
+        }
+
+        // Token addresses are short; 64 bytes is well beyond any real value.
+        let mut token_buf = [0u8; 64];
+        if token_len > token_buf.len() {
+            panic_with_error!(env, Error::InvalidSrcToken);
+        }
+        src_token.copy_into_slice(&mut token_buf[..token_len]);
+        let tok = &token_buf[..token_len];
 
         if is_evm {
             // EVM token address: exactly "0x" + 40 hex chars = 42 characters.
-            if token_len != 42 {
+            if token_len != 42 || tok[0] != b'0' || tok[1] != b'x' {
                 panic_with_error!(env, Error::InvalidSrcToken);
             }
-            // Must start with "0x".
-            if src_token.get(0) != b'0' as u32 || src_token.get(1) != b'x' as u32 {
-                panic_with_error!(env, Error::InvalidSrcToken);
-            }
-            // Remaining 40 characters must all be hex digits [0-9a-fA-F].
-            let mut i = 2u32;
-            while i < 42 {
-                let ch = src_token.get(i);
-                let is_hex = (ch >= b'0' as u32 && ch <= b'9' as u32)
-                    || (ch >= b'a' as u32 && ch <= b'f' as u32)
-                    || (ch >= b'A' as u32 && ch <= b'F' as u32);
+            for &ch in &tok[2..] {
+                let is_hex = ch.is_ascii_digit()
+                    || (b'a'..=b'f').contains(&ch)
+                    || (b'A'..=b'F').contains(&ch);
                 if !is_hex {
                     panic_with_error!(env, Error::InvalidSrcToken);
                 }
-                i += 1;
             }
             return;
         }
 
-        if chain_is(b"solana") {
-            // Solana token (SPL mint): base58-encoded public key, 32–44 chars,
-            // no "0x" prefix.
-            if token_len < 32 || token_len > 44 {
+        // Solana token (SPL mint): base58-encoded public key, 32–44 chars,
+        // no "0x" prefix.
+        if !(32..=44).contains(&token_len) {
+            panic_with_error!(env, Error::InvalidSrcToken);
+        }
+        if token_len >= 2 && tok[0] == b'0' && tok[1] == b'x' {
+            panic_with_error!(env, Error::InvalidSrcToken);
+        }
+        // Base58 alphabet: 123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz
+        // (excludes '0', 'I', 'O', 'l').
+        for &ch in tok {
+            let is_b58 = (b'1'..=b'9').contains(&ch)
+                || (b'A'..=b'H').contains(&ch)
+                || (b'J'..=b'N').contains(&ch)
+                || (b'P'..=b'Z').contains(&ch)
+                || (b'a'..=b'k').contains(&ch)
+                || (b'm'..=b'z').contains(&ch);
+            if !is_b58 {
                 panic_with_error!(env, Error::InvalidSrcToken);
-            }
-            if token_len >= 2
-                && src_token.get(0) == b'0' as u32
-                && src_token.get(1) == b'x' as u32
-            {
-                panic_with_error!(env, Error::InvalidSrcToken);
-            }
-            // Validate base58 alphabet:
-            // 123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz
-            // (excludes: '0', 'I', 'O', 'l')
-            let mut i = 0u32;
-            while i < token_len {
-                let ch = src_token.get(i);
-                let is_b58 = (ch >= b'1' as u32 && ch <= b'9' as u32)
-                    || (ch >= b'A' as u32 && ch <= b'H' as u32)
-                    || (ch >= b'J' as u32 && ch <= b'N' as u32)
-                    || (ch >= b'P' as u32 && ch <= b'Z' as u32)
-                    || (ch >= b'a' as u32 && ch <= b'k' as u32)
-                    || (ch >= b'm' as u32 && ch <= b'z' as u32);
-                if !is_b58 {
-                    panic_with_error!(env, Error::InvalidSrcToken);
-                }
-                i += 1;
             }
         }
-        // Unknown chain: skip validation — forward-compatible with future chains.
     }
 
     fn require_admin(env: &Env) {
