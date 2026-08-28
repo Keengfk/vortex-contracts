@@ -100,6 +100,18 @@ first deploys to mainnet.
   "solana"` is validated end-to-end (base58 SPL mint, 32–44 chars, no `0x`
   prefix) and documented alongside the EVM chains; the README's "planned"
   marker is removed.
+- **`solver_registry` contract + tier perks** (#197, partial #186): new
+  `solver_registry/` crate storing an admin-managed tier per solver
+  (Unranked → Platinum) with `get_tier` and the perk-schedule views.
+  `intent_settlement` gains `set_solver_registry(Option<Address>)`: when a
+  registry is linked, `accept_intent` extends the fill window by the tier's
+  bonus (+0 / +10 / +20 / +30 / +50 %) and `slash_solver` slashes at the
+  tier's reduced rate (10 / 10 / 8 / 6 / 5 %, 5% floor). The tier is
+  snapshotted on the `IntentRecord` at accept-time, so a mid-flight
+  promotion/demotion doesn't change the slash. The integration is optional
+  and degrades to Unranked when unset or unreachable — behaviour with no
+  registry is byte-for-byte the pre-#197 flat 10% slash / fixed window.
+  Score-gated promotion, staking and migration remain #186.
 
 ### Changed
 
@@ -107,9 +119,18 @@ first deploys to mainnet.
   RustSec advisory database) alongside the existing fmt/clippy/test/build
   checks.
 - CI `wasm-size` job now measures the `wasm-opt -Oz` artifact (the size
-  that actually deploys) and `[profile.release]` enables `lto`. Budget set
-  to 63 000 bytes, under Soroban's 64 KB limit; a dedicated size-reduction
-  pass is still needed to restore real headroom.
+  that actually deploys) against a pinned binaryen, and `[profile.release]`
+  enables `lto`. After #197 the optimized `intent_settlement` wasm is
+  ~63.7 KB — within ~1.8 KB of Soroban's 64 KB hard limit — so the budget
+  is 64 500 bytes and a dedicated size-reduction pass is now **blocking**
+  further feature work.
+- Removed the never-functional bid-window scaffolding from
+  `intent_settlement` (`BID_WINDOW`, `BestBidRecord`, `is_bid_window_enabled`
+  and the dead `Bidding` branch in `submit_intent`); `submit_intent` always
+  opened intents as `Open` already. The `IntentState::Bidding` variant is
+  retained as reserved.
+- CI: new `solver-registry` job (fmt / clippy / test / wasm build) for the
+  new crate.
 
 ### Documentation
 
@@ -139,3 +160,7 @@ first deploys to mainnet.
 - `indexer/reference-indexer.js`: noted `list_solvers` as the on-chain
   alternative to full `solver_registered` / `solver_deregistered` replay
   (#198).
+- `docs/solver-registry-design.md`: added an "Implementation status" section
+  recording what #197 shipped, the local-tier-table deviation from §6, the
+  accept-time snapshot decision, and that the §8 fee rebate is deferred and
+  should be unified with #7 (#197).

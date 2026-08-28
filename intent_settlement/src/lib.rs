@@ -8,7 +8,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, token, xdr::ToXdr,
-    Address, Bytes, BytesN, Env, String, Symbol, Vec,
+    Address, Bytes, BytesN, Env, IntoVal, String, Symbol, Vec,
 };
 
 #[cfg(test)]
@@ -23,11 +23,6 @@ const INTENT_EXPIRY: u64 = 1800; // 30 minutes
 const FILL_WINDOW: u64 = 300; // 5 minutes to fill after intent accepted
 const MIN_BOND: i128 = 50 * 10_000_000; // 50 USDC minimum solver bond
 const PROTOCOL_FEE_BPS: i128 = 5; // 0.05%
-/// Duration of the competitive bid-collection window when bid-window mode is
-/// enabled.  Solvers have this many seconds after `submit_intent` to submit
-/// competing quotes via `bid_intent`; the best quote wins once the window
-/// closes.
-const BID_WINDOW: u64 = 120; // 2 minutes
 
 /// Delay enforced between proposing and executing a sensitive admin change
 /// (admin transfer, fee recipient handover, dst_token allowlist changes).
@@ -110,6 +105,27 @@ const MAX_BATCH_SIZE: u32 = 20;
 /// magnitude as `FILL_WINDOW` so a single extension can at most roughly double
 /// the solver's delivery window.
 const MAX_EXTENSION_DURATION: u64 = 300; // 5 minutes
+
+// ─── Solver-registry tier perks (#197) ──────────────────────────────────────
+//
+// Index = tier number (0 Unranked … 4 Platinum). These MUST stay in lock-step
+// with `solver_registry`'s tier table and `docs/solver-registry-design.md`
+// §3/§6/§7. They are held here, rather than fetched per call, so
+// `accept_intent` / `slash_solver` make at most one cross-contract call each
+// (just `get_tier`) on their hot paths. A change to these values is a
+// protocol-parameter change.
+
+/// Fill-window extension bonus per tier, in basis points (10_000 = +100%).
+/// Unranked +0%, Bronze +10%, Silver +20%, Gold +30%, Platinum +50%.
+const TIER_FILL_WINDOW_BONUS_BPS: [u64; 5] = [0, 1_000, 2_000, 3_000, 5_000];
+
+/// Slash percentage per tier, in basis points of the bond (10_000 = 100%).
+/// Unranked/Bronze 10%, Silver 8%, Gold 6%, Platinum 5% — and 5% (500 bps) is
+/// the floor for every tier.
+const TIER_SLASH_BPS: [i128; 5] = [1_000, 1_000, 800, 600, 500];
+
+/// Lowest slash rate any tier may receive, in basis points (Platinum's 5%).
+const MIN_SLASH_BPS: i128 = 500;
 
 // ─── Storage Keys ─────────────────────────────────────────────────────────────
 
@@ -266,6 +282,12 @@ pub enum DataKey {
     /// unpause access) -- resuming the protocol always needs the full
     /// admin's judgment.
     Pauser,
+
+    /// **Instance storage.** Address of the `solver_registry` contract (#197).
+    /// Optional: absent ⇒ every solver is treated as Unranked (tier 0), so
+    /// `accept_intent` / `slash_solver` behave exactly as before the
+    /// integration. Set / cleared by the admin via `set_solver_registry`.
+    SolverRegistry,
 }
 
 // ─── Data Structs ─────────────────────────────────────────────────────────────
@@ -318,6 +340,13 @@ pub struct IntentRecord {
     /// intent transitions to `Filled` as soon as `total_filled` satisfies
     /// the user's `min_dst_amount` requirement.
     pub total_filled: i128,
+
+    /// #197: the `solver_registry` tier the assigned solver held when they
+    /// called `accept_intent` — snapshotted so `slash_solver` applies the
+    /// slash rate that was in force when the obligation was taken on, not the
+    /// solver's tier now. `0` (Unranked) whenever there is no assignee
+    /// (`Open` / `PartiallyFilled`) or the registry integration is unset.
+    pub solver_tier: u32,
 }
 
 #[contracttype]
@@ -330,10 +359,9 @@ pub enum IntentState {
     Cancelled,       // user cancelled before fill
     Expired,         // deadline passed, no fill
     Slashed,         // solver failed to fill after accepting
-    /// Bid-window mode: intent has been submitted and is collecting competing
-    /// solver bids.  No solver has exclusive fill rights yet.  Once the
-    /// `BID_WINDOW` elapses the best bid is settled and the intent transitions
-    /// to `Accepted`.
+    /// Reserved for a future competitive bid-collection mode (not currently
+    /// produced by any entrypoint — `submit_intent` always opens intents in
+    /// `Open`).
     Bidding,
 }
 
@@ -369,16 +397,6 @@ pub struct ProtocolParams {
     pub intent_expiry: u64,
     /// Protocol fee charged on each fill, in basis points (1 bps = 0.01%).
     pub protocol_fee_bps: i128,
-}
-
-/// Tracks the leading bid for an intent that is in the `Bidding` state.
-/// Only the current best bid is kept — a new submission replaces it only
-/// if it quotes a strictly higher `quoted_dst_amount`.
-#[contracttype]
-#[derive(Clone)]
-pub struct BestBidRecord {
-    pub solver: Address,
-    pub quoted_dst_amount: i128,
 }
 
 /// Aggregate protocol-wide health snapshot, returned by `get_protocol_health`.
@@ -1056,6 +1074,35 @@ impl IntentSettlement {
         env.storage().instance().get(&DataKey::Pauser)
     }
 
+    // ── Solver Registry Integration (#197) ────────────────────────────────────
+
+    /// Admin-only: point this contract at a deployed `solver_registry` so
+    /// `accept_intent` grants tier fill-window bonuses and `slash_solver`
+    /// applies tier slash rates. Pass `None` to disable the integration —
+    /// every solver then behaves as Unranked (tier 0), i.e. exactly as before
+    /// the integration existed. The registry is an *optional* dependency:
+    /// `accept_intent` / `slash_solver` never hard-fail if it is unset,
+    /// mis-set, or reverts (they fall back to Unranked).
+    pub fn set_solver_registry(env: Env, registry: Option<Address>) {
+        Self::require_admin(&env);
+        match &registry {
+            Some(addr) => env.storage().instance().set(&DataKey::SolverRegistry, addr),
+            None => env.storage().instance().remove(&DataKey::SolverRegistry),
+        }
+        env.events()
+            .publish((Symbol::new(&env, "solver_registry_set"),), registry);
+    }
+
+    /// The configured `solver_registry` address, or `None` if the tier-perk
+    /// integration is disabled.
+    ///
+    /// The accept-time tier snapshot itself is exposed as `solver_tier` on the
+    /// `IntentRecord` returned by `get_intent` — that is the rate
+    /// `slash_solver` would apply.
+    pub fn get_solver_registry(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::SolverRegistry)
+    }
+
     /// Admin- or pauser-only: halt new intent submission, acceptance, and
     /// fills for incident response. slash_solver stays permissionless
     /// throughout, so a solver already holding an Accepted intent can't
@@ -1450,28 +1497,13 @@ impl IntentSettlement {
             dst_token,
             min_dst_amount,
             solver: None,
-            // When bid-window mode is active, the intent opens in Bidding state
-            // so solvers can compete before one is assigned exclusive fill rights.
-            // The bid-window deadline is BID_WINDOW seconds from now, not the
-            // full intent expiry — settle_bids extends it to FILL_WINDOW once a
-            // winner is picked.  The original expiry is stored separately in
-            // deadline and reset after settlement.
-            state: if Self::is_bid_window_enabled(env.clone()) {
-                IntentState::Bidding
-            } else {
-                IntentState::Open
-            },
+            state: IntentState::Open,
             created_at: now,
-            // In bidding mode, deadline tracks the end of the bid window.
-            // In first-accept-wins mode, deadline tracks the intent expiry.
-            deadline: if Self::is_bid_window_enabled(env.clone()) {
-                now + BID_WINDOW
-            } else {
-                expiry
-            },
+            deadline: expiry,
             filled_at: None,
             fill_amount: None,
             total_filled: 0,
+            solver_tier: 0, // set to the accepting solver's tier in accept_intent
         };
 
         env.storage()
@@ -1498,8 +1530,7 @@ impl IntentSettlement {
             .instance()
             .set(&DataKey::TotalIntents, &(total + 1));
 
-        // Increment open_intents: every new submission starts as Open (or Bidding,
-        // which also counts as an unfilled intent awaiting a solver).
+        // Increment open_intents: every new submission starts as Open.
         let open: u64 = env
             .storage()
             .instance()
@@ -1580,9 +1611,20 @@ impl IntentSettlement {
 
         intent.solver = Some(solver.clone());
         intent.state = IntentState::Accepted;
-        // Extend deadline to fill window from now
+
+        // #197: snapshot the solver's registry tier NOW and bake its
+        // fill-window bonus into this intent's deadline. The tier is read at
+        // accept-time (not live at fill/slash time) because the fill window
+        // and, symmetrically, the slash rate are both part of the deal the
+        // solver strikes when it takes on the obligation: a later promotion
+        // must not soften an abandonment, and a later demotion must not
+        // harden it. `slash_solver` reads this same `intent.solver_tier`
+        // snapshot. Falls back to Unranked (tier 0, no bonus) when the
+        // registry is unset or unreachable.
         let cfg = Self::load_config(&env);
-        intent.deadline = now + cfg.fill_window;
+        let tier = Self::solver_tier(&env, &solver);
+        intent.solver_tier = tier;
+        intent.deadline = now + Self::tier_fill_window(tier, cfg.fill_window);
 
         solver_record.active_intents += 1;
         env.storage()
@@ -1722,6 +1764,7 @@ impl IntentSettlement {
             // The intent is back in Open rotation, so increment open_intents again.
             intent.state = IntentState::PartiallyFilled;
             intent.solver = None;
+            intent.solver_tier = 0; // #197: no assignee → no tier snapshot
             intent.deadline = now + INTENT_EXPIRY;
             solver_record.active_intents = solver_record.active_intents.saturating_sub(1);
 
@@ -1892,10 +1935,26 @@ impl IntentSettlement {
             .get(&DataKey::Solver(solver_addr.clone()))
             .unwrap();
 
-        // Slash 10% of bond, with a floor of 1 so that a non-zero bond is never
-        // economically unpunished due to integer division rounding to zero
-        // (issue #32: tiny bonds below 10 would otherwise yield slash_amount = 0).
-        let slash_amount = (solver_record.bond_amount / 10).max(1);
+        // #197: slash at the reduced rate for the tier the solver held when it
+        // ACCEPTED this intent (`intent.solver_tier`), not its tier now — see
+        // the rationale comment in `accept_intent`. With the registry unset the
+        // snapshot is 0 (Unranked) and `TIER_SLASH_BPS[0]` is 1_000, i.e.
+        // `bond_amount / 10` — identical to the pre-#197 flat 10%.
+        // `MIN_SLASH_BPS` (Platinum's 5%) is the floor for every tier, so
+        // slashing always stings. Overflow-safe: an absurdly large bond falls
+        // back to the flat 10%. `.max(1)` keeps a non-zero bond from being
+        // economically unpunished by integer-division rounding (issue #32).
+        let slash_bps = TIER_SLASH_BPS
+            .get(intent.solver_tier as usize)
+            .copied()
+            .unwrap_or(TIER_SLASH_BPS[0])
+            .max(MIN_SLASH_BPS);
+        let slash_amount = solver_record
+            .bond_amount
+            .checked_mul(slash_bps)
+            .map(|x| x / 10_000)
+            .unwrap_or(solver_record.bond_amount / 10)
+            .max(1);
         solver_record.bond_amount -= slash_amount;
         solver_record.fills_failed += 1;
         solver_record.last_slash_time = now;
@@ -1916,6 +1975,7 @@ impl IntentSettlement {
             IntentState::Open
         };
         intent.solver = None;
+        intent.solver_tier = 0; // #197: cleared with the solver assignment
         intent.deadline = now + cfg.intent_expiry;
 
         let open: u64 = env
@@ -2678,6 +2738,41 @@ impl IntentSettlement {
         (MIN_BOND * multiplier) / 10
     }
 
+    /// #197: resolve `solver`'s registry tier for perk calculation.
+    ///
+    /// Makes a single cross-contract call — `solver_registry.get_tier(solver)`
+    /// — via `try_invoke_contract` (rather than a generated `#[contractclient]`,
+    /// to keep the settlement wasm small). Returns `0` (Unranked) — the
+    /// pre-integration behaviour — whenever the registry address is unset, or
+    /// the call reverts, or the return value doesn't decode as a `u32`. The
+    /// result is clamped to a known tier so the perk tables index safely.
+    fn solver_tier(env: &Env, solver: &Address) -> u32 {
+        let Some(registry) = env
+            .storage()
+            .instance()
+            .get::<_, Address>(&DataKey::SolverRegistry)
+        else {
+            return 0;
+        };
+        let args: Vec<soroban_sdk::Val> = (solver.clone(),).into_val(env);
+        let result: Result<Result<u32, _>, Result<soroban_sdk::Error, _>> =
+            env.try_invoke_contract(&registry, &Symbol::new(env, "get_tier"), args);
+        match result {
+            Ok(Ok(tier)) => tier.min(TIER_SLASH_BPS.len() as u32 - 1),
+            _ => 0,
+        }
+    }
+
+    /// Fill-window seconds a solver on `tier` gets when accepting: the base
+    /// `fill_window` plus the tier's `TIER_FILL_WINDOW_BONUS_BPS` extension.
+    fn tier_fill_window(tier: u32, base_fill_window: u64) -> u64 {
+        let bonus_bps = TIER_FILL_WINDOW_BONUS_BPS
+            .get(tier as usize)
+            .copied()
+            .unwrap_or(0);
+        base_fill_window.saturating_mul(10_000 + bonus_bps) / 10_000
+    }
+
     /// Load the protocol config from storage, falling back to defaults for
     /// contracts that pre-date this upgrade (upgrade-safe).
     fn load_config(env: &Env) -> ProtocolConfig {
@@ -2697,26 +2792,6 @@ impl IntentSettlement {
             .instance()
             .get(&DataKey::BondToken)
             .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized))
-    }
-
-    /// Returns `true` when bid-window mode is active (an admin has stored a
-    /// `BidWindowEnabled` flag).  Defaults to `false` so first-accept-wins
-    /// behaviour is preserved on all deployments that pre-date this feature.
-    ///
-    /// Bid-window mode changes `submit_intent` so newly created intents start
-    /// in the `Bidding` state instead of `Open`, giving solvers a fixed
-    /// `BID_WINDOW`-second window to submit competing quotes before the best
-    /// one is selected.
-    fn is_bid_window_enabled(env: Env) -> bool {
-        env.storage()
-            .instance()
-            .get(&DataKey::DstAllowlistEnabled) // reuse nearest boolean key as placeholder
-            .unwrap_or(false)
-        // NOTE: a dedicated DataKey::BidWindowEnabled should be added when
-        // bid-window mode is fully implemented.  For now this always returns
-        // false so the `Bidding` branch in submit_intent is never taken.
-        // The constant `false` is intentional — it keeps the existing
-        // first-accept-wins flow working while the bidding feature is gated.
     }
 
     /// Returns the effective protocol fee in basis points from the stored
