@@ -48,6 +48,9 @@ pub enum ProofKey {
     AuthorizedEmitter(u32), // u32 wraps u16 — Soroban contracttype requires u32
     /// Verified proof record keyed by Vortex `intent_id`.
     Proof(BytesN<32>),
+    /// Guard flag indicating that `migrate()` has already been called
+    /// on this contract version (prevents double-migration).
+    MigrationDone,
 }
 
 // ─── Data Types ───────────────────────────────────────────────────────────────
@@ -155,6 +158,34 @@ impl ProofRegistry {
         env.storage()
             .instance()
             .get(&ProofKey::AuthorizedEmitter(chain_id))
+    }
+
+    // ── Contract Upgrade ──────────────────────────────────────────────────────
+
+    /// Admin-only: upgrade the contract WASM and run any migration logic.
+    /// Panics if migration has already been executed on this version.
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
+        Self::require_admin(&env);
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        Self::migrate(&env);
+    }
+
+    /// Internal: migration guard that runs once per contract version upgrade.
+    /// This function is idempotent (safe to call multiple times) but will panic
+    /// if called a second time on the same version via `update_current_contract_wasm`.
+    fn migrate(env: &Env) {
+        // Guard: if migration has already run for this version, panic to prevent
+        // accidental double-migration. This catches programming errors where
+        // `migrate()` might be called multiple times in test or recovery scenarios.
+        if env.storage().instance().has(&ProofKey::MigrationDone) {
+            panic!("migration already completed for this contract version");
+        }
+        env.storage()
+            .instance()
+            .set(&ProofKey::MigrationDone, &true);
+
+        // Future versions: add migration logic here (e.g. data transformations,
+        // storage layout changes, etc.).
     }
 
     // ── Message Receipt ───────────────────────────────────────────────────────

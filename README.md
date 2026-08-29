@@ -209,9 +209,21 @@ the exact condition that triggers it.
 | 19 | `DeadlineNotReached` | `expire_intent` | `now < intent.deadline` |
 | 20 | `InsufficientBond` | `withdraw_bond` | Requested withdrawal `amount > solver_record.bond_amount` |
 | 21 | `DstTokenNotAllowed` | `submit_intent` | `DstAllowlistEnabled` is `true` and `dst_token` is not in the `AllowedDstToken` list |
-| 25 | `TimelockNotElapsed` | `accept_fee_recipient`, `accept_admin_transfer`, `execute_add_dst_token`, `execute_remove_dst_token` | Called before the `#115` timelock delay since the matching `propose_*` call has elapsed |
-| 26 | `NoPendingAdminTransfer` | `accept_admin_transfer` | No prior `propose_admin_transfer` on record |
-| 27 | `NoPendingDstTokenChange` | `execute_add_dst_token`, `execute_remove_dst_token` | No matching pending proposal for the given token |
+| 22 | `IntentAlreadyExists` | `submit_intent` | Hash collision: an intent with this `intent_id` was already submitted |
+| 23 | `FeeOverflow` | `fill_intent` | Fee arithmetic overflowed (fill amount astronomically large) |
+| 24 | `InvalidTokenInterface` | `add_allowed_dst_token` | Token address does not implement SEP-41 |
+| 25 | `NoPendingFeeRecipient` | `accept_fee_recipient` | No prior `propose_fee_recipient` on record |
+| 26 | `SrcChainNotAllowed` | `submit_intent` | `SrcChainAllowlistEnabled` is `true` and `src_chain` is not in the allowlist |
+| 27 | `RescueProtectedToken` | `rescue_tokens` | Token is the bond token or an active intent's dst_token |
+| 28 | `InvalidSrcToken` | `submit_intent` | `src_token` format does not match the declared `src_chain`'s conventions |
+| 29 | `BatchSizeExceeded` | `batch_submit_intent`, `batch_accept_intent` | Batch size exceeds `MAX_BATCH_SIZE` |
+| 30 | `ExtensionAlreadyGranted` | `request_extension` | Intent has already used its one-time extension |
+| 31 | `InvalidConfig` | `set_config` | Invalid protocol configuration parameters |
+| 32 | `TimelockNotElapsed` | `accept_fee_recipient`, `accept_admin_transfer`, `execute_add_dst_token`, `execute_remove_dst_token` | Called before the `#115` timelock delay since the matching `propose_*` call has elapsed |
+| 33 | `NoPendingAdminTransfer` | `accept_admin_transfer` | No prior `propose_admin_transfer` on record |
+| 34 | `NoPendingDstTokenChange` | `execute_add_dst_token`, `execute_remove_dst_token` | No matching pending proposal for the given token |
+| 35 | `CancelCooldownNotExpired` | `cancel_intent` | Cannot cancel an Accepted intent whose solver was recently slashed (cooldown active) |
+| 36 | `AmountTooLarge` | `submit_intent` | Numeric input (e.g. `src_amount`) is too large to safely handle |
 
 ---
 

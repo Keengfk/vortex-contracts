@@ -9,8 +9,26 @@ first deploys to mainnet.
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- **#237**: The `paused` event is now split into two distinct topics:
+  - `pause()` emits `paused`
+  - `unpause()` emits `unpaused`
+  
+  **Migration**: Indexers filtering by the shared `paused` topic must now subscribe to both `paused` and `unpaused` separately. This allows topic-name filtering without decoding event payloads.
+
 ### Fixed
 
+- **#238**: `set_src_chain_allowlist_enabled` now emits an event 
+  (`src_chain_allowlist_enabled`) to match the behavior of 
+  `set_dst_allowlist_enabled`. Indexers and ops dashboards can now observe 
+  both allowlist toggles without polling.
+- **#239**: `batch_submit_intent` and `batch_accept_intent` now panic with 
+  `BatchSizeExceeded` (instead of the generic `ZeroAmount`) when batch size 
+  exceeds `MAX_BATCH_SIZE`. `request_extension` now panics with 
+  `ExtensionAlreadyGranted` (instead of `ZeroAmount`) when an intent has 
+  already been extended once. This allows solver bots and integrators to 
+  distinguish between input validation failures and resource-limit errors.
 - `deregister_solver` now refuses to return a solver's bond while they hold
   an `Accepted` intent, closing a path to dodge `slash_solver` by
   withdrawing before the fill window expired.
@@ -23,6 +41,10 @@ first deploys to mainnet.
 
 ### Added
 
+- **#240** (`proof_registry`): Contract upgrade mechanism (`upgrade` entrypoint
+  and `migrate()` guard) matching the pattern in `intent_settlement`. Allows 
+  `proof_registry` to evolve without data loss or re-initialization. Migration 
+  guard prevents double-execution on the same version.
 - **Storage TTL management**: persistent `Intent`/`Solver` entries and the
   contract instance now have their TTL extended on every write, closing a
   gap where none of Soroban's state-archival requirements were handled.

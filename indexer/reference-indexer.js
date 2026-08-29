@@ -141,7 +141,10 @@ class VortexIndexer {
         // Protocol params change; no per-intent state to update.
         break;
       case "paused":
-        // Boolean in value; not needed to reconstruct intent/solver state.
+        // Emitted when contract is paused; not needed to reconstruct intent/solver state.
+        break;
+      case "unpaused":
+        // Emitted when contract is unpaused; not needed to reconstruct intent/solver state.
         break;
       case "tokens_rescued":
         // Admin recovery; no intent/solver state change.
@@ -152,6 +155,8 @@ class VortexIndexer {
       case "dst_token_disallowed":
       case "src_chain_allowed":
       case "src_chain_disallowed":
+      case "dst_allowlist_enabled":
+      case "src_chain_allowlist_enabled":
       case "bond_multiplier_set":
         // Config changes; no per-intent/solver state.
         break;

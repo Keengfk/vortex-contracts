@@ -48,6 +48,14 @@ const ADMIN_TIMELOCK_DELAY: u64 = 172_800; // 48 hours
 // That is a comfortable safety margin while rejecting only fat-fingered inputs.
 pub const MAX_AMOUNT: i128 = 1_000_000_000_000_000_000_000_000_000_000i128; // 10^30
 
+const MAX_BATCH_SIZE: u32 = 100;
+const MAX_EXTENSION_DURATION: u64 = 600; // 10 minutes
+
+const DEFAULT_MIN_BOND: i128 = MIN_BOND;
+const DEFAULT_FILL_WINDOW: u64 = FILL_WINDOW;
+const DEFAULT_INTENT_EXPIRY: u64 = INTENT_EXPIRY;
+const DEFAULT_PROTOCOL_FEE_BPS: i128 = PROTOCOL_FEE_BPS;
+
 // Soroban archives ledger entries that go too long without being touched.
 // Persistent Intent/Solver records get their TTL bumped on every write so
 // they don't need to be manually restored before later calls can read them.
@@ -144,6 +152,28 @@ pub enum DataKey {
     /// unpause access) -- resuming the protocol always needs the full
     /// admin's judgment.
     Pauser,
+
+    /// **Instance storage.** Admin-configurable protocol parameters
+    /// (min_bond, fill_window, intent_expiry, protocol_fee_bps).
+    Config,
+
+    /// Proposed-but-not-yet-accepted new admin plus the ledger timestamp.
+    PendingAdmin,
+
+    /// Proposed-but-not-yet-accepted new dst_token plus the ledger timestamp.
+    PendingDstTokenAdd(Address),
+
+    /// Proposed-but-not-yet-accepted dst_token removal plus the ledger timestamp.
+    PendingDstTokenRemove(Address),
+
+    /// Bond multiplier for a specific dst_token (stored as i128 where 10 = 1.0x).
+    MinBondMultiplier(Address),
+
+    /// List of all currently allowed dst_tokens.
+    AllowedDstTokenList,
+
+    /// Flag indicating that an intent has already used its one-time extension.
+    ExtensionGranted(BytesN<32>),
 }
 
 // ─── Data Structs ─────────────────────────────────────────────────────────────
@@ -388,14 +418,24 @@ pub enum Error {
 
     /// Duplicate `intent_id` detected in `submit_intent` (hash collision guard).
     IntentAlreadyExists = 22,
+
     /// #30: no pending fee-recipient proposal to accept
-    NoPendingFeeRecipient = 22,
+    NoPendingFeeRecipient = 25,
+
     /// #31: fee arithmetic overflowed (fill_amount is astronomically large)
     FeeOverflow = 23,
+
     /// #33: the address passed to add_allowed_dst_token doesn't implement SEP-41
     InvalidTokenInterface = 24,
-    SrcChainNotAllowed = 22,
-    RescueProtectedToken = 23,
+
+    /// `submit_intent` was called with a `src_chain` not on the allowlist
+    /// while `SrcChainAllowlistEnabled` is `true`.
+    SrcChainNotAllowed = 26,
+
+    /// `rescue_tokens` was called to recover a token that is currently
+    /// protecting an active intent's output or the protocol's bond collateral.
+    RescueProtectedToken = 27,
+
     /// #127: `submit_intent` was called with a `src_token` whose format does
     /// not match the conventions of the declared `src_chain`.
     ///
@@ -408,6 +448,33 @@ pub enum Error {
     /// If `src_chain` is unknown this error is never raised — unknown chains
     /// bypass token-format validation so the allowlist remains the sole gate.
     InvalidSrcToken = 28,
+
+    /// `batch_submit_intent` or `batch_accept_intent` was called with a batch
+    /// size exceeding `MAX_BATCH_SIZE`.
+    BatchSizeExceeded = 29,
+
+    /// `request_extension` was called on an intent that has already been
+    /// extended once (each intent gets exactly one extension).
+    ExtensionAlreadyGranted = 30,
+
+    /// `set_config` was called with an invalid parameter configuration.
+    InvalidConfig = 31,
+
+    /// Admin timelock delay has not yet elapsed since the proposal was made.
+    TimelockNotElapsed = 32,
+
+    /// No pending admin transfer exists to accept.
+    NoPendingAdminTransfer = 33,
+
+    /// No pending dst_token change exists to execute.
+    NoPendingDstTokenChange = 34,
+
+    /// `cancel_intent` was called on an Accepted intent whose solver
+    /// was recently slashed; a cooldown period must elapse before cancelling.
+    CancelCooldownNotExpired = 35,
+
+    /// A numeric input (e.g. src_amount) is too large to safely handle.
+    AmountTooLarge = 36,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -862,6 +929,8 @@ impl IntentSettlement {
         env.storage()
             .instance()
             .set(&DataKey::SrcChainAllowlistEnabled, &enabled);
+        env.events()
+            .publish((Symbol::new(&env, "src_chain_allowlist_enabled"),), enabled);
     }
 
     /// Whether src_chain validation is currently active.
@@ -912,7 +981,7 @@ impl IntentSettlement {
     pub fn pause(env: Env, caller: Address) {
         Self::require_admin_or_pauser(&env, &caller);
         env.storage().instance().set(&DataKey::Paused, &true);
-        env.events().publish((Symbol::new(&env, "paused"),), true);
+        env.events().publish((Symbol::new(&env, "paused"),), ());
     }
 
     /// Admin-only: lift a pause and restore normal operation.
@@ -924,7 +993,7 @@ impl IntentSettlement {
     pub fn unpause(env: Env) {
         Self::require_admin(&env);
         env.storage().instance().set(&DataKey::Paused, &false);
-        env.events().publish((Symbol::new(&env, "paused"),), false);
+        env.events().publish((Symbol::new(&env, "unpaused"),), ());
     }
 
     /// Whether submit_intent/accept_intent/fill_intent and solver bond
@@ -1807,7 +1876,7 @@ impl IntentSettlement {
         intents: soroban_sdk::Vec<(String, String, i128, Address, i128, Option<u64>)>,
     ) -> soroban_sdk::Vec<BytesN<32>> {
         if intents.len() > MAX_BATCH_SIZE as usize {
-            panic_with_error!(&env, Error::ZeroAmount); // No dedicated error; reuse nearest
+            panic_with_error!(&env, Error::BatchSizeExceeded);
         }
 
         let mut result = soroban_sdk::Vec::new(&env);
@@ -1837,7 +1906,7 @@ impl IntentSettlement {
         intent_ids: soroban_sdk::Vec<BytesN<32>>,
     ) {
         if intent_ids.len() > MAX_BATCH_SIZE as usize {
-            panic_with_error!(&env, Error::ZeroAmount); // No dedicated error; reuse nearest
+            panic_with_error!(&env, Error::BatchSizeExceeded);
         }
 
         for intent_id in intent_ids {
@@ -1877,7 +1946,7 @@ impl IntentSettlement {
             .persistent()
             .has(&DataKey::ExtensionGranted(intent_id.clone()))
         {
-            panic_with_error!(&env, Error::ZeroAmount); // No dedicated error; reuse nearest
+            panic_with_error!(&env, Error::ExtensionAlreadyGranted);
         }
 
         let now = env.ledger().timestamp();
