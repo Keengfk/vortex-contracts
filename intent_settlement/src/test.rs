@@ -2871,3 +2871,156 @@ fn unknown_chain_bypasses_token_format_validation() {
         &deadline,
     );
 }
+
+// ─── #202/#203/#204: compiling-baseline reconciliation ──────────────────────────
+
+/// #203: every `Error` discriminant must be unique. Constructing one of every
+/// variant and comparing the `u32` codes pairwise means a future duplicate
+/// (the bug this fixes: three variants on 22, two on 23) fails the suite
+/// instead of silently collapsing distinct failures onto one wire code.
+#[test]
+fn error_discriminants_are_pairwise_distinct() {
+    let all = [
+        Error::AlreadyInitialized,
+        Error::Unauthorized,
+        Error::IntentNotFound,
+        Error::IntentNotOpen,
+        Error::IntentExpired,
+        Error::IntentNotAccepted,
+        Error::SolverNotRegistered,
+        Error::SolverBondTooLow,
+        Error::InsufficientOutput,
+        Error::FillWindowExpired,
+        Error::CannotCancelAccepted,
+        Error::SolverInactive,
+        Error::ZeroAmount,
+        Error::InvalidDeadline,
+        Error::IntentAlreadyFilled,
+        Error::NotInitialized,
+        Error::SolverHasActiveIntents,
+        Error::ContractPaused,
+        Error::DeadlineNotReached,
+        Error::InsufficientBond,
+        Error::DstTokenNotAllowed,
+        Error::IntentAlreadyExists,
+        Error::FeeOverflow,
+        Error::InvalidTokenInterface,
+        Error::InvalidSrcToken,
+        Error::NoPendingFeeRecipient,
+        Error::SrcChainNotAllowed,
+        Error::RescueProtectedToken,
+        Error::TimelockNotElapsed,
+        Error::NoPendingAdminTransfer,
+        Error::NoPendingDstTokenChange,
+        Error::InvalidConfig,
+        Error::AmountTooLarge,
+        Error::CancelCooldownNotExpired,
+        Error::ExtensionCapExceeded,
+    ];
+    for (i, a) in all.iter().enumerate() {
+        for b in all.iter().skip(i + 1) {
+            assert_ne!(
+                *a as u32, *b as u32,
+                "duplicate Error discriminant: {:?} and {:?}",
+                a, b
+            );
+        }
+    }
+}
+
+/// #204: `DataKey::Config` round-trips through storage — `set_config` persists
+/// and `get_config` reads the same values back.
+#[test]
+fn config_key_round_trips() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    // Defaults are seeded by `initialize`.
+    let seeded = c.get_config();
+    assert_eq!(seeded.min_bond, MIN_BOND);
+    assert_eq!(seeded.fill_window, FILL_WINDOW);
+    assert_eq!(seeded.intent_expiry, INTENT_EXPIRY);
+
+    c.set_config(&(100 * 10_000_000), &120, &900, &7);
+    let got = c.get_config();
+    assert_eq!(got.min_bond, 100 * 10_000_000);
+    assert_eq!(got.fill_window, 120);
+    assert_eq!(got.intent_expiry, 900);
+    assert_eq!(got.protocol_fee_bps, 7);
+
+    // Survives a simulated ledger close.
+    ctx.pass_time(1);
+    let after = c.get_config();
+    assert_eq!(after.fill_window, 120);
+}
+
+/// #202: `set_config` rejects out-of-bounds values with `InvalidConfig` using
+/// the newly-defined bound constants.
+#[test]
+fn set_config_enforces_bound_constants() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    // fill_window below MIN_FILL_WINDOW_SECS (60)
+    assert_eq!(
+        c.try_set_config(&(50 * 10_000_000), &30, &900, &5),
+        Err(Ok(Error::InvalidConfig.into()))
+    );
+    // intent_expiry not strictly greater than fill_window
+    assert_eq!(
+        c.try_set_config(&(50 * 10_000_000), &600, &600, &5),
+        Err(Ok(Error::InvalidConfig.into()))
+    );
+    // min_bond below MIN_BOND_FLOOR (1 token unit)
+    assert_eq!(
+        c.try_set_config(&1, &120, &900, &5),
+        Err(Ok(Error::InvalidConfig.into()))
+    );
+    // protocol_fee_bps above MAX_PROTOCOL_FEE_BPS (1_000)
+    assert_eq!(
+        c.try_set_config(&(50 * 10_000_000), &120, &900, &5_000),
+        Err(Ok(Error::InvalidConfig.into()))
+    );
+}
+
+// ─── #200: reputation-gated fill-window extension ──────────────────────────────
+
+/// #200 backward-compatibility regression: an unranked solver (zero fills) gets
+/// exactly ONE extension per intent — the historical one-shot behaviour — and a
+/// second request is rejected once the cumulative cap is reached.
+#[test]
+fn unranked_solver_gets_exactly_one_extension() {
+    let ctx = setup();
+    let c = ctx.client();
+    ctx.register_solver();
+    let id = ctx.submit();
+    c.accept_intent(&ctx.solver, &id);
+
+    let before = c.get_intent(&id).unwrap().deadline;
+    c.request_extension(&ctx.solver, &id);
+    let after = c.get_intent(&id).unwrap().deadline;
+    assert_eq!(after, before + 300); // one MAX_EXTENSION_DURATION quantum
+
+    // Second request exceeds the unranked cap (== one quantum).
+    assert_eq!(
+        c.try_request_extension(&ctx.solver, &id),
+        Err(Ok(Error::ExtensionCapExceeded.into()))
+    );
+}
+
+/// #200 race edge case: an extension requested after the deadline has already
+/// passed (intent is now slashable by anyone) is rejected.
+#[test]
+fn extension_after_deadline_is_rejected() {
+    let ctx = setup();
+    let c = ctx.client();
+    ctx.register_solver();
+    let id = ctx.submit();
+    c.accept_intent(&ctx.solver, &id);
+
+    ctx.pass_time(FILL_WINDOW + 1);
+    assert_eq!(
+        c.try_request_extension(&ctx.solver, &id),
+        Err(Ok(Error::FillWindowExpired.into()))
+    );
+}

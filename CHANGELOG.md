@@ -11,6 +11,66 @@ first deploys to mainnet.
 
 ### Fixed
 
+- **Restored a compiling baseline for `intent_settlement/src/lib.rs`**
+  (closes #202, #203, #204). The file referenced twelve constants, nine
+  `DataKey` variants, and eight `Error` variants that were never declared,
+  and three `Error` variants collided on discriminant 22 with two more on
+  23 — so the crate did not build. All are now declared:
+  - Constants: `DEFAULT_MIN_BOND`, `DEFAULT_FILL_WINDOW`,
+    `DEFAULT_INTENT_EXPIRY`, `DEFAULT_PROTOCOL_FEE_BPS` (all equal to the
+    historical hard-coded values so `initialize` / `load_config` behaviour
+    is unchanged), plus the `set_config` bounds `MAX_PROTOCOL_FEE_BPS`
+    (100 bps), `MIN_FILL_WINDOW_SECS` (60), `MIN_INTENT_EXPIRY_SECS`
+    (300), `MIN_BOND_FLOOR` (1 USDC), and `SLASH_COOLDOWN` (1 h),
+    `CANCEL_COOLDOWN` (5 min), `MAX_BATCH_SIZE` (20),
+    `MAX_EXTENSION_DURATION` (5 min).
+  - `DataKey`: `Config`, `PendingAdmin`, `AllowedDstTokenList`,
+    `PendingDstTokenAdd(Address)`, `PendingDstTokenRemove(Address)`,
+    `UserIntents(Address)`, `MinBondMultiplier(Address)`,
+    `CancelCooldown(Address)`, `ExtensionGranted(BytesN<32>)`, each with a
+    rustdoc block matching the existing variants. No change to what any
+    existing key stores.
+  - `Error`: added `TimelockNotElapsed`, `NoPendingAdminTransfer`,
+    `NoPendingDstTokenChange`, `InvalidConfig`, `AmountTooLarge`,
+    `CancelCooldownNotExpired`.
+
+### Changed
+
+- **`Error` discriminant migration** (#203). Every `#[contracterror]`
+  variant now has a unique `#[repr(u32)]` code. Following
+  `CONTRIBUTING.md` ("do not renumber existing variants"), codes 1–24 and
+  28 are untouched; the collided/mis-documented variants moved to freshly
+  appended numbers:
+  - `NoPendingFeeRecipient`: 22 → **29**
+  - `SrcChainNotAllowed`: 22 → **30**
+  - `RescueProtectedToken`: 23 → **31**
+  - `TimelockNotElapsed`: documented as 25, never assigned → **32**
+  - `NoPendingAdminTransfer`: documented as 26 → **33**
+  - `NoPendingDstTokenChange`: documented as 27 → **34**
+  - New: `InvalidConfig` = 35, `AmountTooLarge` = 36,
+    `CancelCooldownNotExpired` = 37, `ExtensionCapExceeded` = 38.
+
+  Integrators, solvers, and indexers that hard-coded error code 22 ("src
+  chain not allowed" / "no pending fee recipient") or 23 ("rescue
+  protected token") **must remap** to the numbers above. The README Error
+  Reference table has been regenerated to match the enum exactly.
+- **`request_extension` is now reputation-gated** (#200). It previously
+  granted exactly one fixed-size extension per intent to any accepted
+  solver. It now grants repeated `MAX_EXTENSION_DURATION` extensions as
+  long as the intent's cumulative extension time stays within a
+  per-solver budget derived from the solver's local tier
+  (`fills_completed` + `compute_reputation_score`): +10% / +20% / +30% /
+  +50% for Bronze / Silver / Gold / Platinum, mirroring
+  `docs/solver-registry-design.md`. **Unranked solvers keep the exact
+  old one-shot behaviour.** A tier-independent ceiling
+  (`MAX_TOTAL_EXTENSION` = 2 × `MAX_EXTENSION_DURATION`) caps every
+  intent regardless of tier, and an extension requested after the
+  deadline has already passed is now rejected with `FillWindowExpired`.
+  The `DataKey::ExtensionGranted(intent_id)` value changed from a `bool`
+  presence flag to a `u64` running total of seconds consumed.
+
+### Fixed
+
 - `deregister_solver` now refuses to return a solver's bond while they hold
   an `Accepted` intent, closing a path to dodge `slash_solver` by
   withdrawing before the fill window expired.

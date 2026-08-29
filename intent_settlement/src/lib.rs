@@ -61,6 +61,68 @@ const PERSISTENT_TTL_EXTEND_TO: u32 = DAY_IN_LEDGERS * 30;
 const INSTANCE_TTL_THRESHOLD: u32 = DAY_IN_LEDGERS * 30;
 const INSTANCE_TTL_EXTEND_TO: u32 = DAY_IN_LEDGERS * 60;
 
+// ─── Configurable protocol parameters ─────────────────────────────────────────
+//
+// `ProtocolConfig` (see below) makes `min_bond`, `fill_window`, `intent_expiry`,
+// and `protocol_fee_bps` per-deployment tunable via `set_config`. The `DEFAULT_*`
+// constants are the values `initialize` seeds and the values `load_config` falls
+// back to for contracts deployed before `Config` existed (upgrade-safe path), so
+// they must equal the historical hard-coded behaviour: `MIN_BOND`, `FILL_WINDOW`,
+// `INTENT_EXPIRY`, and `PROTOCOL_FEE_BPS` respectively — not new numbers.
+const DEFAULT_MIN_BOND: i128 = MIN_BOND;
+const DEFAULT_FILL_WINDOW: u64 = FILL_WINDOW;
+const DEFAULT_INTENT_EXPIRY: u64 = INTENT_EXPIRY;
+const DEFAULT_PROTOCOL_FEE_BPS: i128 = PROTOCOL_FEE_BPS;
+
+// Bounds enforced by `set_config` on admin-supplied values. Each lower bound is
+// the smallest value that keeps the corresponding mechanism economically
+// meaningful; the fee cap is the largest rate the protocol will ever charge.
+//
+// `MAX_PROTOCOL_FEE_BPS` — 1_000 bps (10%), matching the bound already
+// documented in `set_config`'s rustdoc. Anything above this is presumed a
+// fat-fingered input rather than an intentional rate; it also keeps
+// `amount * protocol_fee_bps` comfortably inside the `MAX_AMOUNT` overflow
+// margin already documented above.
+const MAX_PROTOCOL_FEE_BPS: i128 = 1_000;
+// `MIN_FILL_WINDOW_SECS` — 60 s. Below one minute a solver cannot realistically
+// observe an accept, build, sign, and land a fill on the source chain, so a
+// shorter window would only manufacture slashable failures.
+const MIN_FILL_WINDOW_SECS: u64 = 60;
+// `MIN_INTENT_EXPIRY_SECS` — 300 s. An intent must live long enough for a solver
+// to see it and accept it; `set_config` additionally requires
+// `intent_expiry > fill_window` so the two windows never invert.
+const MIN_INTENT_EXPIRY_SECS: u64 = 300;
+// `MIN_BOND_FLOOR` — one whole USDC unit (7-decimal). The bond only deters spam
+// and funds slashing if it is a non-dust amount; the real operational floor is
+// set per-deployment via `min_bond`, this is just the hard ratchet.
+const MIN_BOND_FLOOR: i128 = 10_000_000;
+
+// `SLASH_COOLDOWN` — 1 hour. After a solver is slashed, `accept_intent` refuses
+// that solver until the cooldown elapses (`last_slash_time + SLASH_COOLDOWN`),
+// forcing a pause for the operator to investigate and re-bond rather than
+// immediately re-exposing user intents to a misbehaving solver.
+const SLASH_COOLDOWN: u64 = 3_600;
+// `CANCEL_COOLDOWN` — 5 minutes. Minimum spacing between successive
+// `cancel_intent` calls by the same user, so cancel/resubmit cannot be used to
+// grief solvers by repeatedly yanking intents out from under an accept.
+const CANCEL_COOLDOWN: u64 = 300;
+
+// `MAX_BATCH_SIZE` — 20 intents per `batch_submit_intent` / `batch_accept_intent`
+// call. Caps the persistent-storage writes a single transaction can trigger so a
+// batch call cannot blow the Soroban resource budget or become a cheap DoS.
+const MAX_BATCH_SIZE: u32 = 20;
+
+// `MAX_EXTENSION_DURATION` — 5 minutes, i.e. one `FILL_WINDOW` of extra time per
+// extension. `request_extension` grants at most this much additional deadline
+// per call, and the per-intent cumulative cap in `request_extension` is a small
+// multiple of it (see `extension_cap_secs`).
+const MAX_EXTENSION_DURATION: u64 = 300;
+// Absolute ceiling on cumulative extension time for a single intent, regardless
+// of solver tier. Even a top-tier solver cannot push an intent's deadline out by
+// more than this in total — the anti-abuse backstop that survives the
+// reputation-gated policy in `request_extension`.
+const MAX_TOTAL_EXTENSION: u64 = MAX_EXTENSION_DURATION * 2;
+
 // ─── Storage Keys ─────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -144,6 +206,77 @@ pub enum DataKey {
     /// unpause access) -- resuming the protocol always needs the full
     /// admin's judgment.
     Pauser,
+
+    /// **Instance storage.** The per-deployment `ProtocolConfig`
+    /// (`min_bond`, `fill_window`, `intent_expiry`, `protocol_fee_bps`).
+    /// Seeded with the `DEFAULT_*` constants by `initialize`, overwritten
+    /// wholesale by `set_config`, and read by `load_config` (which falls
+    /// back to the same defaults for contracts deployed before this key
+    /// existed). Lives as long as the contract instance.
+    Config,
+
+    /// **Instance storage.** Proposed-but-not-yet-accepted admin handover:
+    /// `(Address, u64)` — the incoming admin and the ledger timestamp at
+    /// which `accept_admin_transfer` may execute the swap
+    /// (`propose_admin_transfer` writes it, `accept_admin_transfer` reads
+    /// and removes it). Mirrors `PendingFeeRecipient`. Absent when no
+    /// transfer is in flight; `accept_admin_transfer` then raises
+    /// `NoPendingAdminTransfer`.
+    PendingAdmin,
+
+    /// **Instance storage.** The canonical `Vec<Address>` of currently
+    /// allowed destination tokens, kept alongside the per-token
+    /// `AllowedDstToken(Address)` presence flags so callers can enumerate
+    /// the allowlist without scanning storage. Maintained by
+    /// `execute_add_dst_token` / `execute_remove_dst_token`. Absent (empty
+    /// list) until the first token is added.
+    AllowedDstTokenList,
+
+    /// **Instance storage.** Timelock record for a pending "add this
+    /// `dst_token` to the allowlist" proposal: `u64` eta (ledger timestamp
+    /// at which `execute_add_dst_token` may run). Keyed by the candidate
+    /// `token` address. Written by `propose_add_dst_token`, read and removed
+    /// by `execute_add_dst_token`; its absence raises
+    /// `NoPendingDstTokenChange`.
+    PendingDstTokenAdd(Address),
+
+    /// **Instance storage.** Timelock record for a pending "remove this
+    /// `dst_token` from the allowlist" proposal: `u64` eta. Keyed by the
+    /// target `token` address. Written by `propose_remove_dst_token`, read
+    /// and removed by `execute_remove_dst_token`; its absence raises
+    /// `NoPendingDstTokenChange`.
+    PendingDstTokenRemove(Address),
+
+    /// **Persistent storage.** Per-user index of submitted intents:
+    /// `Vec<BytesN<32>>` of every `intent_id` the `Address` has created via
+    /// `submit_intent`. Lets `get_user_intents` return a user's history
+    /// without replaying events. Grows on each `submit_intent`; TTL bumped
+    /// on write.
+    UserIntents(Address),
+
+    /// **Instance storage.** Optional per-`dst_token` multiplier (`i128`,
+    /// basis points where 10_000 = 1×) applied on top of the configured
+    /// `min_bond` when a solver accepts an intent targeting that token.
+    /// Lets the admin demand extra collateral for thin or volatile
+    /// destination assets. Set by `set_min_bond_multiplier`, read by
+    /// `get_min_bond_multiplier` / the accept path; absent means 1×.
+    MinBondMultiplier(Address),
+
+    /// **Persistent storage.** Per-user cancel-rate-limit stamp: `u64`
+    /// ledger timestamp of that `Address`'s most recent `cancel_intent`.
+    /// `cancel_intent` rejects a new cancel until
+    /// `last + CANCEL_COOLDOWN`, raising `CancelCooldownNotExpired`.
+    /// Absent until the user's first cancel.
+    CancelCooldown(Address),
+
+    /// **Persistent storage.** Per-intent cumulative fill-window extension
+    /// budget already consumed via `request_extension`: `u64` seconds.
+    /// Keyed by `intent_id`. `request_extension` reads it, rejects the call
+    /// if granting `MAX_EXTENSION_DURATION` more would exceed the solver's
+    /// tier cap or the absolute `MAX_TOTAL_EXTENSION` ceiling, and writes
+    /// the new running total. Absent (treated as `0`) until the first
+    /// extension on that intent.
+    ExtensionGranted(BytesN<32>),
 }
 
 // ─── Data Structs ─────────────────────────────────────────────────────────────
@@ -388,14 +521,11 @@ pub enum Error {
 
     /// Duplicate `intent_id` detected in `submit_intent` (hash collision guard).
     IntentAlreadyExists = 22,
-    /// #30: no pending fee-recipient proposal to accept
-    NoPendingFeeRecipient = 22,
-    /// #31: fee arithmetic overflowed (fill_amount is astronomically large)
+    /// #31: fee arithmetic overflowed (fill_amount is astronomically large).
+    /// Raised by `fill_intent`'s protocol-fee computation.
     FeeOverflow = 23,
     /// #33: the address passed to add_allowed_dst_token doesn't implement SEP-41
     InvalidTokenInterface = 24,
-    SrcChainNotAllowed = 22,
-    RescueProtectedToken = 23,
     /// #127: `submit_intent` was called with a `src_token` whose format does
     /// not match the conventions of the declared `src_chain`.
     ///
@@ -408,6 +538,67 @@ pub enum Error {
     /// If `src_chain` is unknown this error is never raised — unknown chains
     /// bypass token-format validation so the allowlist remains the sole gate.
     InvalidSrcToken = 28,
+
+    // ── Appended per CONTRIBUTING.md (never renumber existing variants) ──
+    //
+    // 29–31 previously collided on discriminants 22/23. They are moved to
+    // fresh numbers here; callers that hard-coded 22 for "src chain not
+    // allowed" or "no pending fee recipient", or 23 for "rescue protected
+    // token", must remap. See CHANGELOG.md.
+
+    /// #30: `accept_fee_recipient` was called with no pending fee-recipient
+    /// proposal in storage (`propose_fee_recipient` never ran, or the
+    /// proposal was already accepted/cleared). *(Was discriminant 22.)*
+    NoPendingFeeRecipient = 29,
+
+    /// `submit_intent` was called with a `src_chain` that is not present in
+    /// the `AllowedSrcChain` allowlist while `SrcChainAllowlistEnabled` is
+    /// `true`. *(Was discriminant 22.)*
+    SrcChainNotAllowed = 30,
+
+    /// `rescue_tokens` was pointed at the bond token (or another token the
+    /// contract holds on users' behalf); those balances are not free for an
+    /// admin to sweep. *(Was discriminant 23.)*
+    RescueProtectedToken = 31,
+
+    /// A timelocked admin action (`accept_fee_recipient`,
+    /// `accept_admin_transfer`, `execute_add_dst_token`,
+    /// `execute_remove_dst_token`) was called before its stored `eta`
+    /// (`propose_*` timestamp + `ADMIN_TIMELOCK_DELAY`) has been reached.
+    TimelockNotElapsed = 32,
+
+    /// `accept_admin_transfer` was called with no pending transfer in
+    /// storage — `propose_admin_transfer` was never called, or the pending
+    /// transfer was already accepted/cleared.
+    NoPendingAdminTransfer = 33,
+
+    /// `execute_add_dst_token` / `execute_remove_dst_token` was called with
+    /// no matching pending `PendingDstTokenAdd` / `PendingDstTokenRemove`
+    /// proposal for that token in storage.
+    NoPendingDstTokenChange = 34,
+
+    /// `set_config` was given a value outside its accepted bounds:
+    /// `protocol_fee_bps` outside `0..=MAX_PROTOCOL_FEE_BPS`, `fill_window`
+    /// below `MIN_FILL_WINDOW_SECS`, `intent_expiry` below
+    /// `MIN_INTENT_EXPIRY_SECS` or not strictly greater than `fill_window`,
+    /// or `min_bond` below `MIN_BOND_FLOOR`.
+    InvalidConfig = 35,
+
+    /// A numeric input exceeded its upper sanity bound: `submit_intent` /
+    /// `batch_submit_intent` was given a `src_amount` or `min_dst_amount`
+    /// greater than `MAX_AMOUNT`.
+    AmountTooLarge = 36,
+
+    /// `cancel_intent` was called again by the same user before
+    /// `CANCEL_COOLDOWN` seconds had elapsed since their previous cancel
+    /// (`CancelCooldown(user)` + `CANCEL_COOLDOWN` is still in the future).
+    CancelCooldownNotExpired = 37,
+
+    /// `request_extension` was rejected because granting another
+    /// `MAX_EXTENSION_DURATION` would push this intent's cumulative
+    /// extension time past the solver's reputation-tier allowance or the
+    /// absolute `MAX_TOTAL_EXTENSION` ceiling.
+    ExtensionCapExceeded = 38,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -1847,10 +2038,62 @@ impl IntentSettlement {
 
     // ── Fill Window Extension ─────────────────────────────────────────────────
 
-    /// Solver requests a grace-period extension on an Accepted intent.
-    /// Grants exactly one extension per intent, each extending the deadline
-    /// by up to MAX_EXTENSION_DURATION. Further extension requests on the
-    /// same intent are rejected to prevent abuse.
+    /// Per-intent cumulative fill-window extension budget for `solver`, in
+    /// seconds, gated by the solver's reputation tier (#200).
+    ///
+    /// The tier is derived locally from the solver's own `SolverRecord`
+    /// (`fills_completed` plus `compute_reputation_score`) rather than from a
+    /// cross-contract call into `solver_registry`, so this ships before the
+    /// registry does; the return value is all `request_extension` consumes,
+    /// so swapping in a real tier lookup later is not an ABI break.
+    ///
+    /// Tiers mirror the fill-window perk table in
+    /// `docs/solver-registry-design.md` (+10% / +20% / +30% / +50% on top of
+    /// the base `MAX_EXTENSION_DURATION`). An unranked solver — no record, no
+    /// fills, or a zero reputation score — gets exactly `MAX_EXTENSION_DURATION`,
+    /// i.e. the historical one-shot behaviour, so nobody who is not yet tiered
+    /// sees a change. Every result is clamped to `MAX_TOTAL_EXTENSION`, the
+    /// tier-independent anti-abuse ceiling.
+    fn extension_cap_secs(env: &Env, solver: &Address) -> u64 {
+        let base = MAX_EXTENSION_DURATION;
+
+        let record: Option<SolverRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Solver(solver.clone()));
+
+        let cap = match record {
+            None => base,
+            Some(r) => {
+                let score = Self::compute_reputation_score(&r);
+                let fills = r.fills_completed;
+                // (min fills, min reputation bps) → extension multiplier %
+                if fills >= 1_000 && score >= 9_000 {
+                    base * 150 / 100 // Platinum: +50%
+                } else if fills >= 200 && score >= 8_500 {
+                    base * 130 / 100 // Gold: +30%
+                } else if fills >= 50 && score >= 7_000 {
+                    base * 120 / 100 // Silver: +20%
+                } else if fills >= 10 && score >= 5_000 {
+                    base * 110 / 100 // Bronze: +10%
+                } else {
+                    base // Unranked: unchanged one-shot behaviour
+                }
+            }
+        };
+
+        cap.min(MAX_TOTAL_EXTENSION)
+    }
+
+    /// Solver requests a grace-period extension on an Accepted intent (#200).
+    ///
+    /// Each call pushes the deadline out by `MAX_EXTENSION_DURATION`. Multiple
+    /// extensions are allowed as long as the running total for the intent stays
+    /// within the solver's reputation-tier budget (`extension_cap_secs`); an
+    /// unranked solver's budget equals a single `MAX_EXTENSION_DURATION`, so the
+    /// historical one-extension-per-intent rule is preserved for them. The
+    /// per-intent total can never exceed `MAX_TOTAL_EXTENSION` regardless of
+    /// tier — that is the anti-abuse backstop.
     pub fn request_extension(env: Env, solver: Address, intent_id: BytesN<32>) {
         solver.require_auth();
         Self::bump_instance_ttl(&env);
@@ -1871,24 +2114,35 @@ impl IntentSettlement {
             panic_with_error!(&env, Error::Unauthorized);
         }
 
-        // Each intent gets exactly one extension
-        if env
-            .storage()
-            .persistent()
-            .has(&DataKey::ExtensionGranted(intent_id.clone()))
-        {
-            panic_with_error!(&env, Error::ZeroAmount); // No dedicated error; reuse nearest
-        }
-
         let now = env.ledger().timestamp();
 
-        // Extend the deadline by the full extension duration
-        intent.deadline = now + MAX_EXTENSION_DURATION;
+        // Race guard: once the deadline has already passed the intent is
+        // slashable by anyone; it is too late to extend, whether or not
+        // `slash_solver` has been called yet.
+        if now >= intent.deadline {
+            panic_with_error!(&env, Error::FillWindowExpired);
+        }
 
-        // Record that this intent has used its one extension
+        // Cumulative extension budget already consumed on this intent.
+        let used: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ExtensionGranted(intent_id.clone()))
+            .unwrap_or(0);
+
+        let cap = Self::extension_cap_secs(&env, &solver);
+        let new_used = used
+            .checked_add(MAX_EXTENSION_DURATION)
+            .unwrap_or(u64::MAX);
+        if new_used > cap {
+            panic_with_error!(&env, Error::ExtensionCapExceeded);
+        }
+
+        // Extend the deadline by one extension quantum and record the new total.
+        intent.deadline += MAX_EXTENSION_DURATION;
         env.storage()
             .persistent()
-            .set(&DataKey::ExtensionGranted(intent_id.clone()), &true);
+            .set(&DataKey::ExtensionGranted(intent_id.clone()), &new_used);
 
         env.storage()
             .persistent()

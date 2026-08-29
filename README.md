@@ -209,9 +209,26 @@ the exact condition that triggers it.
 | 19 | `DeadlineNotReached` | `expire_intent` | `now < intent.deadline` |
 | 20 | `InsufficientBond` | `withdraw_bond` | Requested withdrawal `amount > solver_record.bond_amount` |
 | 21 | `DstTokenNotAllowed` | `submit_intent` | `DstAllowlistEnabled` is `true` and `dst_token` is not in the `AllowedDstToken` list |
-| 25 | `TimelockNotElapsed` | `accept_fee_recipient`, `accept_admin_transfer`, `execute_add_dst_token`, `execute_remove_dst_token` | Called before the `#115` timelock delay since the matching `propose_*` call has elapsed |
-| 26 | `NoPendingAdminTransfer` | `accept_admin_transfer` | No prior `propose_admin_transfer` on record |
-| 27 | `NoPendingDstTokenChange` | `execute_add_dst_token`, `execute_remove_dst_token` | No matching pending proposal for the given token |
+| 22 | `IntentAlreadyExists` | `submit_intent` | Duplicate `intent_id` (hash-collision guard) |
+| 23 | `FeeOverflow` | `fill_intent` | Protocol-fee arithmetic (`fill_amount * protocol_fee_bps`) overflowed |
+| 24 | `InvalidTokenInterface` | `propose_add_dst_token` | Candidate `dst_token` address does not implement the SEP-41 token interface |
+| 28 | `InvalidSrcToken` | `submit_intent` | `src_token` string does not match the address format for the declared `src_chain` |
+| 29 | `NoPendingFeeRecipient` | `accept_fee_recipient` | No pending fee-recipient proposal in storage *(was discriminant 22)* |
+| 30 | `SrcChainNotAllowed` | `submit_intent` | `SrcChainAllowlistEnabled` is `true` and `src_chain` is not in the `AllowedSrcChain` list *(was discriminant 22)* |
+| 31 | `RescueProtectedToken` | `rescue_tokens` | Target token is the bond token or another balance the contract custodies for users *(was discriminant 23)* |
+| 32 | `TimelockNotElapsed` | `accept_fee_recipient`, `accept_admin_transfer`, `execute_add_dst_token`, `execute_remove_dst_token` | Called before the `#115` timelock delay since the matching `propose_*` call has elapsed *(was discriminant 25)* |
+| 33 | `NoPendingAdminTransfer` | `accept_admin_transfer` | No prior `propose_admin_transfer` on record *(was discriminant 26)* |
+| 34 | `NoPendingDstTokenChange` | `execute_add_dst_token`, `execute_remove_dst_token` | No matching pending proposal for the given token *(was discriminant 27)* |
+| 35 | `InvalidConfig` | `set_config` | A supplied parameter is outside its accepted bound (`protocol_fee_bps`, `fill_window`, `intent_expiry`, or `min_bond`) |
+| 36 | `AmountTooLarge` | `submit_intent`, `batch_submit_intent` | `src_amount` or `min_dst_amount` exceeds `MAX_AMOUNT` (10^30) |
+| 37 | `CancelCooldownNotExpired` | `cancel_intent` | Same user cancelled again before `CANCEL_COOLDOWN` (300 s) elapsed |
+| 38 | `ExtensionCapExceeded` | `request_extension` | Another extension would exceed the solver's reputation-tier budget or the absolute `MAX_TOTAL_EXTENSION` ceiling |
+
+> **Discriminant migration (see `CHANGELOG.md`):** variants 29–31 previously
+> collided on codes 22/23, and 32–34 were documented here as 25–27 but were
+> never actually assigned those numbers in the enum. Integrators who hard-coded
+> the old numbers must remap to the values above. Per `CONTRIBUTING.md`,
+> discriminants 1–24 and 28 are unchanged and will never be renumbered.
 
 ---
 
