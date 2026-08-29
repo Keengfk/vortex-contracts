@@ -23,6 +23,26 @@ const INTENT_EXPIRY: u64 = 1800; // 30 minutes
 const FILL_WINDOW: u64 = 300; // 5 minutes to fill after intent accepted
 const MIN_BOND: i128 = 50 * 10_000_000; // 50 USDC minimum solver bond
 const PROTOCOL_FEE_BPS: i128 = 5; // 0.05%
+
+// Aliases for config defaults (for backward-compatibility with load_config)
+const DEFAULT_MIN_BOND: i128 = 50 * 10_000_000;
+const DEFAULT_FILL_WINDOW: u64 = 300;
+const DEFAULT_INTENT_EXPIRY: u64 = 1800;
+const DEFAULT_PROTOCOL_FEE_BPS: i128 = 5;
+
+// Config bounds-checking
+const MAX_PROTOCOL_FEE_BPS: i128 = 1_000; // 10%
+const MIN_FILL_WINDOW_SECS: u64 = 60;
+const MIN_INTENT_EXPIRY_SECS: u64 = 300;
+const MIN_BOND_FLOOR: i128 = 10_000_000; // 1 USDC (7 decimals)
+const DEFAULT_MAX_ACTIVE_INTENTS_PER_SOLVER: u32 = 100;
+
+// Solver cooldowns and limits
+const SLASH_COOLDOWN: u64 = 3600; // 1 hour cooldown after slash
+const CANCEL_COOLDOWN: u64 = 60; // 60 seconds between cancellations
+const MAX_BATCH_SIZE: u64 = 100; // Max intents per batch operation
+const MAX_EXTENSION_DURATION: u64 = 600; // 10 minutes max extension
+
 /// Duration of the competitive bid-collection window when bid-window mode is
 /// enabled.  Solvers have this many seconds after `submit_intent` to submit
 /// competing quotes via `bid_intent`; the best quote wins once the window
@@ -144,12 +164,61 @@ pub enum DataKey {
     /// unpause access) -- resuming the protocol always needs the full
     /// admin's judgment.
     Pauser,
+
+    /// **Instance storage.** Admin-configurable protocol parameters.
+    /// Stored as a single entry so all values are read/written atomically.
+    Config,
+
+    /// Proposed-but-not-yet-accepted new admin address plus the ledger
+    /// timestamp at which `accept_admin_transfer` may execute it (issue #115).
+    PendingAdmin,
+
+    /// Proposed-but-not-yet-accepted dst_token allowlist additions,
+    /// indexed by token address, plus the ETA for execution.
+    PendingDstTokenAdd(Address),
+
+    /// Proposed-but-not-yet-accepted dst_token allowlist removals,
+    /// indexed by token address, plus the ETA for execution.
+    PendingDstTokenRemove(Address),
+
+    /// **Instance storage.** Enumerable list of all dst_tokens currently
+    /// on the allowlist (for efficient enumeration without replaying events).
+    AllowedDstTokenList,
+
+    /// Per-token bond multiplier for adjusted min_bond floors.
+    /// Stored as i128 where 10 = 1.0x, 20 = 2.0x, etc.
+    /// Defaults to 10 (1.0x) if unset.
+    MinBondMultiplier(Address),
+
+    /// Per-intent extension grant flag — set when a solver has used their
+    /// one allowed extension on an Accepted intent (issue #21).
+    ExtensionGranted(BytesN<32>),
+
+    /// Per-user cancel cooldown timestamp to prevent spam
+    /// (cancel_intent is throttled).
+    CancelCooldown(Address),
+
+    /// Per-user list of intent IDs they've submitted.
+    UserIntents(Address),
+
+    /// **Instance storage.** Boolean flag for bid-window mode enablement.
+    /// When true, submit_intent creates intents in Bidding state instead of Open.
+    BidWindowEnabled,
+
+    /// **Instance storage.** Sum of all currently-locked solver bonds across
+    /// the whole protocol (i128). Updated alongside TotalVolume/TotalSolvers.
+    /// Used to compute bond utilization and risk metrics (issue #231).
+    TotalBonded,
+
+    /// **Instance storage.** Admin-configurable per-solver max active intents cap.
+    /// A solver at this cap is rejected from accepting further intents (issue #230).
+    MaxActiveIntentsPerSolver,
 }
 
 // ─── Data Structs ─────────────────────────────────────────────────────────────
 
 /// Admin-configurable protocol parameters.  Stored as a single instance-storage
-/// entry so all four values are read/written atomically.
+/// entry so all values are read/written atomically.
 #[contracttype]
 #[derive(Clone)]
 pub struct ProtocolConfig {
@@ -161,6 +230,8 @@ pub struct ProtocolConfig {
     pub intent_expiry: u64,
     /// Protocol fee in basis points charged on each fill (0.01% per bps).
     pub protocol_fee_bps: i128,
+    /// Maximum number of intents a single solver may accept simultaneously (issue #230).
+    pub max_active_intents_per_solver: u32,
 }
 
 /// A user's cross-chain swap intent
@@ -274,6 +345,8 @@ pub struct ProtocolHealth {
     pub total_volume: i128,
     /// Mirrors `get_solver_count()` — currently registered solvers.
     pub total_solvers: u32,
+    /// Mirrors `get_total_bonded()` — total collateral locked across all solvers (issue #231).
+    pub total_bonded: i128,
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -408,6 +481,33 @@ pub enum Error {
     /// If `src_chain` is unknown this error is never raised — unknown chains
     /// bypass token-format validation so the allowlist remains the sole gate.
     InvalidSrcToken = 28,
+
+    /// A numeric input was too large for safe arithmetic. Raised by
+    /// `submit_intent` when `src_amount` or `min_dst_amount` exceeds `MAX_AMOUNT`.
+    AmountTooLarge = 29,
+
+    /// Admin-only config update validation failed. Raised by `set_config`
+    /// when any parameter violates its bounds.
+    InvalidConfig = 30,
+
+    /// Timelock delay for a pending admin change has not yet elapsed.
+    /// Raised by `accept_fee_recipient` and `accept_admin_transfer`.
+    TimelockNotElapsed = 31,
+
+    /// No pending admin transfer proposal to accept (issue #115).
+    NoPendingAdminTransfer = 32,
+
+    /// No pending dst_token allowlist change to execute.
+    NoPendingDstTokenChange = 33,
+
+    /// User has recently cancelled an intent and must wait out the cancel
+    /// cooldown period before cancelling another. Raised by `cancel_intent`.
+    CancelCooldownNotExpired = 34,
+
+    /// #230: Solver has reached the per-solver max-active-intents cap and
+    /// cannot accept further intents until some settle (filled, slashed, or
+    /// cancelled). Raised by `accept_intent`.
+    MaxActiveIntentsCapReached = 35,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -443,6 +543,7 @@ impl IntentSettlement {
         env.storage().instance().set(&DataKey::TotalVolume, &0i128);
         env.storage().instance().set(&DataKey::TotalSolvers, &0u32);
         env.storage().instance().set(&DataKey::OpenIntents, &0u64);
+        env.storage().instance().set(&DataKey::TotalBonded, &0i128);
         // Seed Config with defaults so the contract is immediately usable
         // without a follow-up admin call.
         env.storage().instance().set(
@@ -452,6 +553,7 @@ impl IntentSettlement {
                 fill_window: DEFAULT_FILL_WINDOW,
                 intent_expiry: DEFAULT_INTENT_EXPIRY,
                 protocol_fee_bps: DEFAULT_PROTOCOL_FEE_BPS,
+                max_active_intents_per_solver: DEFAULT_MAX_ACTIVE_INTENTS_PER_SOLVER,
             },
         );
         Self::bump_instance_ttl(&env);
@@ -588,19 +690,21 @@ impl IntentSettlement {
         Self::load_config(&env)
     }
 
-    /// Admin-only: update the four configurable protocol parameters atomically.
+    /// Admin-only: update the configurable protocol parameters atomically.
     ///
     /// Bounds (any violation returns `InvalidConfig`):
-    /// * `protocol_fee_bps`  ≤ 1 000 (10%)
-    /// * `fill_window`       ≥ 60 s
-    /// * `intent_expiry`     ≥ 300 s and > fill_window
-    /// * `min_bond`          ≥ 1 token unit (10_000_000 for 7-decimal USDC)
+    /// * `protocol_fee_bps`                ≤ 1 000 (10%)
+    /// * `fill_window`                     ≥ 60 s
+    /// * `intent_expiry`                   ≥ 300 s and > fill_window
+    /// * `min_bond`                        ≥ 1 token unit (10_000_000 for 7-decimal USDC)
+    /// * `max_active_intents_per_solver`   ≥ 1
     pub fn set_config(
         env: Env,
         min_bond: i128,
         fill_window: u64,
         intent_expiry: u64,
         protocol_fee_bps: i128,
+        max_active_intents_per_solver: u32,
     ) {
         Self::require_admin(&env);
 
@@ -616,19 +720,23 @@ impl IntentSettlement {
         if min_bond < MIN_BOND_FLOOR {
             panic_with_error!(&env, Error::InvalidConfig);
         }
+        if max_active_intents_per_solver == 0 {
+            panic_with_error!(&env, Error::InvalidConfig);
+        }
 
         let cfg = ProtocolConfig {
             min_bond,
             fill_window,
             intent_expiry,
             protocol_fee_bps,
+            max_active_intents_per_solver,
         };
         env.storage().instance().set(&DataKey::Config, &cfg);
         Self::bump_instance_ttl(&env);
 
         env.events().publish(
             (Symbol::new(&env, "config_updated"),),
-            (min_bond, fill_window, intent_expiry, protocol_fee_bps),
+            (min_bond, fill_window, intent_expiry, protocol_fee_bps, max_active_intents_per_solver),
         );
     }
 
@@ -1035,6 +1143,16 @@ impl IntentSettlement {
             .set(&DataKey::Solver(solver.clone()), &record);
         Self::bump_solver_ttl(&env, &solver);
 
+        // Increment TotalBonded by the amount being added (issue #231)
+        let total_bonded: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalBonded)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalBonded, &(total_bonded + bond_amount));
+
         if is_new_solver {
             let total: u32 = env
                 .storage()
@@ -1095,6 +1213,16 @@ impl IntentSettlement {
             .instance()
             .set(&DataKey::TotalSolvers, &total.saturating_sub(1));
 
+        // Decrement TotalBonded by the solver's full remaining bond (issue #231)
+        let total_bonded: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalBonded)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalBonded, &(total_bonded - record.bond_amount));
+
         // ── Interaction: return bond ─────────────────────────────────────────
         if record.bond_amount > 0 {
             let bond_token = Self::load_bond_token(&env);
@@ -1149,6 +1277,16 @@ impl IntentSettlement {
             .persistent()
             .set(&DataKey::Solver(solver.clone()), &record);
         Self::bump_solver_ttl(&env, &solver);
+
+        // Decrement TotalBonded by the withdrawn amount (issue #231)
+        let total_bonded: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalBonded)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalBonded, &(total_bonded - amount));
 
         let bond_token = Self::load_bond_token(&env);
         let client = token::Client::new(&env, &bond_token);
@@ -1375,10 +1513,15 @@ impl IntentSettlement {
             panic_with_error!(&env, Error::IntentNotOpen);
         }
 
+        // Issue #230: Check max-active-intents cap before accepting
+        let cfg = Self::load_config(&env);
+        if solver_record.active_intents >= cfg.max_active_intents_per_solver {
+            panic_with_error!(&env, Error::MaxActiveIntentsCapReached);
+        }
+
         intent.solver = Some(solver.clone());
         intent.state = IntentState::Accepted;
         // Extend deadline to fill window from now
-        let cfg = Self::load_config(&env);
         intent.deadline = now + cfg.fill_window;
 
         solver_record.active_intents += 1;
@@ -1689,6 +1832,16 @@ impl IntentSettlement {
         solver_record.last_slash_time = now;
         solver_record.active_intents = solver_record.active_intents.saturating_sub(1);
 
+        // Decrement TotalBonded by the slashed amount (issue #231)
+        let total_bonded: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalBonded)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalBonded, &(total_bonded - slash_amount));
+
         let cfg = Self::load_config(&env);
         // A solver whose bond no longer covers min_bond can't credibly back
         // further fills -- take them out of rotation until they top back up.
@@ -1909,19 +2062,47 @@ impl IntentSettlement {
     /// INTENT_EXPIRY, and PROTOCOL_FEE_BPS without reading source code.
     /// Returns the values as a dedicated struct so each field is named at
     /// the call site rather than relying on tuple-position conventions.
+    ///
+    /// Issue #229: reads from live ProtocolConfig, not compile-time constants.
     pub fn get_protocol_params(env: Env) -> ProtocolParams {
-        let _ = env; // view — no storage read needed; values are compile-time constants
+        let cfg = Self::load_config(&env);
         ProtocolParams {
-            min_bond: MIN_BOND,
-            fill_window: FILL_WINDOW,
-            intent_expiry: INTENT_EXPIRY,
-            protocol_fee_bps: PROTOCOL_FEE_BPS,
+            min_bond: cfg.min_bond,
+            fill_window: cfg.fill_window,
+            intent_expiry: cfg.intent_expiry,
+            protocol_fee_bps: cfg.protocol_fee_bps,
         }
     }
 
     /// Fetch an intent's full record by id, or None if it was never submitted.
     pub fn get_intent(env: Env, intent_id: BytesN<32>) -> Option<IntentRecord> {
         env.storage().persistent().get(&DataKey::Intent(intent_id))
+    }
+
+    /// Issue #232: Get an intent's deadline-adjusted state without mutating storage.
+    /// Returns `Expired` for an Open/PartiallyFilled intent whose deadline has passed,
+    /// giving callers a true picture of the intent's logical state without requiring
+    /// them to independently track deadlines and compare against wall-clock time.
+    ///
+    /// For all other states (Accepted, Filled, Cancelled, Slashed, Bidding) this
+    /// returns the stored state as-is. Boundary semantics match expire_intent:
+    /// deadline is INCLUSIVE (now >= intent.deadline means expired).
+    pub fn get_effective_intent_state(env: Env, intent_id: BytesN<32>) -> Option<IntentState> {
+        let mut intent: IntentRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Intent(intent_id))?;
+
+        let now = env.ledger().timestamp();
+        // Only Open/PartiallyFilled intents can be logically expired; other states
+        // are already terminal or intermediate with different semantics.
+        if (intent.state == IntentState::Open || intent.state == IntentState::PartiallyFilled)
+            && now >= intent.deadline
+        {
+            intent.state = IntentState::Expired;
+        }
+
+        Some(intent.state)
     }
 
     /// Fetch a solver's full record by address, or None if never registered.
@@ -1943,9 +2124,9 @@ impl IntentSettlement {
     }
 
     /// Whether `solver` currently meets accept_intent's requirements
-    /// (registered, active, bonded above MIN_BOND). Lets off-chain solver
-    /// bots self-check eligibility without independently reimplementing
-    /// the same logic accept_intent enforces.
+    /// (registered, active, bonded above MIN_BOND, below max_active_intents cap).
+    /// Lets off-chain solver bots self-check eligibility without independently
+    /// reimplementing the same logic accept_intent enforces.
     pub fn is_solver_eligible(env: Env, solver: Address) -> bool {
         let cfg = Self::load_config(&env);
         match env
@@ -1953,9 +2134,18 @@ impl IntentSettlement {
             .persistent()
             .get::<_, SolverRecord>(&DataKey::Solver(solver))
         {
-            Some(record) => record.is_active && record.bond_amount >= cfg.min_bond,
+            Some(record) => {
+                record.is_active
+                    && record.bond_amount >= cfg.min_bond
+                    && record.active_intents < cfg.max_active_intents_per_solver
+            }
             None => false,
         }
+    }
+
+    /// Get the current max-active-intents cap per solver (issue #230).
+    pub fn get_max_active_intents_per_solver(env: Env) -> u32 {
+        Self::load_config(&env).max_active_intents_per_solver
     }
 
     /// Returns the current fee recipient address, or `None` before initialization.
@@ -2023,9 +2213,19 @@ impl IntentSettlement {
         (intents, volume, open)
     }
 
+    /// Total bonded collateral currently locked across all registered solvers.
+    /// Issue #231: aggregate counter for bond utilization and risk metrics.
+    pub fn get_total_bonded(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::TotalBonded)
+            .unwrap_or(0)
+    }
+
     /// Minimum bond required for solver registration.
-    pub fn get_min_bond(_env: Env) -> i128 {
-        MIN_BOND
+    /// Issue #229: reads from live ProtocolConfig, not the compile-time constant.
+    pub fn get_min_bond(env: Env) -> i128 {
+        Self::load_config(&env).min_bond
     }
 
     /// List all intent IDs for a given user. Returns empty Vec if user has no intents.
@@ -2046,7 +2246,7 @@ impl IntentSettlement {
 
     /// Aggregate health snapshot combining `is_paused`, `get_stats`, and
     /// `get_solver_count` into a single call, for dashboard/monitoring
-    /// integrations that would otherwise need three separate round-trips.
+    /// integrations that would otherwise need multiple separate round-trips.
     pub fn get_protocol_health(env: Env) -> ProtocolHealth {
         let paused: bool = env
             .storage()
@@ -2068,12 +2268,18 @@ impl IntentSettlement {
             .instance()
             .get(&DataKey::TotalSolvers)
             .unwrap_or(0);
+        let total_bonded: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalBonded)
+            .unwrap_or(0);
 
         ProtocolHealth {
             paused,
             total_intents,
             total_volume,
             total_solvers,
+            total_bonded,
         }
     }
 
@@ -2309,12 +2515,13 @@ impl IntentSettlement {
     }
 
     fn get_adjusted_min_bond(env: &Env, dst_token: &Address) -> i128 {
+        let base_bond = Self::load_config(env).min_bond;
         let multiplier = env
             .storage()
             .persistent()
             .get::<_, i128>(&DataKey::MinBondMultiplier(dst_token.clone()))
             .unwrap_or(10);
-        (MIN_BOND * multiplier) / 10
+        (base_bond * multiplier) / 10
     }
 
     /// Load the protocol config from storage, falling back to defaults for
