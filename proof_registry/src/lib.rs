@@ -32,6 +32,31 @@ use soroban_sdk::{
 #[cfg(test)]
 mod test;
 
+// ─── TTL Constants ────────────────────────────────────────────────────────────
+//
+// Proof records are meant to be consumed quickly (within the fill window after
+// being relayed). Unlike intent_settlement records which remain active for days,
+// proofs are transient: once a fill consumes them, they become historical.
+// We use shorter TTL thresholds to reflect this.
+//
+// - PROOF_TTL_THRESHOLD (3 days): Proofs that haven't been read/verified in 3
+//   days are likely for stale intents or failed fills. Archiving them saves ledger
+//   space. 3 days is still conservative (one fill window is only 5 minutes), but
+//   accounts for relayer delays and network congestion.
+//
+// - PROOF_TTL_EXTEND_TO (7 days): On every receive_message or mock_set_proof,
+//   extend the proof to 7 days remaining. This means a proof remains readable
+//   for up to a week after relay, long enough for retries or off-chain debugging.
+//
+// - INSTANCE_TTL constants: The contract instance (admin, authorized emitters)
+//   uses the same large buffers as intent_settlement because if the instance
+//   archives, the entire contract becomes unreachable.
+const DAY_IN_LEDGERS: u32 = 17280; // ~5s per ledger
+const PROOF_TTL_THRESHOLD: u32 = DAY_IN_LEDGERS * 3;  // ~3 days
+const PROOF_TTL_EXTEND_TO: u32 = DAY_IN_LEDGERS * 7;  // ~7 days
+const INSTANCE_TTL_THRESHOLD: u32 = DAY_IN_LEDGERS * 30; // ~30 days
+const INSTANCE_TTL_EXTEND_TO: u32 = DAY_IN_LEDGERS * 60; // ~60 days
+
 // ─── Storage Keys ─────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -43,9 +68,15 @@ pub enum ProofKey {
     /// Stored but not called in this mock — present so the storage layout
     /// matches the future production contract.
     WormholeCore,
+    /// Axelar Gateway contract address for GMP message verification.
+    /// Used as the recommended bridge protocol per bridge-protocol-comparison.md.
+    AxelarGateway,
     /// Authorized emitter address on a given Wormhole source-chain ID.
     /// Key: `(chain_id: u16)` → `emitter: BytesN<32>`.
     AuthorizedEmitter(u32), // u32 wraps u16 — Soroban contracttype requires u32
+    /// Authorized source address on a given Axelar source chain.
+    /// Key: `(chain_name: String)` stored as (chain_name, source_addr) tuple.
+    AuthorizedAxelarSource(Symbol),
     /// Verified proof record keyed by Vortex `intent_id`.
     Proof(BytesN<32>),
 }
@@ -108,9 +139,19 @@ pub struct ProofRegistry;
 impl ProofRegistry {
     // ── Initialization ────────────────────────────────────────────────────────
 
-    /// Deploy-time setup.  Records `admin` and the Wormhole Core contract
-    /// address.  Must be called exactly once.
-    pub fn initialize(env: Env, admin: Address, wormhole_core: Address) {
+    /// Deploy-time setup.  Records `admin`, Wormhole Core contract address,
+    /// and Axelar Gateway address. Must be called exactly once.
+    ///
+    /// Both bridge protocols are registered at init time. The choice of which
+    /// to use for incoming proofs is determined by the authorized emitter/source
+    /// configuration and the calling convention (receive_message vs.
+    /// receive_message_axelar).
+    pub fn initialize(
+        env: Env,
+        admin: Address,
+        wormhole_core: Address,
+        axelar_gateway: Address,
+    ) {
         if env.storage().instance().has(&ProofKey::Admin) {
             panic_with_error!(&env, Error::AlreadyInitialized);
         }
@@ -119,6 +160,10 @@ impl ProofRegistry {
         env.storage()
             .instance()
             .set(&ProofKey::WormholeCore, &wormhole_core);
+        env.storage()
+            .instance()
+            .set(&ProofKey::AxelarGateway, &axelar_gateway);
+        Self::bump_instance_ttl(&env);
     }
 
     // ── Admin ─────────────────────────────────────────────────────────────────
@@ -131,6 +176,7 @@ impl ProofRegistry {
         env.storage()
             .instance()
             .set(&ProofKey::AuthorizedEmitter(chain_id), &emitter);
+        Self::bump_instance_ttl(&env);
         env.events().publish(
             (Symbol::new(&env, "emitter_authorized"),),
             (chain_id, emitter),
@@ -144,6 +190,7 @@ impl ProofRegistry {
         env.storage()
             .instance()
             .remove(&ProofKey::AuthorizedEmitter(chain_id));
+        Self::bump_instance_ttl(&env);
         env.events().publish(
             (Symbol::new(&env, "emitter_removed"),),
             chain_id,
@@ -155,6 +202,42 @@ impl ProofRegistry {
         env.storage()
             .instance()
             .get(&ProofKey::AuthorizedEmitter(chain_id))
+    }
+
+    /// Admin-only: register a trusted Axelar source address for a given
+    /// Axelar source chain (e.g., "ethereum", "base", "arbitrum").
+    /// Only messages originating from this source on `chain_name` will be
+    /// accepted by `receive_message_axelar`.
+    pub fn set_authorized_axelar_source(env: Env, chain_name: Symbol, source: String) {
+        Self::require_admin(&env);
+        env.storage()
+            .instance()
+            .set(&ProofKey::AuthorizedAxelarSource(chain_name.clone()), &source);
+        Self::bump_instance_ttl(&env);
+        env.events().publish(
+            (Symbol::new(&env, "axelar_source_authorized"),),
+            (chain_name, source),
+        );
+    }
+
+    /// Admin-only: remove a trusted Axelar source.
+    pub fn remove_authorized_axelar_source(env: Env, chain_name: Symbol) {
+        Self::require_admin(&env);
+        env.storage()
+            .instance()
+            .remove(&ProofKey::AuthorizedAxelarSource(chain_name.clone()));
+        Self::bump_instance_ttl(&env);
+        env.events().publish(
+            (Symbol::new(&env, "axelar_source_removed"),),
+            chain_name,
+        );
+    }
+
+    /// Return the authorized Axelar source for `chain_name`, or `None` if unset.
+    pub fn get_authorized_axelar_source(env: Env, chain_name: Symbol) -> Option<String> {
+        env.storage()
+            .instance()
+            .get(&ProofKey::AuthorizedAxelarSource(chain_name))
     }
 
     // ── Message Receipt ───────────────────────────────────────────────────────
@@ -245,8 +328,108 @@ impl ProofRegistry {
             .persistent()
             .set(&ProofKey::Proof(intent_id.clone()), &record);
 
+        Self::bump_proof_ttl(&env, &intent_id);
+
         env.events().publish(
             (Symbol::new(&env, "proof_received"),),
+            (intent_id, src_chain_id, src_amount),
+        );
+    }
+
+    /// Receive and verify an Axelar GMP message, then store the decoded proof.
+    ///
+    /// **Axelar integration rationale:**
+    /// docs/bridge-protocol-comparison.md recommends Axelar GMP as the primary
+    /// bridge protocol for Stellar: it has live Mainnet support (Feb 2026),
+    /// official Stellar developer docs, and active production usage. This
+    /// complementary `receive_message_axelar` path allows proofs to be relayed
+    /// via either Wormhole (legacy/fallback) or Axelar (recommended).
+    ///
+    /// **Payload layout (same as Wormhole for compatibility):**
+    /// The Axelar GMP message body encodes the same 102-byte payload as
+    /// Wormhole's VAA, ensuring intent_settlement sees identical ProofRecords:
+    /// ```
+    ///  [0..32]   intent_id   (BytesN<32>)
+    ///  [32..52]  src_user    (20-byte EVM address)
+    ///  [52..54]  src_chain_id (u16)
+    ///  [54..86]  src_token   (32 bytes, address padded)
+    ///  [86..102] src_amount  (i128, big-endian)
+    /// ```
+    ///
+    /// **Flow (mock behavior for now):**
+    /// In production, this would call the Axelar Gateway contract to verify
+    /// the message signature. For now, like receive_message, this parses the
+    /// payload directly without verification.
+    pub fn receive_message_axelar(
+        env: Env,
+        source_chain: Symbol,
+        source_address: String,
+        payload: Bytes,
+    ) {
+        if payload.len() != 102 {
+            panic_with_error!(&env, Error::InvalidPayload);
+        }
+
+        // Verify source authorization
+        if let Some(authorized_source) = Self::get_authorized_axelar_source(&env, source_chain.clone()) {
+            if authorized_source != source_address {
+                panic_with_error!(&env, Error::EmitterNotAuthorized);
+            }
+        } else {
+            panic_with_error!(&env, Error::EmitterNotAuthorized);
+        }
+
+        // Decode intent_id (bytes 0..32).
+        let intent_id: BytesN<32> = payload.slice(0..32).try_into().unwrap_or_else(|_| {
+            panic_with_error!(&env, Error::InvalidPayload)
+        });
+
+        // Reject replays.
+        if env
+            .storage()
+            .persistent()
+            .has(&ProofKey::Proof(intent_id.clone()))
+        {
+            panic_with_error!(&env, Error::ProofAlreadyExists);
+        }
+
+        // Decode src_chain_id (bytes 52..54) as big-endian u16 → u32.
+        let chain_hi = payload.get(52) as u32;
+        let chain_lo = payload.get(53) as u32;
+        let src_chain_id: u32 = (chain_hi << 8) | chain_lo;
+
+        // Decode src_amount (bytes 86..102) as big-endian i128.
+        let mut amount_bytes = [0u8; 16];
+        let mut idx = 0usize;
+        while idx < 16 {
+            amount_bytes[idx] = payload.get((86 + idx) as u32) as u8;
+            idx += 1;
+        }
+        let src_amount = i128::from_be_bytes(amount_bytes);
+
+        let now = env.ledger().timestamp();
+
+        let src_user = Self::bytes_to_hex_string(&env, &payload.slice(32..52));
+        let src_token = Self::bytes_to_hex_string(&env, &payload.slice(54..86));
+
+        let record = ProofRecord {
+            intent_id: intent_id.clone(),
+            src_user,
+            src_chain_id,
+            src_token,
+            src_amount,
+            vaa_sequence: 0, // Axelar GMP doesn't use sequence numbers like Wormhole
+            received_at: now,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&ProofKey::Proof(intent_id.clone()), &record);
+
+        Self::bump_proof_ttl(&env, &intent_id);
+
+        env.events().publish(
+            (Symbol::new(&env, "proof_received_axelar"),),
             (intent_id, src_chain_id, src_amount),
         );
     }
@@ -295,6 +478,7 @@ impl ProofRegistry {
         env.storage()
             .persistent()
             .set(&ProofKey::Proof(record.intent_id.clone()), &record);
+        Self::bump_proof_ttl(&env, &record.intent_id);
     }
 
     /// **Test-only**: remove a stored proof.  Useful for testing the
@@ -336,5 +520,19 @@ impl ProofRegistry {
             i += 1;
         }
         String::from_bytes(env, &out)
+    }
+
+    fn bump_instance_ttl(env: &Env) {
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+    }
+
+    fn bump_proof_ttl(env: &Env, intent_id: &BytesN<32>) {
+        env.storage().persistent().extend_ttl(
+            &ProofKey::Proof(intent_id.clone()),
+            PROOF_TTL_THRESHOLD,
+            PROOF_TTL_EXTEND_TO,
+        );
     }
 }
