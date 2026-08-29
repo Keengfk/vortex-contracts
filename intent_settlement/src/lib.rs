@@ -2535,6 +2535,7 @@ impl IntentSettlement {
                 fill_window: DEFAULT_FILL_WINDOW,
                 intent_expiry: DEFAULT_INTENT_EXPIRY,
                 protocol_fee_bps: DEFAULT_PROTOCOL_FEE_BPS,
+                max_active_intents_per_solver: DEFAULT_MAX_ACTIVE_INTENTS_PER_SOLVER,
             })
     }
 
