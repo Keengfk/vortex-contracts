@@ -143,6 +143,15 @@ The contract emits Soroban events for every state transition. Your bot should
 subscribe to the ledger event stream and filter on `CONTRACT_ID` plus the topic
 symbols listed below.
 
+> **On-chain alternative for discovery (#249):** if all you need is *what's
+> currently fillable*, you don't have to run a full event-replay index just to
+> answer that question. Call `list_open_intents(offset, limit)` to page
+> directly through the contract's own list of `Open`/`PartiallyFilled` intent
+> IDs, bounded per call. Event subscription is still the right tool for
+> reacting to state transitions in real time (fills, cancellations, slashes);
+> `list_open_intents` is a cheaper way to bootstrap or periodically
+> reconcile your local view of open opportunities.
+
 ### Event Topics
 
 | Event symbol        | Emitted by         | Second topic (address) | Data value                                  |

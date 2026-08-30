@@ -29,6 +29,10 @@ const PROTOCOL_FEE_BPS: i128 = 5; // 0.05%
 /// closes.
 const BID_WINDOW: u64 = 120; // 2 minutes
 
+/// Upper bound on the number of intent IDs `list_open_intents` returns per
+/// call (issue #249), bounding the resource cost of paginated reads.
+const MAX_PAGE_SIZE: u32 = 100;
+
 /// Delay enforced between proposing and executing a sensitive admin change
 /// (admin transfer, fee recipient handover, dst_token allowlist changes).
 /// Gives users and solvers a window to notice and react before the change
@@ -108,6 +112,13 @@ pub enum DataKey {
     /// all successfully filled intents.  Incremented by `fill_intent`.
     TotalVolume,
 
+    /// **Instance storage.** Cumulative protocol fee revenue (`i128`)
+    /// collected across all fills (issue #248). Incremented by `fill_intent`
+    /// with the same `fee` value transferred to `FeeRecipient`, so it can
+    /// never drift from real transferred amounts. Absent until the first
+    /// fill after this field was introduced; `unwrap_or(0)` handles that.
+    TotalFeesCollected,
+
     /// **Instance storage.** Count of currently registered solvers (`u32`).
     /// Incremented by `register_solver` on first registration, decremented
     /// by `deregister_solver`.
@@ -132,6 +143,15 @@ pub enum DataKey {
     /// switching enforcement on.
     DstAllowlistEnabled,
     UserNonce(Address),       // per-user submit counter to widen intent_id preimage
+
+    /// **Instance storage.** Enumerable list of intent IDs currently in
+    /// `Open`/`PartiallyFilled` state (issue #249), maintained alongside the
+    /// `OpenIntents` counter following the same add/remove discipline as
+    /// `AllowedDstTokenList`. Lets solver bots discover fillable intents
+    /// via `list_open_intents` without replaying the full event history.
+    /// Trade-off: same as `OpenIntents` — one extra instance-storage
+    /// read+write on the handful of calls that open/close an intent.
+    OpenIntentList,
     AllowedSrcChain(String), // src_chain name -> present if allowed
     SrcChainAllowlistEnabled,
 
@@ -1112,6 +1132,24 @@ impl IntentSettlement {
         );
     }
 
+    /// Withdraws exactly the maximum amount currently safely withdrawable
+    /// above `min_bond` (issue #258), so callers don't need to first read
+    /// `get_solver`/`get_config` and compute `bond_amount - min_bond`
+    /// themselves. A solver already at or below the floor (e.g. post-slash)
+    /// is a safe zero-amount no-op rather than an underflow or rejection.
+    pub fn withdraw_excess_bond(env: Env, solver: Address) {
+        let record: SolverRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Solver(solver.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::SolverNotRegistered));
+        let cfg = Self::load_config(&env);
+        let excess = record.bond_amount - cfg.min_bond;
+        if excess > 0 {
+            Self::withdraw_bond(env, solver, excess);
+        }
+    }
+
     /// Solver withdraws part of their bond without fully deregistering.
     /// The remaining bond must still clear MIN_BOND -- to go below that,
     /// use deregister_solver instead (which also requires no active intents).
@@ -1314,6 +1352,12 @@ impl IntentSettlement {
             .instance()
             .set(&DataKey::OpenIntents, &(open + 1));
 
+        // #249: only truly Open intents (not Bidding, which isn't directly
+        // fillable) are enumerable via list_open_intents.
+        if intent.state == IntentState::Open {
+            Self::add_to_open_intent_list(&env, &intent_id);
+        }
+
         env.events().publish(
             (Symbol::new(&env, "intent_submitted"), user),
             (intent_id.clone(), min_dst_amount, expiry),
@@ -1395,6 +1439,7 @@ impl IntentSettlement {
         env.storage()
             .instance()
             .set(&DataKey::OpenIntents, &open.saturating_sub(1));
+        Self::remove_from_open_intent_list(&env, &intent_id);
 
         env.storage()
             .persistent()
@@ -1536,6 +1581,7 @@ impl IntentSettlement {
             env.storage()
                 .instance()
                 .set(&DataKey::OpenIntents, &(open + 1));
+            Self::add_to_open_intent_list(&env, &intent_id);
         }
 
         env.storage()
@@ -1552,6 +1598,18 @@ impl IntentSettlement {
         env.storage()
             .instance()
             .set(&DataKey::TotalVolume, &(total_vol + fill_amount));
+
+        // Issue #248: track cumulative protocol fee revenue on-chain,
+        // incremented by the same `fee` value actually transferred to
+        // `FeeRecipient` so this counter can never drift from real transfers.
+        let total_fees: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalFeesCollected)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalFeesCollected, &(total_fees + fee));
 
         env.storage()
             .persistent()
@@ -1639,6 +1697,7 @@ impl IntentSettlement {
         env.storage()
             .instance()
             .set(&DataKey::OpenIntents, &open.saturating_sub(1));
+        Self::remove_from_open_intent_list(&env, &intent_id);
         // Update cancellation cooldown
         env.storage()
             .persistent()
@@ -1714,6 +1773,7 @@ impl IntentSettlement {
         env.storage()
             .instance()
             .set(&DataKey::OpenIntents, &(open + 1));
+        Self::add_to_open_intent_list(&env, &intent_id);
 
         // Persist both records BEFORE any token transfer so that a re-entrant
         // or back-to-back call on the same intent_id is rejected by the
@@ -1790,6 +1850,7 @@ impl IntentSettlement {
         env.storage()
             .instance()
             .set(&DataKey::OpenIntents, &open.saturating_sub(1));
+        Self::remove_from_open_intent_list(&env, &intent_id);
 
         env.events()
             .publish((Symbol::new(&env, "intent_expired"),), intent_id);
@@ -2023,6 +2084,16 @@ impl IntentSettlement {
         (intents, volume, open)
     }
 
+    /// Cumulative protocol fee revenue collected across all fills (#248).
+    /// Complements `get_stats`'s `total_volume` (gross fill amounts) with
+    /// the fee slice, without requiring a full event replay.
+    pub fn get_total_fees_collected(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::TotalFeesCollected)
+            .unwrap_or(0)
+    }
+
     /// Minimum bond required for solver registration.
     pub fn get_min_bond(_env: Env) -> i128 {
         MIN_BOND
@@ -2034,6 +2105,38 @@ impl IntentSettlement {
             .persistent()
             .get(&DataKey::UserIntents(user))
             .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Paginated, bounded list of currently `Open`/`PartiallyFilled` intent
+    /// IDs (issue #249), so solver bots can discover fillable intents
+    /// directly from the contract instead of replaying `intent_submitted`/
+    /// `intent_accepted`/etc. events to build their own index. Bounded by
+    /// `MAX_PAGE_SIZE` per call; `offset` beyond the list length returns an
+    /// empty `Vec`.
+    pub fn list_open_intents(env: Env, offset: u32, limit: u32) -> Vec<BytesN<32>> {
+        let list: Vec<BytesN<32>> = env
+            .storage()
+            .instance()
+            .get(&DataKey::OpenIntentList)
+            .unwrap_or_else(|| Vec::new(&env));
+        let page_size = limit.min(MAX_PAGE_SIZE);
+        let mut result = Vec::new(&env);
+        let mut i = offset;
+        while i < list.len() && (i - offset) < page_size {
+            result.push_back(list.get(i).unwrap());
+            i += 1;
+        }
+        result
+    }
+
+    /// Current per-user submit nonce that feeds `compute_intent_id`'s
+    /// preimage (issue #257). Returns 0 for a user who has never submitted
+    /// an intent, matching `submit_intent`'s own `unwrap_or(0)` default.
+    pub fn get_user_nonce(env: Env, user: Address) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::UserNonce(user))
+            .unwrap_or(0)
     }
 
     /// Total number of solvers ever registered.
@@ -2306,6 +2409,49 @@ impl IntentSettlement {
         env.storage()
             .instance()
             .set(&DataKey::AllowedDstTokenList, &new_list);
+    }
+
+    /// Add `intent_id` to the enumerable open-intent list (#249), if not
+    /// already present (guards against duplicate entries across an
+    /// Open -> Accepted -> Slashed -> Open cycle).
+    fn add_to_open_intent_list(env: &Env, intent_id: &BytesN<32>) {
+        let mut list: Vec<BytesN<32>> = env
+            .storage()
+            .instance()
+            .get(&DataKey::OpenIntentList)
+            .unwrap_or_else(|| Vec::new(env));
+        let mut already_present = false;
+        for i in 0..list.len() {
+            if list.get(i).unwrap() == *intent_id {
+                already_present = true;
+                break;
+            }
+        }
+        if !already_present {
+            list.push_back(intent_id.clone());
+            env.storage()
+                .instance()
+                .set(&DataKey::OpenIntentList, &list);
+        }
+    }
+
+    /// Remove `intent_id` from the enumerable open-intent list (#249), if present.
+    fn remove_from_open_intent_list(env: &Env, intent_id: &BytesN<32>) {
+        let list: Vec<BytesN<32>> = env
+            .storage()
+            .instance()
+            .get(&DataKey::OpenIntentList)
+            .unwrap_or_else(|| Vec::new(env));
+        let mut new_list: Vec<BytesN<32>> = Vec::new(env);
+        for i in 0..list.len() {
+            let item = list.get(i).unwrap();
+            if item != *intent_id {
+                new_list.push_back(item);
+            }
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::OpenIntentList, &new_list);
     }
 
     fn get_adjusted_min_bond(env: &Env, dst_token: &Address) -> i128 {

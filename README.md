@@ -40,7 +40,7 @@ Core protocol logic (`intent_settlement/src/lib.rs`):
 - `cancel_intent()` — user cancels an open intent
 - `expire_intent()` — permissionless: materializes an unfilled intent's expiry
 - `slash_solver()` — permissionless: slashes a solver that failed to fill
-- `register_solver()` / `deregister_solver()` / `withdraw_bond()` — solver bond management
+- `register_solver()` / `deregister_solver()` / `withdraw_bond()` / `withdraw_excess_bond()` — solver bond management (#258)
 - `propose_fee_recipient()` / `accept_fee_recipient()` — timelocked fee-recipient handover (#115, #116)
 - `propose_admin_transfer()` / `accept_admin_transfer()` — timelocked admin-key handover (#115, #116)
 - `pause()` / `unpause()` — admin-only incident response
@@ -48,6 +48,9 @@ Core protocol logic (`intent_settlement/src/lib.rs`):
 - `list_allowed_dst_tokens()` — enumerate the full current dst_token allowlist (#117)
 - `add_allowed_src_chain()` / `remove_allowed_src_chain()` / `set_src_chain_allowlist_enabled()` — optional src_chain allowlist (#34)
 - `rescue_tokens()` — admin-only recovery of non-bond tokens accidentally sent to the contract (#35)
+- `get_user_nonce()` — read a user's current `submit_intent` nonce (#257)
+- `list_open_intents()` — paginated view of currently `Open`/`PartiallyFilled` intent IDs (#249)
+- `get_total_fees_collected()` — cumulative protocol fee revenue collected across all fills (#248)
 
 #### Usage examples
 
