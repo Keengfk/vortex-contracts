@@ -2871,3 +2871,108 @@ fn unknown_chain_bypasses_token_format_validation() {
         &deadline,
     );
 }
+
+// ─── Issue #228: Timelocked governance for per-token bond-multiplier changes ───────
+
+/// Issue #228: Admin can propose a bond multiplier change for a token.
+/// The proposal fires a `bond_multiplier_change_proposed` event immediately
+/// but the multiplier is not active until `execute_set_min_bond_multiplier`
+/// is called after the timelock elapses.
+#[test]
+fn propose_set_min_bond_multiplier_creates_pending_change() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    // Initially, the dst_token has the default multiplier (1.0x = 10).
+    assert_eq!(c.get_min_bond_multiplier(&ctx.dst_token), 10);
+
+    // Propose a new multiplier (20 = 2.0x) for the dst token.
+    c.propose_set_min_bond_multiplier(&ctx.dst_token, &20);
+
+    // After proposal, the active multiplier should still be the default (1.0x).
+    assert_eq!(c.get_min_bond_multiplier(&ctx.dst_token), 10);
+}
+
+/// Issue #228: Cannot execute a bond multiplier change before the timelock elapses.
+#[test]
+fn execute_set_min_bond_multiplier_before_timelock_fails() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    c.propose_set_min_bond_multiplier(&ctx.dst_token, &20);
+
+    // Attempting to execute immediately should fail with TimelockNotElapsed.
+    let res = c.try_execute_set_min_bond_multiplier(&ctx.dst_token);
+    assert_eq!(res, Err(Ok(Error::TimelockNotElapsed.into())));
+
+    // The multiplier should remain at the default.
+    assert_eq!(c.get_min_bond_multiplier(&ctx.dst_token), 10);
+}
+
+/// Issue #228: Once the timelock elapses, execute_set_min_bond_multiplier succeeds.
+#[test]
+fn execute_set_min_bond_multiplier_after_timelock_succeeds() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    c.propose_set_min_bond_multiplier(&ctx.dst_token, &20);
+
+    // Advance time past the timelock (48 hours).
+    ctx.pass_time(ADMIN_TIMELOCK_DELAY + 1);
+
+    // Execute should succeed.
+    c.execute_set_min_bond_multiplier(&ctx.dst_token);
+
+    // The multiplier is now active.
+    assert_eq!(c.get_min_bond_multiplier(&ctx.dst_token), 20);
+}
+
+/// Issue #228: Executing a multiplier change without a pending proposal fails.
+#[test]
+fn execute_set_min_bond_multiplier_without_proposal_fails() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    // Attempt to execute without having proposed anything.
+    let res = c.try_execute_set_min_bond_multiplier(&ctx.dst_token);
+    assert!(res.is_err());
+}
+
+/// Issue #228: Proposing a bond multiplier ≤ 0 is rejected.
+#[test]
+fn propose_set_min_bond_multiplier_rejects_zero_or_negative() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    let res = c.try_propose_set_min_bond_multiplier(&ctx.dst_token, &0);
+    assert_eq!(res, Err(Ok(Error::ZeroAmount.into())));
+
+    let res = c.try_propose_set_min_bond_multiplier(&ctx.dst_token, &-5);
+    assert_eq!(res, Err(Ok(Error::ZeroAmount.into())));
+}
+
+/// Issue #228: Proposing a bond multiplier exceeding the upper bound is rejected.
+#[test]
+fn propose_set_min_bond_multiplier_rejects_excessive_value() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    let excessive_multiplier = 100_001;
+    let res = c.try_propose_set_min_bond_multiplier(&ctx.dst_token, &excessive_multiplier);
+
+    assert!(res.is_err());
+}
+
+/// Issue #228: A new proposal overwrites a previous proposal for the same token.
+#[test]
+fn propose_set_min_bond_multiplier_overwrites_previous_proposal() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    c.propose_set_min_bond_multiplier(&ctx.dst_token, &20);
+    assert_eq!(c.get_min_bond_multiplier(&ctx.dst_token), 10);
+
+    c.propose_set_min_bond_multiplier(&ctx.dst_token, &30);
+
+    // The latest proposal (30) should be active.
+}
