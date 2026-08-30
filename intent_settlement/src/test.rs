@@ -2917,3 +2917,78 @@ fn multiple_pause_guardians_last_one_wins() {
     });
     assert_eq!(stored, Some(guardian2));
 }
+
+// ─── Issue #223: Admin Audit Trail Event Tests ────────────────────────────────
+
+#[test]
+fn admin_transfer_emits_event() {
+    let ctx = setup();
+    let new_admin = Address::generate(&ctx.env);
+    ctx.client().propose_admin_transfer(&new_admin);
+    ctx.pass_time(ADMIN_TIMELOCK_DELAY);
+    ctx.client().accept_admin_transfer(&new_admin);
+    let events = ctx.env.events().all();
+    let has_admin_transfer_event = events.iter().any(|(topic, _)| {
+        topic.len() > 0 && topic[0].to_string().contains("admin_transferred")
+    });
+    assert!(has_admin_transfer_event, "admin_transferred event should be emitted");
+}
+
+#[test]
+fn fee_recipient_proposal_emits_event() {
+    let ctx = setup();
+    let new_recipient = Address::generate(&ctx.env);
+    ctx.client().propose_fee_recipient(&new_recipient);
+    let events = ctx.env.events().all();
+    let has_fee_event = events.iter().any(|(topic, _)| {
+        topic.len() > 0 && topic[0].to_string().contains("fee_recipient_proposed")
+    });
+    assert!(has_fee_event, "fee_recipient_proposed event should be emitted");
+}
+
+#[test]
+fn fee_recipient_acceptance_emits_event() {
+    let ctx = setup();
+    let new_recipient = Address::generate(&ctx.env);
+    ctx.client().propose_fee_recipient(&new_recipient);
+    ctx.pass_time(ADMIN_TIMELOCK_DELAY);
+    ctx.client().accept_fee_recipient(&new_recipient);
+    let events = ctx.env.events().all();
+    let has_updated_event = events.iter().any(|(topic, _)| {
+        topic.len() > 0 && topic[0].to_string().contains("fee_recipient_updated")
+    });
+    assert!(has_updated_event, "fee_recipient_updated event should be emitted");
+}
+
+#[test]
+fn pause_emits_paused_event() {
+    let ctx = setup();
+    ctx.client().pause(&ctx.admin);
+    let events = ctx.env.events().all();
+    let has_pause_event = events.iter().any(|(topic, _)| {
+        topic.len() > 0 && topic[0].to_string().contains("paused")
+    });
+    assert!(has_pause_event, "paused event should be emitted");
+}
+
+#[test]
+fn dst_token_allowed_emits_event() {
+    let ctx = setup();
+    ctx.allow_dst_token(&ctx.dst_token);
+    let events = ctx.env.events().all();
+    let has_token_event = events.iter().any(|(topic, _)| {
+        topic.len() > 0 && topic[0].to_string().contains("dst_token_allowed")
+    });
+    assert!(has_token_event, "dst_token_allowed event should be emitted");
+}
+
+#[test]
+fn bond_multiplier_set_emits_event() {
+    let ctx = setup();
+    ctx.client().set_min_bond_multiplier(&ctx.dst_token, &15);
+    let events = ctx.env.events().all();
+    let has_multiplier_event = events.iter().any(|(topic, _)| {
+        topic.len() > 0 && topic[0].to_string().contains("bond_multiplier_set")
+    });
+    assert!(has_multiplier_event, "bond_multiplier_set event should be emitted");
+}
