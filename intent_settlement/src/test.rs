@@ -380,6 +380,8 @@ fn pauser_cannot_unpause() {
         "unpause must require admin auth, not the pauser; got: {:?}",
         auths
     );
+}
+
 #[test]
 fn pause_blocks_fill_intent() {
     let ctx = setup();
@@ -1297,6 +1299,58 @@ fn fill_by_wrong_solver_fails() {
 
     let res = ctx.client().try_fill_intent(&other, &id, &FILL);
     assert_eq!(res, Err(Ok(Error::Unauthorized.into())));
+}
+
+#[test]
+fn is_intent_fillable_matches_fill_intent_outcome() {
+    let ctx = setup();
+    ctx.register_solver();
+    let id = ctx.submit();
+    ctx.client().accept_intent(&ctx.solver, &id);
+
+    // Genuinely fillable: matches a real fill_intent success.
+    assert!(ctx.client().is_intent_fillable(&id, &ctx.solver));
+    ctx.dst_admin().mint(&ctx.solver, &FILL);
+    ctx.client().fill_intent(&ctx.solver, &id, &FILL);
+}
+
+#[test]
+fn is_intent_fillable_false_for_wrong_solver() {
+    let ctx = setup();
+    ctx.register_solver();
+    let id = ctx.submit();
+    ctx.client().accept_intent(&ctx.solver, &id);
+
+    let other = Address::generate(&ctx.env);
+    ctx.bond_admin().mint(&other, &BOND);
+    ctx.client().register_solver(&other, &BOND);
+
+    assert!(!ctx.client().is_intent_fillable(&id, &other));
+    ctx.dst_admin().mint(&other, &FILL);
+    let res = ctx.client().try_fill_intent(&other, &id, &FILL);
+    assert_eq!(res, Err(Ok(Error::Unauthorized.into())));
+}
+
+#[test]
+fn is_intent_fillable_false_after_deadline() {
+    let ctx = setup();
+    ctx.register_solver();
+    let id = ctx.submit();
+    ctx.client().accept_intent(&ctx.solver, &id);
+
+    ctx.pass_time(FILL_WINDOW + 1);
+    assert!(!ctx.client().is_intent_fillable(&id, &ctx.solver));
+
+    ctx.dst_admin().mint(&ctx.solver, &FILL);
+    let res = ctx.client().try_fill_intent(&ctx.solver, &id, &FILL);
+    assert_eq!(res, Err(Ok(Error::FillWindowExpired.into())));
+}
+
+#[test]
+fn is_intent_fillable_false_for_nonexistent_intent() {
+    let ctx = setup();
+    let bogus_id = BytesN::from_array(&ctx.env, &[9u8; 32]);
+    assert!(!ctx.client().is_intent_fillable(&bogus_id, &ctx.solver));
 }
 
 // ─── Cancellation ───────────────────────────────────────────────────────────────
@@ -2870,4 +2924,38 @@ fn unknown_chain_bypasses_token_format_validation() {
         &MIN_DST,
         &deadline,
     );
+}
+
+// ─── #253 src_chain-to-Wormhole-chain-ID mapping ─────────────────────────────────
+
+/// Every chain in the README's Supported Source Chains table round-trips
+/// correctly through `src_chain_to_wormhole_id`.
+#[test]
+fn src_chain_to_wormhole_id_covers_every_supported_chain() {
+    let ctx = setup();
+    let c = ctx.client();
+    let cases: &[(&str, u32)] = &[
+        ("ethereum", 2),
+        ("base", 30),
+        ("polygon", 5),
+        ("arbitrum", 23),
+        ("optimism", 24),
+        ("avalanche", 6),
+        ("bsc", 4),
+        ("solana", 1),
+    ];
+    for (chain, expected_id) in cases {
+        let chain_str = String::from_str(&ctx.env, chain);
+        assert_eq!(c.src_chain_to_wormhole_id(&chain_str), *expected_id);
+    }
+}
+
+/// An unknown/future chain string is explicitly rejected rather than
+/// defaulting to chain ID 0.
+#[test]
+fn src_chain_to_wormhole_id_rejects_unknown_chain() {
+    let ctx = setup();
+    let chain_str = String::from_str(&ctx.env, "cosmos");
+    let res = ctx.client().try_src_chain_to_wormhole_id(&chain_str);
+    assert_eq!(res, Err(Ok(Error::SrcChainNotSupported.into())));
 }

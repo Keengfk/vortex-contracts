@@ -162,6 +162,63 @@ fn receive_message_stores_proof() {
 }
 
 #[test]
+fn get_fresh_proof_returns_record_when_fresh() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    let intent_id = make_intent_id(&ctx.env, 95);
+    let payload = make_payload(&ctx.env, &intent_id, 2, 1_000_000_000);
+    c.receive_message(&payload);
+
+    let record = c.get_fresh_proof(&intent_id);
+    assert_eq!(record.intent_id, intent_id);
+}
+
+#[test]
+fn get_fresh_proof_rejects_stale_proof() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    let intent_id = make_intent_id(&ctx.env, 96);
+    let payload = make_payload(&ctx.env, &intent_id, 2, 1_000_000_000);
+    c.receive_message(&payload);
+
+    ctx.env
+        .ledger()
+        .with_mut(|li| li.timestamp += crate::PROOF_VALIDITY_WINDOW + 1);
+
+    let res = c.try_get_fresh_proof(&intent_id);
+    assert_eq!(res, Err(Ok(Error::ProofStale.into())));
+}
+
+#[test]
+fn get_fresh_proof_accepts_exact_boundary() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    let intent_id = make_intent_id(&ctx.env, 97);
+    let payload = make_payload(&ctx.env, &intent_id, 2, 1_000_000_000);
+    c.receive_message(&payload);
+
+    // Exactly at the validity window boundary: still fresh (inclusive).
+    ctx.env
+        .ledger()
+        .with_mut(|li| li.timestamp += crate::PROOF_VALIDITY_WINDOW);
+    let record = c.get_fresh_proof(&intent_id);
+    assert_eq!(record.intent_id, intent_id);
+}
+
+#[test]
+fn get_fresh_proof_rejects_missing_proof() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    let intent_id = make_intent_id(&ctx.env, 98);
+    let res = c.try_get_fresh_proof(&intent_id);
+    assert_eq!(res, Err(Ok(Error::ProofNotFound.into())));
+}
+
+#[test]
 fn receive_message_rejects_duplicate_intent_id() {
     let ctx = setup();
     let c = ctx.client();
@@ -189,6 +246,53 @@ fn receive_message_rejects_wrong_payload_length() {
     let long = Bytes::from_slice(&ctx.env, &[0u8; 200]);
     let res = ctx.client().try_receive_message(&long);
     assert_eq!(res, Err(Ok(Error::InvalidPayload.into())));
+}
+
+#[test]
+fn receive_message_succeeds_while_unpaused() {
+    let ctx = setup();
+    let c = ctx.client();
+    assert!(!c.is_paused());
+
+    let intent_id = make_intent_id(&ctx.env, 90);
+    let payload = make_payload(&ctx.env, &intent_id, 2, 1_000_000_000);
+    c.receive_message(&payload);
+    assert!(c.has_proof(&intent_id));
+}
+
+#[test]
+fn receive_message_rejects_while_paused() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    c.pause();
+    assert!(c.is_paused());
+
+    let intent_id = make_intent_id(&ctx.env, 91);
+    let payload = make_payload(&ctx.env, &intent_id, 2, 1_000_000_000);
+    let res = c.try_receive_message(&payload);
+    assert_eq!(res, Err(Ok(Error::ContractPaused.into())));
+}
+
+#[test]
+fn reads_remain_available_while_paused() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    let intent_id = make_intent_id(&ctx.env, 92);
+    let payload = make_payload(&ctx.env, &intent_id, 2, 1_000_000_000);
+    c.receive_message(&payload);
+
+    c.pause();
+    assert!(c.has_proof(&intent_id));
+    assert!(c.get_proof(&intent_id).is_some());
+
+    c.unpause();
+    assert!(!c.is_paused());
+    let intent_id2 = make_intent_id(&ctx.env, 93);
+    let payload2 = make_payload(&ctx.env, &intent_id2, 2, 1);
+    c.receive_message(&payload2);
+    assert!(c.has_proof(&intent_id2));
 }
 
 #[test]

@@ -9,8 +9,29 @@ first deploys to mainnet.
 
 ## [Unreleased]
 
+### Added
+
+- **`proof_registry` pause/circuit-breaker**: `pause`/`unpause`/`is_paused`
+  gate `receive_message` for incident response, mirroring
+  `intent_settlement`'s existing pause mechanism. `get_proof`/`has_proof`
+  remain available during a pause (#264).
+- **`is_intent_fillable` view** on `intent_settlement`: lets off-chain solver
+  bots self-check whether a `fill_intent` call would pass its pre-transfer
+  guards (intent exists, state `Accepted`, caller matches `intent.solver`,
+  deadline not passed) before spending a transaction (#259).
+- **Proof expiry/freshness**: `proof_registry::get_fresh_proof` rejects a
+  `ProofRecord` older than the new `PROOF_VALIDITY_WINDOW` (1 hour) with a
+  dedicated `ProofStale` error, distinct from `ProofNotFound` (#254).
+- **`src_chain`-to-Wormhole-chain-ID mapping**:
+  `IntentSettlement::src_chain_to_wormhole_id` is the single source of truth
+  translating canonical `src_chain` strings to their numeric Wormhole chain
+  ID, failing closed with `SrcChainNotSupported` for unmapped chains (#253).
+
 ### Fixed
 
+- `intent_settlement/src/test.rs`: restored a missing closing brace in
+  `pauser_cannot_unpause` (left unclosed by a prior merge) that made the
+  file unparseable and broke `cargo fmt`/`cargo test` for the whole crate.
 - `deregister_solver` now refuses to return a solver's bond while they hold
   an `Accepted` intent, closing a path to dodge `slash_solver` by
   withdrawing before the fill window expired.

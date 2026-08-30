@@ -419,6 +419,24 @@ stellar contract invoke \
   unpause
 ```
 
+### Pause the proof registry (admin only)
+
+`proof_registry` has its own independent pause flag (issue #264), separate
+from `intent_settlement`'s. Use this if you suspect a forged-proof attack or
+other proof-ingestion incident:
+
+```bash
+stellar contract invoke \
+  --id $PROOF_REGISTRY_CONTRACT_ID \
+  --source <ADMIN_SECRET_KEY> \
+  --network mainnet -- \
+  pause
+```
+
+Effect: `receive_message` reverts with `ContractPaused (8)`. `get_proof` and
+`has_proof` remain available. Resume with the same `unpause` invocation used
+for `intent_settlement`, targeted at `$PROOF_REGISTRY_CONTRACT_ID`.
+
 ### Rotate admin key
 
 If the admin key is compromised, use `transfer_admin`. This requires

@@ -29,6 +29,16 @@ use soroban_sdk::{
     BytesN, Env, String, Symbol,
 };
 
+/// Issue #254: how long (in seconds) a `ProofRecord` remains usable to gate a
+/// `fill_intent` call after `receive_message` stores it. Chosen to comfortably
+/// exceed `intent_settlement`'s 300-second `FILL_WINDOW` plus realistic
+/// VAA-relay latency (1–20 minutes across the bridge protocols compared in
+/// `docs/bridge-protocol-comparison.md`), so a proof arriving even somewhat
+/// late is never spuriously rejected as stale. This is distinct from Soroban
+/// storage-TTL archival (issue #51) — this is business-logic staleness, not
+/// ledger-entry expiry.
+pub const PROOF_VALIDITY_WINDOW: u64 = 3600;
+
 #[cfg(test)]
 mod test;
 
@@ -48,6 +58,10 @@ pub enum ProofKey {
     AuthorizedEmitter(u32), // u32 wraps u16 — Soroban contracttype requires u32
     /// Verified proof record keyed by Vortex `intent_id`.
     Proof(BytesN<32>),
+    /// Boolean flag (`true` = paused). Set by `pause()` and cleared by
+    /// `unpause()`. When `true`, `receive_message` rejects new proofs.
+    /// Absent until first `pause()` call (defaults to `false`).
+    Paused,
 }
 
 // ─── Data Types ───────────────────────────────────────────────────────────────
@@ -97,6 +111,12 @@ pub enum Error {
     InvalidPayload = 6,
     /// Contract not initialized (`Admin` key absent).
     NotInitialized = 7,
+    /// `receive_message` called while the registry is paused.
+    ContractPaused = 8,
+    /// `get_fresh_proof` found a `ProofRecord` older than
+    /// `PROOF_VALIDITY_WINDOW`. Distinct from `ProofNotFound` — the proof
+    /// exists but is too stale to gate a fill.
+    ProofStale = 9,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -157,6 +177,32 @@ impl ProofRegistry {
             .get(&ProofKey::AuthorizedEmitter(chain_id))
     }
 
+    /// Admin-only: halt `receive_message` for incident response (issue #264),
+    /// mirroring `intent_settlement`'s `pause`/`unpause` mechanism. Unlike
+    /// `intent_settlement` (issue #120), there is no separate narrow-scoped
+    /// pauser role here — admin-only is sufficient for this registry's first
+    /// version. `get_proof`/`has_proof` remain available during a pause.
+    pub fn pause(env: Env) {
+        Self::require_admin(&env);
+        env.storage().instance().set(&ProofKey::Paused, &true);
+        env.events().publish((Symbol::new(&env, "paused"),), true);
+    }
+
+    /// Admin-only: lift a pause and resume accepting proofs.
+    pub fn unpause(env: Env) {
+        Self::require_admin(&env);
+        env.storage().instance().set(&ProofKey::Paused, &false);
+        env.events().publish((Symbol::new(&env, "paused"),), false);
+    }
+
+    /// Whether `receive_message` is currently halted.
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&ProofKey::Paused)
+            .unwrap_or(false)
+    }
+
     // ── Message Receipt ───────────────────────────────────────────────────────
 
     /// Receive and verify a Wormhole VAA, then store the decoded proof.
@@ -185,6 +231,10 @@ impl ProofRegistry {
     ///  [86..102] src_amount  (i128, big-endian)
     /// ```
     pub fn receive_message(env: Env, vaa: Bytes) {
+        if Self::is_paused(env.clone()) {
+            panic_with_error!(&env, Error::ContractPaused);
+        }
+
         // Payload must be exactly 102 bytes.
         if vaa.len() != 102 {
             panic_with_error!(&env, Error::InvalidPayload);
@@ -268,6 +318,29 @@ impl ProofRegistry {
             .has(&ProofKey::Proof(intent_id))
     }
 
+    /// Return `intent_id`'s `ProofRecord` only if it exists and is still
+    /// fresh (`now - received_at <= PROOF_VALIDITY_WINDOW`). Panics with
+    /// `Error::ProofNotFound` if no proof was received, or
+    /// `Error::ProofStale` if one exists but has aged out (issue #254).
+    /// This is the entry point `fill_intent`'s proof check (issue #5) is
+    /// intended to call — `get_proof`/`has_proof` remain raw, freshness-blind
+    /// reads for other callers.
+    pub fn get_fresh_proof(env: Env, intent_id: BytesN<32>) -> ProofRecord {
+        let record: ProofRecord = env
+            .storage()
+            .persistent()
+            .get(&ProofKey::Proof(intent_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ProofNotFound));
+        let now = env.ledger().timestamp();
+        // Boundary: exactly at the validity window is still fresh (inclusive),
+        // matching this codebase's documented inclusive/exclusive convention
+        // (issue #26) — validity holds through the boundary second itself.
+        if now - record.received_at > PROOF_VALIDITY_WINDOW {
+            panic_with_error!(&env, Error::ProofStale);
+        }
+        record
+    }
+
     // ── Test Back-Door ────────────────────────────────────────────────────────
 
     /// **Test-only** (available only when the `testutils` Cargo feature is
@@ -281,6 +354,11 @@ impl ProofRegistry {
     /// The method is intentionally not guarded by admin auth in the mock so
     /// that any test address can call it.  A production implementation would
     /// not expose this method at all.
+    ///
+    /// Issue #264: deliberately ignores the pause flag. This is test-setup
+    /// scaffolding, not the production message-receipt path `pause` protects;
+    /// tests that need to assert paused-`receive_message` behavior call
+    /// `receive_message` directly.
     #[cfg(feature = "testutils")]
     pub fn mock_set_proof(env: Env, record: ProofRecord) {
         // Reject replays (same as receive_message) so tests that accidentally

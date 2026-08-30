@@ -408,6 +408,10 @@ pub enum Error {
     /// If `src_chain` is unknown this error is never raised — unknown chains
     /// bypass token-format validation so the allowlist remains the sole gate.
     InvalidSrcToken = 28,
+    /// Issue #253: `src_chain` has no entry in the `src_chain`-to-Wormhole-
+    /// chain-ID mapping table (`src_chain_to_wormhole_id`). Fails closed
+    /// rather than defaulting to chain ID 0 for an unmapped/future chain.
+    SrcChainNotSupported = 29,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -1439,19 +1443,10 @@ impl IntentSettlement {
         // Boundary semantics: the fill-window deadline is EXCLUSIVE for filling.
         // `now >= intent.deadline` rejects at the boundary second (`now == deadline`)
         // so the full [accepted_at, accepted_at + FILL_WINDOW) window is available
-        // to the solver.
-        if now >= intent.deadline {
-            panic_with_error!(&env, Error::FillWindowExpired);
-        }
-
-        match &intent.state {
-            IntentState::Accepted => {}
-            IntentState::Filled => panic_with_error!(&env, Error::IntentAlreadyFilled),
-            _ => panic_with_error!(&env, Error::IntentNotAccepted),
-        }
-
-        if intent.solver.as_ref() != Some(&solver) {
-            panic_with_error!(&env, Error::Unauthorized);
+        // to the solver. Shared with `is_intent_fillable` via `check_fill_guards`
+        // (issue #259) so the two can never silently drift apart.
+        if let Err(e) = Self::check_fill_guards(&intent, &solver, now) {
+            panic_with_error!(&env, e);
         }
 
         if fill_amount <= 0 {
@@ -1958,6 +1953,29 @@ impl IntentSettlement {
         }
     }
 
+    /// Whether `fill_intent(solver, intent_id, ..)` would currently pass all
+    /// of its pre-transfer guards: intent exists, state is `Accepted`, `solver`
+    /// matches `intent.solver`, and the fill-window deadline hasn't passed.
+    /// Mirrors `is_solver_eligible`'s precedent, letting off-chain solver bots
+    /// self-check before spending a transaction (issue #259). Uses the same
+    /// boundary semantics `fill_intent` itself uses via `check_fill_guards`,
+    /// so the two can never disagree. Does not predict whether the token
+    /// transfer itself would succeed (e.g. insufficient solver balance) —
+    /// this checks contract-state preconditions only. Never panics: returns
+    /// `false` for a nonexistent `intent_id`.
+    pub fn is_intent_fillable(env: Env, intent_id: BytesN<32>, solver: Address) -> bool {
+        let intent: IntentRecord = match env
+            .storage()
+            .persistent()
+            .get(&DataKey::Intent(intent_id))
+        {
+            Some(intent) => intent,
+            None => return false,
+        };
+        let now = env.ledger().timestamp();
+        Self::check_fill_guards(&intent, &solver, now).is_ok()
+    }
+
     /// Returns the current fee recipient address, or `None` before initialization.
     pub fn get_fee_recipient(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::FeeRecipient)
@@ -2223,6 +2241,51 @@ impl IntentSettlement {
         // Unknown chain: skip validation — forward-compatible with future chains.
     }
 
+    /// Translates a canonical `src_chain` string (per
+    /// `docs/132-supported-chains.md` §2) to its numeric Wormhole chain ID,
+    /// for comparison against `proof.src_chain_id` once proof-gated fills
+    /// (issue #5) are wired up. Single source of truth for this mapping —
+    /// kept in sync with `docs/129-proof-mismatch-fallback.md` §4 (issue #253).
+    ///
+    /// Fails closed: an unmapped/future `src_chain` string panics with
+    /// `Error::SrcChainNotSupported` rather than defaulting to chain ID 0.
+    pub fn src_chain_to_wormhole_id(env: Env, src_chain: String) -> u32 {
+        let chain_len = src_chain.len();
+        let chain_is = |literal: &[u8]| -> bool {
+            if chain_len as usize != literal.len() {
+                return false;
+            }
+            let mut i = 0u32;
+            while i < chain_len {
+                if src_chain.get(i) != literal[i as usize] as u32 {
+                    return false;
+                }
+                i += 1;
+            }
+            true
+        };
+
+        if chain_is(b"ethereum") {
+            2
+        } else if chain_is(b"base") {
+            30
+        } else if chain_is(b"polygon") {
+            5
+        } else if chain_is(b"arbitrum") {
+            23
+        } else if chain_is(b"optimism") {
+            24
+        } else if chain_is(b"avalanche") {
+            6
+        } else if chain_is(b"bsc") {
+            4
+        } else if chain_is(b"solana") {
+            1
+        } else {
+            panic_with_error!(&env, Error::SrcChainNotSupported)
+        }
+    }
+
     fn require_admin(env: &Env) {
         let admin: Address = env
             .storage()
@@ -2265,6 +2328,27 @@ impl IntentSettlement {
         if Self::is_paused(env.clone()) {
             panic_with_error!(env, Error::ContractPaused);
         }
+    }
+
+    /// The pre-transfer guard sequence shared between `fill_intent` and
+    /// `is_intent_fillable` (issue #259): intent state is `Accepted`, `solver`
+    /// matches `intent.solver`, and `now` is before the fill-window deadline.
+    /// Extracted so the two call sites can never silently drift apart.
+    fn check_fill_guards(intent: &IntentRecord, solver: &Address, now: u64) -> Result<(), Error> {
+        // Boundary semantics: the fill-window deadline is EXCLUSIVE for filling
+        // (issue #26) — `now >= intent.deadline` rejects at the boundary second.
+        if now >= intent.deadline {
+            return Err(Error::FillWindowExpired);
+        }
+        match &intent.state {
+            IntentState::Accepted => {}
+            IntentState::Filled => return Err(Error::IntentAlreadyFilled),
+            _ => return Err(Error::IntentNotAccepted),
+        }
+        if intent.solver.as_ref() != Some(solver) {
+            return Err(Error::Unauthorized);
+        }
+        Ok(())
     }
 
     /// Add `token` to the enumerable allowlist (#117), if not already present.

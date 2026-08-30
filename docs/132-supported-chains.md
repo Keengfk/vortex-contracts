@@ -208,6 +208,10 @@ mapping table lives in §4 of [129-proof-mismatch-fallback.md](./129-proof-misma
 and must be kept in sync with the canonical strings listed in §2 of this
 document.
 
+**Implemented** (issue #253): `IntentSettlement::src_chain_to_wormhole_id` in
+`intent_settlement/src/lib.rs` is the single source of truth for this mapping.
+An unmapped `src_chain` string fails closed with `Error::SrcChainNotSupported`.
+
 ---
 
 *Closes #132*
