@@ -2871,3 +2871,49 @@ fn unknown_chain_bypasses_token_format_validation() {
         &deadline,
     );
 }
+
+// ─── Issue #221: Pause Guardian Tests ────────────────────────────────────────
+
+#[test]
+fn set_pause_guardian_stores_guardian_address() {
+    let ctx = setup();
+    let guardian = Address::generate(&ctx.env);
+    ctx.client().set_pause_guardian(&guardian);
+    let stored_guardian: Option<Address> = ctx.env.as_contract(&ctx.contract_id, || {
+        ctx.env.storage().instance().get(&DataKey::Pauser)
+    });
+    assert_eq!(stored_guardian, Some(guardian));
+}
+
+#[test]
+fn pause_guardian_can_pause_contract() {
+    let ctx = setup();
+    let guardian = Address::generate(&ctx.env);
+    ctx.client().set_pause_guardian(&guardian);
+    ctx.client().pause(&guardian);
+    assert!(ctx.client().is_paused());
+}
+
+#[test]
+fn pause_guardian_cannot_unpause_contract() {
+    let ctx = setup();
+    let guardian = Address::generate(&ctx.env);
+    ctx.client().set_pause_guardian(&guardian);
+    ctx.client().pause(&guardian);
+    assert!(ctx.client().is_paused());
+    ctx.client().unpause();
+    assert!(!ctx.client().is_paused());
+}
+
+#[test]
+fn multiple_pause_guardians_last_one_wins() {
+    let ctx = setup();
+    let guardian1 = Address::generate(&ctx.env);
+    let guardian2 = Address::generate(&ctx.env);
+    ctx.client().set_pause_guardian(&guardian1);
+    ctx.client().set_pause_guardian(&guardian2);
+    let stored: Option<Address> = ctx.env.as_contract(&ctx.contract_id, || {
+        ctx.env.storage().instance().get(&DataKey::Pauser)
+    });
+    assert_eq!(stored, Some(guardian2));
+}
