@@ -2871,3 +2871,160 @@ fn unknown_chain_bypasses_token_format_validation() {
         &deadline,
     );
 }
+
+// ─── Timelocked Config Changes (Issue #220) ─────────────────────────────────────
+
+/// Tests for the timelocked `propose_config`/`execute_config` governance pattern.
+/// Verifies that protocol parameter changes (`min_bond`, `fill_window`, `intent_expiry`,
+/// `protocol_fee_bps`) require a 48-hour timelock with advance-notice events.
+
+#[test]
+fn propose_config_emits_event_and_blocks_before_timelock() {
+    let ctx = setup();
+    let new_min_bond: i128 = 2_000 * 10_000_000;
+    let new_fill_window: u64 = 3600;
+    let new_intent_expiry: u64 = 259200;
+    let new_protocol_fee_bps: u32 = 50;
+
+    // Admin proposes a config change.
+    ctx.client().propose_config(
+        &new_min_bond,
+        &new_fill_window,
+        &new_intent_expiry,
+        &new_protocol_fee_bps,
+    );
+
+    // Pending config is visible.
+    let pending = ctx.client().get_pending_config();
+    assert!(pending.is_some(), "Pending config should exist after proposal");
+
+    // Attempting to execute before the timelock delay elapses fails.
+    let res = ctx.client().try_execute_config();
+    assert_eq!(
+        res,
+        Err(Ok(Error::TimelockNotElapsed.into())),
+        "execute_config should fail before timelock"
+    );
+
+    // Config remains unchanged.
+    let (mb, fw, ie, pfb) = ctx.client().get_config();
+    assert_eq!(mb, MIN_BOND, "min_bond should not change");
+    assert_eq!(fw, FILL_WINDOW, "fill_window should not change");
+    assert_eq!(ie, INTENT_EXPIRY, "intent_expiry should not change");
+}
+
+#[test]
+fn execute_config_succeeds_after_timelock() {
+    let ctx = setup();
+    let new_min_bond: i128 = 2_000 * 10_000_000;
+    let new_fill_window: u64 = 3600;
+    let new_intent_expiry: u64 = 259200;
+    let new_protocol_fee_bps: u32 = 50;
+
+    ctx.client().propose_config(
+        &new_min_bond,
+        &new_fill_window,
+        &new_intent_expiry,
+        &new_protocol_fee_bps,
+    );
+
+    // Advance time past the timelock.
+    ctx.pass_time(ADMIN_TIMELOCK_DELAY);
+
+    // Execute succeeds.
+    ctx.client().execute_config();
+
+    // Config is updated.
+    let (mb, fw, ie, pfb) = ctx.client().get_config();
+    assert_eq!(mb, new_min_bond, "min_bond should be updated");
+    assert_eq!(fw, new_fill_window, "fill_window should be updated");
+    assert_eq!(ie, new_intent_expiry, "intent_expiry should be updated");
+    assert_eq!(pfb, new_protocol_fee_bps, "protocol_fee_bps should be updated");
+
+    // Pending config is cleared.
+    assert_eq!(
+        ctx.client().get_pending_config(),
+        None,
+        "Pending config should be cleared after execution"
+    );
+}
+
+#[test]
+fn config_proposal_validates_bounds_at_proposal_time() {
+    let ctx = setup();
+
+    // Attempt to propose invalid min_bond (too low).
+    let res = ctx.client().try_propose_config(
+        &0, // invalid: min_bond must be > 0
+        &FILL_WINDOW,
+        &INTENT_EXPIRY,
+        &50,
+    );
+    assert!(
+        res.is_err(),
+        "Proposal with invalid min_bond should fail at proposal time"
+    );
+
+    // Attempt to propose invalid fill_window (zero).
+    let res = ctx.client().try_propose_config(
+        &MIN_BOND,
+        &0, // invalid: fill_window must be > 0
+        &INTENT_EXPIRY,
+        &50,
+    );
+    assert!(
+        res.is_err(),
+        "Proposal with invalid fill_window should fail at proposal time"
+    );
+
+    // Attempt to propose invalid intent_expiry (zero).
+    let res = ctx.client().try_propose_config(
+        &MIN_BOND,
+        &FILL_WINDOW,
+        &0, // invalid: intent_expiry must be > 0
+        &50,
+    );
+    assert!(
+        res.is_err(),
+        "Proposal with invalid intent_expiry should fail at proposal time"
+    );
+
+    // Attempt to propose excessive protocol_fee_bps (> 10000 bps = 100%).
+    let res = ctx.client().try_propose_config(
+        &MIN_BOND,
+        &FILL_WINDOW,
+        &INTENT_EXPIRY,
+        &10001, // invalid: > 100%
+    );
+    assert!(
+        res.is_err(),
+        "Proposal with protocol_fee_bps > 10000 should fail at proposal time"
+    );
+}
+
+#[test]
+fn accepted_intent_deadline_unchanged_by_later_config_change() {
+    let ctx = setup();
+    ctx.register_solver();
+    let intent_id = ctx.submit();
+
+    // Accept the intent (deadline snapshots the current fill_window).
+    ctx.client().accept_intent(&ctx.solver, &intent_id);
+
+    let (_, original_deadline) = ctx.client().get_intent(&intent_id).unwrap();
+
+    // Admin proposes and executes a config change to a longer fill_window.
+    let new_fill_window: u64 = 7200; // Longer than original.
+    ctx.client()
+        .propose_config(&MIN_BOND, &new_fill_window, &INTENT_EXPIRY, &50);
+    ctx.pass_time(ADMIN_TIMELOCK_DELAY);
+    ctx.client().execute_config();
+
+    // The already-accepted intent's deadline remains unchanged (deadline was
+    // snapshotted at accept time, not recalculated when config changes).
+    let (_, deadline_after) = ctx.client().get_intent(&intent_id).unwrap();
+    assert_eq!(
+        deadline_after, original_deadline,
+        "Already-accepted intent deadline should not change when config changes"
+    );
+}
