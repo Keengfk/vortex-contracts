@@ -29,6 +29,17 @@ const PROTOCOL_FEE_BPS: i128 = 5; // 0.05%
 /// closes.
 const BID_WINDOW: u64 = 120; // 2 minutes
 
+/// After being slashed a solver must wait this many seconds before they can
+/// accept new intents. Used by `accept_intent`'s cooldown guard and by
+/// `get_slash_cooldown_remaining` (issue #256), which both derive from the
+/// same `slash_cooldown_remaining` helper so they can never disagree.
+const SLASH_COOLDOWN: u64 = 3600; // 1 hour
+
+/// Upper bound on the number of `src_chain`/`dst_token` entries a solver may
+/// declare via `set_solver_routes` (issue #255), to keep per-solver route
+/// storage bounded.
+const MAX_ROUTE_ENTRIES: u32 = 20;
+
 /// Delay enforced between proposing and executing a sensitive admin change
 /// (admin transfer, fee recipient handover, dst_token allowlist changes).
 /// Gives users and solvers a window to notice and react before the change
@@ -144,6 +155,30 @@ pub enum DataKey {
     /// unpause access) -- resuming the protocol always needs the full
     /// admin's judgment.
     Pauser,
+
+    /// **Persistent storage.** List of `intent_id`s currently `Accepted` by
+    /// this solver (issue #245). Appended by `accept_intent`, removed on the
+    /// terminal transitions `fill_intent` performs (both the full-fill close
+    /// and the partial-fill re-open, since either way the solver relinquishes
+    /// exclusive ownership) and by `slash_solver`. Read by
+    /// `get_solver_intents`.
+    SolverIntents(Address),
+
+    /// **Instance storage.** Cumulative `dst_token` volume (`i128`) for a
+    /// single destination token (issue #246), incremented alongside the
+    /// global `TotalVolume` on every fill (including partial fills). Read by
+    /// `get_token_stats`.
+    TokenVolume(Address),
+    /// **Instance storage.** Cumulative protocol fees (`i128`) collected in
+    /// a single destination token (issue #246), incremented on every fill
+    /// alongside `TokenVolume`. Read by `get_token_stats`.
+    TokenFees(Address),
+
+    /// **Persistent storage.** A solver's advisory `(src_chains, dst_tokens)`
+    /// route preference (issue #255), set via `set_solver_routes`. Purely
+    /// informational -- `accept_intent` does not enforce it. Absent means
+    /// "no declared preference" (serves every route).
+    SolverRoutes(Address),
 }
 
 // ─── Data Structs ─────────────────────────────────────────────────────────────
@@ -408,6 +443,10 @@ pub enum Error {
     /// If `src_chain` is unknown this error is never raised — unknown chains
     /// bypass token-format validation so the allowlist remains the sole gate.
     InvalidSrcToken = 28,
+
+    /// `set_solver_routes` was called with more than `MAX_ROUTE_ENTRIES`
+    /// `src_chains` or `dst_tokens` (issue #255).
+    TooManyRouteEntries = 29,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -1344,7 +1383,7 @@ impl IntentSettlement {
         }
 
         let now = env.ledger().timestamp();
-        if solver_record.last_slash_time > 0 && now < solver_record.last_slash_time + SLASH_COOLDOWN {
+        if Self::slash_cooldown_remaining(solver_record.last_slash_time, now) > 0 {
             panic_with_error!(&env, Error::SolverInactive);
         }
 
@@ -1385,6 +1424,7 @@ impl IntentSettlement {
         env.storage()
             .persistent()
             .set(&DataKey::Solver(solver.clone()), &solver_record);
+        Self::solver_intents_add(&env, &solver, &intent_id);
 
         // Decrement open_intents: the intent is no longer open (a solver owns it).
         let open: u64 = env
@@ -1518,6 +1558,7 @@ impl IntentSettlement {
             intent.filled_at = Some(now);
             solver_record.fills_completed += 1;
             solver_record.active_intents = solver_record.active_intents.saturating_sub(1);
+            Self::solver_intents_remove(&env, &solver, &intent_id);
         } else {
             // Partial fill: re-open so another solver (or the same) can claim the
             // remaining amount.  Reset solver assignment and deadline back to the
@@ -1527,6 +1568,7 @@ impl IntentSettlement {
             intent.solver = None;
             intent.deadline = now + INTENT_EXPIRY;
             solver_record.active_intents = solver_record.active_intents.saturating_sub(1);
+            Self::solver_intents_remove(&env, &solver, &intent_id);
 
             let open: u64 = env
                 .storage()
@@ -1552,6 +1594,27 @@ impl IntentSettlement {
         env.storage()
             .instance()
             .set(&DataKey::TotalVolume, &(total_vol + fill_amount));
+
+        // Per-token volume/fee breakdown (issue #246), mirroring TotalVolume's
+        // per-fill increment timing so partial fills are counted immediately.
+        let token_vol: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TokenVolume(intent.dst_token.clone()))
+            .unwrap_or(0);
+        env.storage().instance().set(
+            &DataKey::TokenVolume(intent.dst_token.clone()),
+            &(token_vol + fill_amount),
+        );
+        let token_fees: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TokenFees(intent.dst_token.clone()))
+            .unwrap_or(0);
+        env.storage().instance().set(
+            &DataKey::TokenFees(intent.dst_token.clone()),
+            &(token_fees + fee),
+        );
 
         env.storage()
             .persistent()
@@ -1688,6 +1751,7 @@ impl IntentSettlement {
         solver_record.fills_failed += 1;
         solver_record.last_slash_time = now;
         solver_record.active_intents = solver_record.active_intents.saturating_sub(1);
+        Self::solver_intents_remove(&env, &solver_addr, &intent_id);
 
         let cfg = Self::load_config(&env);
         // A solver whose bond no longer covers min_bond can't credibly back
@@ -1929,6 +1993,69 @@ impl IntentSettlement {
         env.storage().persistent().get(&DataKey::Solver(solver))
     }
 
+    /// List the intent IDs currently `Accepted` by `solver` (issue #245).
+    /// Returns an empty `Vec` if the solver has no in-flight obligations (or
+    /// has never accepted an intent). Lets a solver bot recovering from a
+    /// crash rediscover its own active intents without replaying events.
+    pub fn get_solver_intents(env: Env, solver: Address) -> Vec<BytesN<32>> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SolverIntents(solver))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Cumulative `(volume, fees)` for a single destination token across all
+    /// fills, both in the token's smallest unit (issue #246). Returns
+    /// `(0, 0)` for a token that has never been filled against.
+    pub fn get_token_stats(env: Env, token: Address) -> (i128, i128) {
+        let volume: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TokenVolume(token.clone()))
+            .unwrap_or(0);
+        let fees: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TokenFees(token))
+            .unwrap_or(0);
+        (volume, fees)
+    }
+
+    /// Solver declares which `src_chain`/`dst_token` combinations it services
+    /// (issue #255). Purely advisory -- `accept_intent` does not enforce
+    /// this, so a solver may still accept any intent it's otherwise eligible
+    /// for regardless of declared routes.
+    pub fn set_solver_routes(
+        env: Env,
+        solver: Address,
+        src_chains: Vec<String>,
+        dst_tokens: Vec<Address>,
+    ) {
+        solver.require_auth();
+        if src_chains.len() > MAX_ROUTE_ENTRIES || dst_tokens.len() > MAX_ROUTE_ENTRIES {
+            panic_with_error!(&env, Error::TooManyRouteEntries);
+        }
+        env.storage().persistent().set(
+            &DataKey::SolverRoutes(solver.clone()),
+            &(src_chains, dst_tokens),
+        );
+        env.storage().persistent().extend_ttl(
+            &DataKey::SolverRoutes(solver),
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_EXTEND_TO,
+        );
+    }
+
+    /// A solver's declared route preference, or `(empty, empty)` if it has
+    /// never called `set_solver_routes` -- meaning "no declared preference",
+    /// i.e. it is presumed to serve every route (issue #255).
+    pub fn get_solver_routes(env: Env, solver: Address) -> (Vec<String>, Vec<Address>) {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SolverRoutes(solver))
+            .unwrap_or_else(|| (Vec::new(&env), Vec::new(&env)))
+    }
+
     /// Returns the reputation score (0–10_000 basis points) for `solver`,
     /// or None if the solver has never registered.
     ///
@@ -1955,6 +2082,24 @@ impl IntentSettlement {
         {
             Some(record) => record.is_active && record.bond_amount >= cfg.min_bond,
             None => false,
+        }
+    }
+
+    /// Seconds remaining before `solver`'s post-slash `SLASH_COOLDOWN` clears,
+    /// or `0` if the solver isn't in cooldown (including solvers who have
+    /// never been slashed, or who are unregistered). Uses the exact same
+    /// arithmetic as `accept_intent`'s cooldown guard via the shared
+    /// `slash_cooldown_remaining` helper, so the two can never disagree
+    /// (issue #256).
+    pub fn get_slash_cooldown_remaining(env: Env, solver: Address) -> u64 {
+        let now = env.ledger().timestamp();
+        match env
+            .storage()
+            .persistent()
+            .get::<_, SolverRecord>(&DataKey::Solver(solver))
+        {
+            Some(record) => Self::slash_cooldown_remaining(record.last_slash_time, now),
+            None => 0,
         }
     }
 
@@ -2390,6 +2535,55 @@ impl IntentSettlement {
             PERSISTENT_TTL_THRESHOLD,
             PERSISTENT_TTL_EXTEND_TO,
         );
+    }
+
+    /// Seconds remaining until a `SLASH_COOLDOWN` starting at `last_slash_time`
+    /// clears, given the current ledger time `now`. Returns `0` for a solver
+    /// that has never been slashed (`last_slash_time == 0`) or whose cooldown
+    /// has already elapsed. Shared by `accept_intent` and
+    /// `get_slash_cooldown_remaining` so both can never disagree (issue #256).
+    fn slash_cooldown_remaining(last_slash_time: u64, now: u64) -> u64 {
+        if last_slash_time == 0 {
+            return 0;
+        }
+        let cooldown_end = last_slash_time + SLASH_COOLDOWN;
+        cooldown_end.saturating_sub(now)
+    }
+
+    /// Appends `intent_id` to `solver`'s `SolverIntents` list (issue #245).
+    fn solver_intents_add(env: &Env, solver: &Address, intent_id: &BytesN<32>) {
+        let mut list: Vec<BytesN<32>> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SolverIntents(solver.clone()))
+            .unwrap_or_else(|| Vec::new(env));
+        list.push_back(intent_id.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::SolverIntents(solver.clone()), &list);
+        env.storage().persistent().extend_ttl(
+            &DataKey::SolverIntents(solver.clone()),
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_EXTEND_TO,
+        );
+    }
+
+    /// Removes `intent_id` from `solver`'s `SolverIntents` list, if present
+    /// (issue #245). A no-op if the list or the entry doesn't exist.
+    fn solver_intents_remove(env: &Env, solver: &Address, intent_id: &BytesN<32>) {
+        let key = DataKey::SolverIntents(solver.clone());
+        if let Some(list) = env.storage().persistent().get::<_, Vec<BytesN<32>>>(&key) {
+            if let Some(idx) = list.iter().position(|id| &id == intent_id) {
+                let mut list = list;
+                let _ = list.remove(idx as u32);
+                env.storage().persistent().set(&key, &list);
+                env.storage().persistent().extend_ttl(
+                    &key,
+                    PERSISTENT_TTL_THRESHOLD,
+                    PERSISTENT_TTL_EXTEND_TO,
+                );
+            }
+        }
     }
 
     fn compute_intent_id(

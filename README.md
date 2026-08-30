@@ -212,6 +212,7 @@ the exact condition that triggers it.
 | 25 | `TimelockNotElapsed` | `accept_fee_recipient`, `accept_admin_transfer`, `execute_add_dst_token`, `execute_remove_dst_token` | Called before the `#115` timelock delay since the matching `propose_*` call has elapsed |
 | 26 | `NoPendingAdminTransfer` | `accept_admin_transfer` | No prior `propose_admin_transfer` on record |
 | 27 | `NoPendingDstTokenChange` | `execute_add_dst_token`, `execute_remove_dst_token` | No matching pending proposal for the given token |
+| 29 | `TooManyRouteEntries` | `set_solver_routes` | `src_chains.len()` or `dst_tokens.len()` exceeds `MAX_ROUTE_ENTRIES` (20) |
 
 ---
 

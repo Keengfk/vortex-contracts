@@ -76,6 +76,25 @@ with a positive `bond_amount`. The contract checks that the *cumulative* total
 meets `MIN_BOND`, so top-ups smaller than 50 USDC are accepted once you are
 already above the threshold.
 
+### Declaring served routes (optional)
+
+If your bot only bridges specific `src_chain`/`dst_token` combinations, you can
+advertise that on-chain via `set_solver_routes` so discovery tooling can filter
+to solvers that actually service a given route. This is purely advisory:
+`accept_intent` never enforces it, so you may still accept any intent you're
+otherwise eligible for regardless of what you've declared.
+
+```bash
+stellar contract invoke --id <CONTRACT_ID> --source <SOLVER_SECRET_KEY> --network testnet -- \
+  set_solver_routes \
+  --solver <SOLVER_ADDRESS> \
+  --src_chains '["ethereum","base"]' \
+  --dst_tokens '["<USDC_SAC_ADDRESS>"]'
+```
+
+Never calling `set_solver_routes` (the default) reads back as "no declared
+preference" — i.e. you're assumed to serve every route.
+
 ---
 
 ## Startup Eligibility Check
@@ -311,6 +330,10 @@ miss the `FILL_WINDOW`:
    solver can accept it.
 3. If the slash drops your bond below `MIN_BOND`, `is_active` is set to `false`
    and you must top up before accepting new intents.
+4. A slash also starts a `SLASH_COOLDOWN` (1 hour) during which `accept_intent`
+   rejects you even if your bond is healthy. Call `get_slash_cooldown_remaining`
+   to find out exactly how many seconds are left, instead of guessing or
+   reimplementing the cooldown arithmetic yourself.
 
 To recover:
 
@@ -319,13 +342,26 @@ To recover:
 stellar contract invoke --id <CONTRACT_ID> --source <ANY_KEY> --network testnet -- \
   get_solver --solver <SOLVER_ADDRESS>
 
+# Check whether you're still inside the post-slash cooldown window
+stellar contract invoke --id <CONTRACT_ID> --source <ANY_KEY> --network testnet -- \
+  get_slash_cooldown_remaining --solver <SOLVER_ADDRESS>
+
 # Top up to re-activate (must bring total back to ≥ MIN_BOND)
 stellar contract invoke --id <CONTRACT_ID> --source <SOLVER_SECRET_KEY> --network testnet -- \
   register_solver --solver <SOLVER_ADDRESS> --bond_amount <TOP_UP_AMOUNT>
 
-# Confirm you're eligible again
+# Confirm you're eligible again (only true once the cooldown above is 0)
 stellar contract invoke --id <CONTRACT_ID> --source <ANY_KEY> --network testnet -- \
   is_solver_eligible --solver <SOLVER_ADDRESS>
+```
+
+If your bot crashes mid-fill-window and comes back up not knowing what it was
+working on, call `get_solver_intents` to rediscover every `intent_id` you
+currently hold `Accepted`, instead of replaying events since registration:
+
+```bash
+stellar contract invoke --id <CONTRACT_ID> --source <ANY_KEY> --network testnet -- \
+  get_solver_intents --solver <SOLVER_ADDRESS>
 ```
 
 ### Concurrent intent acceptance
