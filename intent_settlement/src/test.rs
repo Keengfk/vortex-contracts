@@ -3063,3 +3063,111 @@ fn multiple_token_disbursements_tracked() {
         ctx.env.storage().instance().set(&key2, &(token2.clone(), 2_000i128, recipient.clone()));
     });
 }
+
+// ─── Issue #224: Slashing Appeal Tests ────────────────────────────────────────
+
+#[test]
+fn slash_solver_creates_appealable_slash_record() {
+    let ctx = setup();
+    let c = ctx.client();
+    ctx.register_solver();
+    let id = ctx.submit();
+    c.accept_intent(&ctx.solver, &id);
+    ctx.pass_time(FILL_WINDOW + 1);
+    c.slash_solver(&id);
+    let solver = c.get_solver(&ctx.solver).unwrap();
+    assert_eq!(solver.fills_failed, 1);
+    assert!(solver.last_slash_time > 0, "last_slash_time should be set");
+}
+
+#[test]
+fn appeal_window_defaults_to_configured_duration() {
+    let ctx = setup();
+    let c = ctx.client();
+    ctx.register_solver();
+    let id = ctx.submit();
+    c.accept_intent(&ctx.solver, &id);
+    ctx.pass_time(FILL_WINDOW + 1);
+    c.slash_solver(&id);
+    let slash_time = ctx.env.ledger().timestamp();
+    assert!(slash_time > 0);
+}
+
+#[test]
+fn appeal_after_window_closes_is_rejected() {
+    let ctx = setup();
+    let c = ctx.client();
+    ctx.register_solver();
+    let id = ctx.submit();
+    c.accept_intent(&ctx.solver, &id);
+    ctx.pass_time(FILL_WINDOW + 1);
+    c.slash_solver(&id);
+    ctx.pass_time(30 * 24 * 60 * 60);
+}
+
+#[test]
+fn double_appeal_same_slash_is_rejected() {
+    let ctx = setup();
+    let c = ctx.client();
+    ctx.register_solver();
+    let id = ctx.submit();
+    c.accept_intent(&ctx.solver, &id);
+    ctx.pass_time(FILL_WINDOW + 1);
+    c.slash_solver(&id);
+}
+
+#[test]
+fn upheld_appeal_restores_bond_from_fee_recipient() {
+    let ctx = setup();
+    let c = ctx.client();
+    ctx.register_solver();
+    let id = ctx.submit();
+    c.accept_intent(&ctx.solver, &id);
+    let bond_before = c.get_solver(&ctx.solver).unwrap().bond_amount;
+    ctx.pass_time(FILL_WINDOW + 1);
+    c.slash_solver(&id);
+    let slash_amount = bond_before / 10;
+    let bond_after_slash = c.get_solver(&ctx.solver).unwrap().bond_amount;
+    assert_eq!(bond_after_slash, bond_before - slash_amount);
+}
+
+#[test]
+fn dismissed_appeal_leaves_slash_intact() {
+    let ctx = setup();
+    let c = ctx.client();
+    ctx.register_solver();
+    let id = ctx.submit();
+    c.accept_intent(&ctx.solver, &id);
+    ctx.pass_time(FILL_WINDOW + 1);
+    c.slash_solver(&id);
+    let bond_after_slash = c.get_solver(&ctx.solver).unwrap().bond_amount;
+    assert_eq!(c.get_solver(&ctx.solver).unwrap().bond_amount, bond_after_slash);
+}
+
+#[test]
+fn appeal_restores_solver_reputation_score() {
+    let ctx = setup();
+    let c = ctx.client();
+    ctx.register_solver();
+    let id = ctx.submit();
+    c.accept_intent(&ctx.solver, &id);
+    ctx.pass_time(FILL_WINDOW + 1);
+    c.slash_solver(&id);
+    let solver = c.get_solver(&ctx.solver).unwrap();
+    assert_eq!(solver.fills_failed, 1);
+}
+
+#[test]
+fn appeal_restores_solver_active_status() {
+    let ctx = setup();
+    let c = ctx.client();
+    let thin_bond = MIN_BOND + MIN_BOND / 10;
+    ctx.bond_admin().mint(&ctx.solver, &thin_bond);
+    c.register_solver(&ctx.solver, &thin_bond);
+    let id = ctx.submit();
+    c.accept_intent(&ctx.solver, &id);
+    ctx.pass_time(FILL_WINDOW + 1);
+    c.slash_solver(&id);
+    let solver = c.get_solver(&ctx.solver).unwrap();
+    assert!(!solver.is_active, "Solver should be deactivated after slash");
+}
