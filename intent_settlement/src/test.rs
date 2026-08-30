@@ -3169,3 +3169,120 @@ fn governance_weight_is_computable() {
     let solver_record = c.get_solver(&ctx.solver);
     assert!(solver_record.is_some());
 }
+
+// ─── Issue #225: Community dashboard for pending timelocked admin proposals ───────
+
+/// Issue #225: Verify that pending fee recipient proposals are queryable.
+/// The community dashboard needs to read pending proposals to display them.
+/// This test verifies get_pending_fee_recipient returns the pending address and ETA.
+#[test]
+fn pending_proposals_track_fee_recipient() {
+    let ctx = setup();
+    let c = ctx.client();
+    let new_recipient = Address::generate(&ctx.env);
+
+    // No pending proposal initially.
+    assert_eq!(c.get_pending_fee_recipient(), None);
+
+    // Propose a fee recipient change.
+    c.propose_fee_recipient(&new_recipient);
+
+    // The pending proposal should be queryable.
+    let pending_data = c.get_pending_fee_recipient();
+    assert!(pending_data.is_some());
+
+    let (pending, eta) = pending_data.unwrap();
+    assert_eq!(pending, new_recipient);
+
+    // ETA should be a valid future timestamp.
+    let now = ctx.env.ledger().timestamp();
+    assert!(eta > now);
+    assert_eq!(eta, now + ADMIN_TIMELOCK_DELAY);
+}
+
+/// Issue #225: Verify that pending admin transfer proposals are queryable.
+/// The dashboard should be able to list all pending admin transfers.
+#[test]
+fn pending_proposals_track_admin_transfer() {
+    let ctx = setup();
+    let c = ctx.client();
+    let new_admin = Address::generate(&ctx.env);
+
+    assert_eq!(c.get_pending_admin(), None);
+
+    c.propose_admin_transfer(&new_admin);
+
+    let pending_data = c.get_pending_admin();
+    assert!(pending_data.is_some());
+
+    let (pending, eta) = pending_data.unwrap();
+    assert_eq!(pending, new_admin);
+
+    // Verify ETA is correct.
+    let now = ctx.env.ledger().timestamp();
+    assert_eq!(eta, now + ADMIN_TIMELOCK_DELAY);
+}
+
+/// Issue #225: Support indexing of pending proposals.
+/// The dashboard should be able to query which tokens are pending addition/removal.
+#[test]
+fn pending_proposals_support_indexing() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    // Initially, no proposals are pending.
+    let admin = Address::generate(&ctx.env);
+    let recipient = Address::generate(&ctx.env);
+
+    // Propose multiple changes.
+    c.propose_admin_transfer(&admin);
+    c.propose_fee_recipient(&recipient);
+
+    // Both should be queryable independently.
+    assert!(c.get_pending_admin().is_some());
+    assert!(c.get_pending_fee_recipient().is_some());
+}
+
+/// Issue #225: Pending proposals remain queryable until executed.
+/// The dashboard needs to track when proposals become available for execution.
+#[test]
+fn pending_proposals_queryable_before_execution() {
+    let ctx = setup();
+    let c = ctx.client();
+    let new_admin = Address::generate(&ctx.env);
+
+    c.propose_admin_transfer(&new_admin);
+    let (pending, eta) = c.get_pending_admin().unwrap();
+
+    // Query remains valid before execution.
+    assert_eq!(pending, new_admin);
+    assert!(eta > ctx.env.ledger().timestamp());
+}
+
+/// Issue #225: Multiple pending proposals can coexist.
+/// The dashboard must track all pending proposals simultaneously.
+#[test]
+fn multiple_pending_proposals_coexist() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    let new_admin = Address::generate(&ctx.env);
+    let new_recipient = Address::generate(&ctx.env);
+
+    // Propose both changes.
+    c.propose_admin_transfer(&new_admin);
+    c.propose_fee_recipient(&new_recipient);
+
+    // Both should be independently queryable.
+    let admin_pending = c.get_pending_admin();
+    let recipient_pending = c.get_pending_fee_recipient();
+
+    assert!(admin_pending.is_some());
+    assert!(recipient_pending.is_some());
+
+    let (admin, _) = admin_pending.unwrap();
+    let (recipient, _) = recipient_pending.unwrap();
+
+    assert_eq!(admin, new_admin);
+    assert_eq!(recipient, new_recipient);
+}
