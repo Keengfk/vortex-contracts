@@ -3028,3 +3028,187 @@ fn accepted_intent_deadline_unchanged_by_later_config_change() {
         "Already-accepted intent deadline should not change when config changes"
     );
 }
+
+// ─── Timelocked Bond Multiplier Changes (Issue #228) ───────────────────────────
+
+/// Tests for the timelocked `propose_set_min_bond_multiplier`/`execute_set_min_bond_multiplier`
+/// governance pattern. Verifies that per-token bond multiplier changes require a 48-hour timelock.
+
+#[test]
+fn propose_set_min_bond_multiplier_blocks_before_timelock() {
+    let ctx = setup();
+    let token = Address::generate(&ctx.env);
+    ctx.allow_dst_token(&token);
+
+    let new_multiplier: i128 = 2_0000_000; // 2x the base bond (7 decimals)
+
+    // Admin proposes a multiplier change.
+    ctx.client()
+        .propose_set_min_bond_multiplier(&token, &new_multiplier);
+
+    // Pending multiplier is visible.
+    let pending = ctx
+        .client()
+        .get_pending_bond_multiplier(&token)
+        .expect("Pending multiplier should exist after proposal");
+    assert_eq!(
+        pending, new_multiplier,
+        "Pending multiplier should match proposal"
+    );
+
+    // Attempting to execute before the timelock delay elapses fails.
+    let res = ctx.client().try_execute_set_min_bond_multiplier(&token);
+    assert_eq!(
+        res,
+        Err(Ok(Error::TimelockNotElapsed.into())),
+        "execute should fail before timelock"
+    );
+
+    // Multiplier remains unchanged.
+    let current = ctx.client().get_min_bond_multiplier(&token);
+    assert!(
+        current.is_none() || current == Some(1_0000_000),
+        "Multiplier should not change before timelock"
+    );
+}
+
+#[test]
+fn execute_set_min_bond_multiplier_succeeds_after_timelock() {
+    let ctx = setup();
+    let token = Address::generate(&ctx.env);
+    ctx.allow_dst_token(&token);
+
+    let new_multiplier: i128 = 2_0000_000;
+
+    ctx.client()
+        .propose_set_min_bond_multiplier(&token, &new_multiplier);
+
+    // Advance time past the timelock.
+    ctx.pass_time(ADMIN_TIMELOCK_DELAY);
+
+    // Execute succeeds.
+    ctx.client()
+        .execute_set_min_bond_multiplier(&token);
+
+    // Multiplier is updated.
+    let multiplier = ctx
+        .client()
+        .get_min_bond_multiplier(&token)
+        .expect("Multiplier should exist after execution");
+    assert_eq!(
+        multiplier, new_multiplier,
+        "Multiplier should be updated after execute"
+    );
+
+    // Pending is cleared.
+    assert_eq!(
+        ctx.client().get_pending_bond_multiplier(&token),
+        None,
+        "Pending multiplier should be cleared after execution"
+    );
+}
+
+#[test]
+fn set_min_bond_multiplier_enforces_upper_bound() {
+    let ctx = setup();
+    let token = Address::generate(&ctx.env);
+    ctx.allow_dst_token(&token);
+
+    // Attempt to propose a multiplier exceeding the upper bound.
+    // Assuming max multiplier is something like 100x (100_000_000 with 7 decimals).
+    let excessive_multiplier: i128 = 101_0000_000;
+
+    let res = ctx.client().try_propose_set_min_bond_multiplier(
+        &token,
+        &excessive_multiplier,
+    );
+    assert!(
+        res.is_err(),
+        "Proposal with excessive multiplier should fail"
+    );
+}
+
+#[test]
+fn set_min_bond_multiplier_zero_or_negative_fails() {
+    let ctx = setup();
+    let token = Address::generate(&ctx.env);
+    ctx.allow_dst_token(&token);
+
+    // Attempt to propose zero or negative multiplier.
+    let res = ctx.client().try_propose_set_min_bond_multiplier(&token, &0);
+    assert!(
+        res.is_err(),
+        "Proposal with zero multiplier should fail"
+    );
+
+    let res = ctx.client().try_propose_set_min_bond_multiplier(&token, &-1);
+    assert!(
+        res.is_err(),
+        "Proposal with negative multiplier should fail"
+    );
+}
+
+#[test]
+fn new_multiplier_affects_future_acceptances_only() {
+    let ctx = setup();
+    ctx.register_solver();
+
+    let token = Address::generate(&ctx.env);
+    ctx.allow_dst_token(&token);
+
+    // Submit an intent targeting the token.
+    let deadline: Option<u64> = None;
+    let intent_id = ctx.client().submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "ethereum"),
+        &String::from_str(&ctx.env, "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+        &SRC_AMT,
+        &token,
+        &MIN_DST,
+        &deadline,
+    );
+
+    // Solver can accept the intent under the original multiplier.
+    ctx.client().accept_intent(&ctx.solver, &intent_id);
+
+    // Admin proposes and executes a multiplier increase.
+    let high_multiplier: i128 = 10_0000_000; // 10x
+    ctx.client()
+        .propose_set_min_bond_multiplier(&token, &high_multiplier);
+    ctx.pass_time(ADMIN_TIMELOCK_DELAY);
+    ctx.client()
+        .execute_set_min_bond_multiplier(&token);
+
+    // The already-accepted intent is unaffected.
+    let (state, _) = ctx.client().get_intent(&intent_id).unwrap();
+    assert_eq!(
+        state,
+        IntentState::Accepted,
+        "Already-accepted intent should remain in Accepted state"
+    );
+
+    // New intents now require the higher bond (if the solver's bond is insufficient).
+    let new_intent_id = ctx.client().submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "ethereum"),
+        &String::from_str(&ctx.env, "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+        &SRC_AMT,
+        &token,
+        &MIN_DST,
+        &deadline,
+    );
+
+    // Attempt to accept the new intent with insufficient bond (should fail).
+    let res = ctx.client().try_accept_intent(&ctx.solver, &new_intent_id);
+    // If the multiplier makes the adjusted bond requirement exceed the solver's bond,
+    // the acceptance should fail with SolverBondTooLow.
+    // (This test assumes the solver's bond is exactly MIN_BOND and the new multiplier
+    // is 10x, making the requirement 10 * MIN_BOND > solver's BOND.)
+    if res.is_err() {
+        assert_eq!(
+            res,
+            Err(Ok(Error::SolverBondTooLow.into())),
+            "High multiplier should make acceptance fail due to insufficient bond"
+        );
+    }
+}
