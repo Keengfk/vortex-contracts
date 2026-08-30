@@ -437,10 +437,15 @@ ledger order.
 | `Open` | `Expired` | `intent_expired` |
 | `Accepted` | `PartiallyFilled` → re-opens as `Open` | `intent_filled` (partial) |
 | `Accepted` | `Filled` | `intent_filled` (cumulative ≥ min_dst_amount) |
-| `Accepted` | `Open` (re-opened) | `solver_slashed` |
+| `Accepted` | `Open` / `PartiallyFilled` (re-opened) | `solver_slashed` (`slash_cycles < max_slash_cycles`) |
+| `Accepted` | `Abandoned` | `solver_slashed` + `intent_abandoned` (`slash_cycles >= max_slash_cycles`) |
 | `PartiallyFilled` | `Accepted` | `intent_accepted` |
 | `PartiallyFilled` | `Expired` | `intent_expired` |
 | `PartiallyFilled` | `Cancelled` | `intent_cancelled` |
+
+`Abandoned` is terminal: an intent that hits `ProtocolConfig.max_slash_cycles`
+repeated `Accepted → Slashed` cycles no longer re-opens; the user must
+resubmit a fresh intent (issue #241).
 
 > **Bidding mode:** If bid-window mode is active, `intent_submitted` opens the
 > intent in `Bidding` state. `bid_intent` events (not yet emitted as named

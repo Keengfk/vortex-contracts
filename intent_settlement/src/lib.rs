@@ -37,6 +37,22 @@ const BID_WINDOW: u64 = 120; // 2 minutes
 /// (#116).
 const ADMIN_TIMELOCK_DELAY: u64 = 172_800; // 48 hours
 
+/// Minimum amount for a partial fill that does not itself complete the
+/// intent. Non-completing fills below this floor are rejected, preventing
+/// dust-fill spam where each tiny fill still writes a full IntentRecord
+/// update and emits an event (issue #247).
+const DEFAULT_MIN_PARTIAL_FILL: i128 = 10_000_000; // 1 unit at 7-decimal precision
+
+/// Basis points of `min_dst_amount` within which a fill's remainder is
+/// treated as fully settled (state -> Filled) instead of leaving an
+/// economically unfillable dust remainder in PartiallyFilled (issue #247).
+const DEFAULT_DUST_TOLERANCE_BPS: i128 = 10; // 0.1%
+
+/// Number of Open -> Accepted -> Slashed cycles a single intent may undergo
+/// before it is retired to the terminal `Abandoned` state instead of
+/// re-opening indefinitely (issue #241).
+const DEFAULT_MAX_SLASH_CYCLES: u32 = 5;
+
 // Upper sanity bound for src_amount and min_dst_amount.
 //
 // Largest realistic token amounts use 18-decimal ETH units.
@@ -161,6 +177,16 @@ pub struct ProtocolConfig {
     pub intent_expiry: u64,
     /// Protocol fee in basis points charged on each fill (0.01% per bps).
     pub protocol_fee_bps: i128,
+    /// Minimum amount for a partial fill that does not itself complete the
+    /// intent (issue #247).
+    pub min_partial_fill: i128,
+    /// Basis points of `min_dst_amount` within which a fill's remainder is
+    /// treated as fully settled rather than left as dust (issue #247).
+    pub dust_tolerance_bps: i128,
+    /// Maximum number of Open -> Accepted -> Slashed cycles an intent may
+    /// undergo before it is retired to the terminal `Abandoned` state
+    /// (issue #241).
+    pub max_slash_cycles: u32,
 }
 
 /// A user's cross-chain swap intent
@@ -196,6 +222,11 @@ pub struct IntentRecord {
     /// intent transitions to `Filled` as soon as `total_filled` satisfies
     /// the user's `min_dst_amount` requirement.
     pub total_filled: i128,
+
+    /// Number of times this intent has cycled Accepted -> Slashed. Once this
+    /// reaches the admin-configured `max_slash_cycles`, the intent moves to
+    /// `Abandoned` instead of re-opening (issue #241).
+    pub slash_cycles: u32,
 }
 
 #[contracttype]
@@ -213,6 +244,10 @@ pub enum IntentState {
     /// `BID_WINDOW` elapses the best bid is settled and the intent transitions
     /// to `Accepted`.
     Bidding,
+    /// Terminal state: the intent hit `max_slash_cycles` repeated
+    /// Accepted -> Slashed cycles and will no longer re-open. The user must
+    /// resubmit a fresh intent to try again (issue #241).
+    Abandoned,
 }
 
 /// A registered solver (market maker)
@@ -408,6 +443,11 @@ pub enum Error {
     /// If `src_chain` is unknown this error is never raised — unknown chains
     /// bypass token-format validation so the allowlist remains the sole gate.
     InvalidSrcToken = 28,
+
+    /// #247: `fill_intent` was called with a `fill_amount` below the
+    /// admin-configured `min_partial_fill` floor for a fill that does not
+    /// itself complete the intent.
+    FillTooSmall = 29,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -452,6 +492,9 @@ impl IntentSettlement {
                 fill_window: DEFAULT_FILL_WINDOW,
                 intent_expiry: DEFAULT_INTENT_EXPIRY,
                 protocol_fee_bps: DEFAULT_PROTOCOL_FEE_BPS,
+                min_partial_fill: DEFAULT_MIN_PARTIAL_FILL,
+                dust_tolerance_bps: DEFAULT_DUST_TOLERANCE_BPS,
+                max_slash_cycles: DEFAULT_MAX_SLASH_CYCLES,
             },
         );
         Self::bump_instance_ttl(&env);
@@ -588,19 +631,25 @@ impl IntentSettlement {
         Self::load_config(&env)
     }
 
-    /// Admin-only: update the four configurable protocol parameters atomically.
+    /// Admin-only: update the seven configurable protocol parameters atomically.
     ///
     /// Bounds (any violation returns `InvalidConfig`):
-    /// * `protocol_fee_bps`  ≤ 1 000 (10%)
-    /// * `fill_window`       ≥ 60 s
-    /// * `intent_expiry`     ≥ 300 s and > fill_window
-    /// * `min_bond`          ≥ 1 token unit (10_000_000 for 7-decimal USDC)
+    /// * `protocol_fee_bps`   ≤ 1 000 (10%)
+    /// * `fill_window`        ≥ 60 s
+    /// * `intent_expiry`      ≥ 300 s and > fill_window
+    /// * `min_bond`           ≥ 1 token unit (10_000_000 for 7-decimal USDC)
+    /// * `min_partial_fill`   ≥ 0 (issue #247)
+    /// * `dust_tolerance_bps` ≤ 1 000 (10%) (issue #247)
+    /// * `max_slash_cycles`   ≥ 1 (issue #241)
     pub fn set_config(
         env: Env,
         min_bond: i128,
         fill_window: u64,
         intent_expiry: u64,
         protocol_fee_bps: i128,
+        min_partial_fill: i128,
+        dust_tolerance_bps: i128,
+        max_slash_cycles: u32,
     ) {
         Self::require_admin(&env);
 
@@ -616,12 +665,24 @@ impl IntentSettlement {
         if min_bond < MIN_BOND_FLOOR {
             panic_with_error!(&env, Error::InvalidConfig);
         }
+        if min_partial_fill < 0 {
+            panic_with_error!(&env, Error::InvalidConfig);
+        }
+        if !(0..=1_000).contains(&dust_tolerance_bps) {
+            panic_with_error!(&env, Error::InvalidConfig);
+        }
+        if max_slash_cycles < 1 {
+            panic_with_error!(&env, Error::InvalidConfig);
+        }
 
         let cfg = ProtocolConfig {
             min_bond,
             fill_window,
             intent_expiry,
             protocol_fee_bps,
+            min_partial_fill,
+            dust_tolerance_bps,
+            max_slash_cycles,
         };
         env.storage().instance().set(&DataKey::Config, &cfg);
         Self::bump_instance_ttl(&env);
@@ -1277,6 +1338,7 @@ impl IntentSettlement {
             filled_at: None,
             fill_amount: None,
             total_filled: 0,
+            slash_cycles: 0,
         };
 
         env.storage()
@@ -1458,6 +1520,17 @@ impl IntentSettlement {
             panic_with_error!(&env, Error::ZeroAmount);
         }
 
+        let cfg = Self::load_config(&env);
+        // A fill that brings total_filled to within dust_tolerance_bps of
+        // min_dst_amount is treated as completing the intent, so it is
+        // exempt from the min_partial_fill floor below (issue #247).
+        let dust_threshold =
+            intent.min_dst_amount - (intent.min_dst_amount * cfg.dust_tolerance_bps / 10_000);
+        let would_complete = intent.total_filled + fill_amount >= dust_threshold;
+        if !would_complete && fill_amount < cfg.min_partial_fill {
+            panic_with_error!(&env, Error::FillTooSmall);
+        }
+
         // Deliver this fill's tokens to the user.
         let dst_client = token::Client::new(&env, &intent.dst_token);
         dst_client.transfer(&solver, &intent.user, &fill_amount);
@@ -1510,8 +1583,8 @@ impl IntentSettlement {
             .unwrap();
         solver_record.total_volume += fill_amount;
 
-        if cumulative >= intent.min_dst_amount {
-            // Intent is fully satisfied — close it out.
+        if cumulative >= dust_threshold {
+            // Intent is fully satisfied (or within dust tolerance) — close it out.
             // open_intents was already decremented when the intent was accepted;
             // no further adjustment needed here.
             intent.state = IntentState::Filled;
@@ -1696,24 +1769,38 @@ impl IntentSettlement {
             solver_record.is_active = false;
         }
 
-        // Re-open the intent, preserving partial-fill progress if any.
-        // The intent transitions back to Open/PartiallyFilled, so increment open_intents.
-        intent.state = if intent.total_filled > 0 {
-            IntentState::PartiallyFilled
-        } else {
-            IntentState::Open
-        };
-        intent.solver = None;
-        intent.deadline = now + cfg.intent_expiry;
+        // Track this Accepted -> Slashed cycle. Once it reaches the
+        // admin-configured cap, retire the intent instead of re-opening it
+        // indefinitely (issue #241).
+        intent.slash_cycles += 1;
+        let abandoned = intent.slash_cycles >= cfg.max_slash_cycles;
 
-        let open: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::OpenIntents)
-            .unwrap_or(0);
-        env.storage()
-            .instance()
-            .set(&DataKey::OpenIntents, &(open + 1));
+        intent.solver = None;
+        if abandoned {
+            // Terminal: preserve any partial-fill progress in total_filled,
+            // but the intent no longer re-enters Open rotation. open_intents
+            // was already decremented at accept_intent time, so nothing to
+            // adjust here.
+            intent.state = IntentState::Abandoned;
+        } else {
+            // Re-open the intent, preserving partial-fill progress if any.
+            // The intent transitions back to Open/PartiallyFilled, so increment open_intents.
+            intent.state = if intent.total_filled > 0 {
+                IntentState::PartiallyFilled
+            } else {
+                IntentState::Open
+            };
+            intent.deadline = now + cfg.intent_expiry;
+
+            let open: u64 = env
+                .storage()
+                .instance()
+                .get(&DataKey::OpenIntents)
+                .unwrap_or(0);
+            env.storage()
+                .instance()
+                .set(&DataKey::OpenIntents, &(open + 1));
+        }
 
         // Persist both records BEFORE any token transfer so that a re-entrant
         // or back-to-back call on the same intent_id is rejected by the
@@ -1745,8 +1832,13 @@ impl IntentSettlement {
 
         env.events().publish(
             (Symbol::new(&env, "solver_slashed"), solver_addr),
-            (intent_id, slash_amount),
+            (intent_id.clone(), slash_amount),
         );
+
+        if abandoned {
+            env.events()
+                .publish((Symbol::new(&env, "intent_abandoned"),), intent_id);
+        }
     }
 
     /// Permissionless: materialize an Open intent's Expired state once its
@@ -1922,6 +2014,30 @@ impl IntentSettlement {
     /// Fetch an intent's full record by id, or None if it was never submitted.
     pub fn get_intent(env: Env, intent_id: BytesN<32>) -> Option<IntentRecord> {
         env.storage().persistent().get(&DataKey::Intent(intent_id))
+    }
+
+    /// Fetch multiple intents' full records by id in a single call, reducing
+    /// the RPC round-trips a caller (e.g. a solver bot scanning many
+    /// candidate intents) pays versus calling `get_intent` once per id.
+    ///
+    /// Bounded by MAX_BATCH_SIZE. Each position mirrors `get_intent`'s
+    /// `Option<IntentRecord>` semantics: an unknown id yields `None` in that
+    /// position rather than panicking and aborting the whole batch read.
+    pub fn get_intents_batch(
+        env: Env,
+        intent_ids: soroban_sdk::Vec<BytesN<32>>,
+    ) -> soroban_sdk::Vec<Option<IntentRecord>> {
+        if intent_ids.len() > MAX_BATCH_SIZE as usize {
+            panic_with_error!(&env, Error::ZeroAmount); // No dedicated error; reuse nearest
+        }
+
+        let mut result = soroban_sdk::Vec::new(&env);
+        for intent_id in intent_ids {
+            let record: Option<IntentRecord> =
+                env.storage().persistent().get(&DataKey::Intent(intent_id));
+            result.push_back(record);
+        }
+        result
     }
 
     /// Fetch a solver's full record by address, or None if never registered.
@@ -2328,6 +2444,9 @@ impl IntentSettlement {
                 fill_window: DEFAULT_FILL_WINDOW,
                 intent_expiry: DEFAULT_INTENT_EXPIRY,
                 protocol_fee_bps: DEFAULT_PROTOCOL_FEE_BPS,
+                min_partial_fill: DEFAULT_MIN_PARTIAL_FILL,
+                dust_tolerance_bps: DEFAULT_DUST_TOLERANCE_BPS,
+                max_slash_cycles: DEFAULT_MAX_SLASH_CYCLES,
             })
     }
 

@@ -167,11 +167,13 @@ stateDiagram-v2
     Open --> Expired : expire_intent()\n[now >= deadline]
 
     Accepted --> Filled : fill_intent()\n[fill_amount >= min_dst_amount,\n now < deadline]
-    Accepted --> Open : slash_solver()\n[now >= deadline]\n(10 % bond slashed,\nintent re-opened with fresh deadline)
+    Accepted --> Open : slash_solver()\n[now >= deadline,\n slash_cycles < max_slash_cycles]\n(10 % bond slashed,\nintent re-opened with fresh deadline)
+    Accepted --> Abandoned : slash_solver()\n[now >= deadline,\n slash_cycles >= max_slash_cycles]\n(10 % bond slashed,\nterminal -- no further re-open)
 
     Filled --> [*]
     Cancelled --> [*]
     Expired --> [*]
+    Abandoned --> [*]
 ```
 
 > **Note:** `accept_intent` also lazily sets state to `Expired` (and panics)
@@ -212,6 +214,25 @@ the exact condition that triggers it.
 | 25 | `TimelockNotElapsed` | `accept_fee_recipient`, `accept_admin_transfer`, `execute_add_dst_token`, `execute_remove_dst_token` | Called before the `#115` timelock delay since the matching `propose_*` call has elapsed |
 | 26 | `NoPendingAdminTransfer` | `accept_admin_transfer` | No prior `propose_admin_transfer` on record |
 | 27 | `NoPendingDstTokenChange` | `execute_add_dst_token`, `execute_remove_dst_token` | No matching pending proposal for the given token |
+| 29 | `FillTooSmall` | `fill_intent` | `fill_amount < ProtocolConfig.min_partial_fill` for a fill that does not itself complete the intent |
+
+---
+
+### Partial-Fill Floor and Dust Tolerance
+
+`fill_intent` rejects a `fill_amount` below `ProtocolConfig.min_partial_fill`
+unless that fill would complete the intent, so a spam pattern of many tiny
+fills each writing a full `IntentRecord` update and emitting an event is no
+longer viable. A completing fill is never blocked by the floor, even if it
+happens to be small.
+
+Separately, `ProtocolConfig.dust_tolerance_bps` lets a fill that brings
+`total_filled` to within a small admin-configured percentage of
+`min_dst_amount` be treated as `Filled` rather than leaving an
+economically unfillable dust remainder in `PartiallyFilled`. The tolerance
+is bounded in basis points, so any shortfall is treated as acceptable
+slippage — consistent with the existing "solver quotes cover the fee" trust
+model; the user is not separately compensated for it.
 
 ---
 
@@ -444,7 +465,9 @@ def compute_intent_id(user_address: str, src_chain: str, src_amount: int, timest
 - [x] **Contract test suite** — `soroban_sdk` testutils coverage for the full intent
       lifecycle, solver bonding/slashing, admin controls, pause, and storage TTL
       management
-- [ ] **Solver registry contract** — tiered staking, reputation NFT, dispute resolution
+- [ ] **Solver registry contract** — tiered staking, dispute resolution
+- [x] **Reputation tier badge prototype** — soulbound on-chain tier badge; see
+      `docs/242-reputation-tier-badge-design.md` and the `reputation_badge` crate
 - [ ] **Cross-chain proof verification** — verify source-chain tx on-chain via Stellar oracle / messaging infra
 
 ---
