@@ -48,6 +48,22 @@ const ADMIN_TIMELOCK_DELAY: u64 = 172_800; // 48 hours
 // That is a comfortable safety margin while rejecting only fat-fingered inputs.
 pub const MAX_AMOUNT: i128 = 1_000_000_000_000_000_000_000_000_000_000i128; // 10^30
 
+/// Upper bound, in *whole tokens*, used by `submit_intent`'s decimals-aware
+/// sanity check (#252). No real token's total supply plausibly exceeds one
+/// trillion whole units, so `min_dst_amount` is rejected once it implies
+/// more than `MAX_WHOLE_UNITS` whole `dst_token`s at that token's own
+/// `decimals()` precision — this is what catches an amount scaled for the
+/// wrong decimals class (e.g. an 18-decimal-scaled amount submitted for a
+/// 7-decimal token) while leaving legitimate high-decimal tokens, which are
+/// still bounded by `MAX_AMOUNT` above, untouched.
+pub const MAX_WHOLE_UNITS: i128 = 1_000_000_000_000i128; // 10^12
+
+/// Cap on entries kept in a single intent's on-chain fill-history log
+/// (#244). Once reached, `fill_intent` evicts the oldest entry (FIFO) to
+/// bound persistent-storage growth; full history beyond the cap still
+/// requires replaying `intent_filled` events off-chain.
+pub const MAX_FILL_HISTORY: u32 = 20;
+
 // Soroban archives ledger entries that go too long without being touched.
 // Persistent Intent/Solver records get their TTL bumped on every write so
 // they don't need to be manually restored before later calls can read them.
@@ -82,8 +98,23 @@ pub enum DataKey {
     /// timestamp at which `accept_fee_recipient` may execute it (issue #30,
     /// timelock added by #115): `(Address, u64)`.
     PendingFeeRecipient,
+    /// Proposed-but-not-yet-accepted new admin plus the ledger timestamp at
+    /// which `accept_admin_transfer` may execute it: `(Address, u64)`.
+    PendingAdmin,
+    /// Proposed-but-not-yet-executed dst-token allowlist addition: the
+    /// ledger timestamp at which `execute_add_dst_token` may execute it.
+    PendingDstTokenAdd(Address),
+    /// Proposed-but-not-yet-executed dst-token allowlist removal: the
+    /// ledger timestamp at which `execute_remove_dst_token` may execute it.
+    PendingDstTokenRemove(Address),
     BondToken,          // USDC address for bonds
     Intent(BytesN<32>), // intent_id -> IntentRecord
+
+    /// **Persistent storage.** Bounded on-chain fill-history log for a given
+    /// intent (issue #244): `Vec<(solver, amount, timestamp)>`, oldest first,
+    /// capped at `MAX_FILL_HISTORY` entries with FIFO eviction of the oldest
+    /// entry once the cap is reached. Appended to by `fill_intent`.
+    IntentFillHistory(BytesN<32>),
     Solver(Address),    // address -> SolverRecord
     TotalIntents,
 
@@ -408,6 +439,24 @@ pub enum Error {
     /// If `src_chain` is unknown this error is never raised — unknown chains
     /// bypass token-format validation so the allowlist remains the sole gate.
     InvalidSrcToken = 28,
+
+    /// `accept_fee_recipient`, `accept_admin_transfer`,
+    /// `execute_add_dst_token`, or `execute_remove_dst_token` was called
+    /// before the `#115` timelock delay since the matching `propose_*` call
+    /// has elapsed.
+    TimelockNotElapsed = 25,
+    /// `accept_admin_transfer` was called with no matching
+    /// `propose_admin_transfer` outstanding.
+    NoPendingAdminTransfer = 26,
+    /// `execute_add_dst_token` / `execute_remove_dst_token` was called with
+    /// no matching `propose_add_dst_token` / `propose_remove_dst_token`
+    /// outstanding for the given token.
+    NoPendingDstTokenChange = 27,
+
+    /// #252: `submit_intent`'s `min_dst_amount` is implausible relative to
+    /// `dst_token`'s own `decimals()` precision (see `MAX_WHOLE_UNITS`), or
+    /// `dst_token.decimals()` reported a precision too large to sanity-check.
+    ImplausibleDstAmount = 29,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -1213,6 +1262,23 @@ impl IntentSettlement {
         // malformed tokens are always caught at submission time.
         Self::validate_src_token(&env, &src_chain, &src_token);
 
+        // #252 — decimals-aware sanity bound on min_dst_amount. Runs
+        // unconditionally (not just when the dst allowlist is enabled) since
+        // this is a magnitude sanity check, not an allowlist gate. The
+        // decimals() probe mirrors propose_add_dst_token's precedent: if
+        // dst_token doesn't implement SEP-41, the call traps and the whole
+        // submission reverts, which is the desired behavior here too.
+        let dst_token_client = token::Client::new(&env, &dst_token);
+        let dst_decimals = dst_token_client.decimals();
+        let dst_bound = 10i128
+            .checked_pow(dst_decimals)
+            .and_then(|unit| unit.checked_mul(MAX_WHOLE_UNITS));
+        // `None` covers dst_decimals being so large the bound itself
+        // overflows i128 — treated the same as exceeding the bound: reject.
+        if !dst_bound.is_some_and(|bound| min_dst_amount <= bound) {
+            panic_with_error!(&env, Error::ImplausibleDstAmount);
+        }
+
         let now = env.ledger().timestamp();
         let cfg = Self::load_config(&env);
         let expiry = deadline.unwrap_or(now + cfg.intent_expiry);
@@ -1556,6 +1622,26 @@ impl IntentSettlement {
         env.storage()
             .persistent()
             .set(&DataKey::Intent(intent_id.clone()), &intent);
+        Self::bump_intent_ttl(&env, &intent_id);
+
+        // #244 — append this fill to the intent's bounded on-chain
+        // fill-history log so get_intent_fill_history can answer "who
+        // filled how much, and when" without replaying intent_filled
+        // events. Oldest entry is evicted (FIFO) once MAX_FILL_HISTORY is
+        // reached; full history beyond the cap still requires the indexer.
+        let mut fill_history: Vec<(Address, i128, u64)> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IntentFillHistory(intent_id.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        if fill_history.len() >= MAX_FILL_HISTORY {
+            fill_history.remove(0);
+        }
+        fill_history.push_back((solver.clone(), fill_amount, now));
+        env.storage().persistent().set(
+            &DataKey::IntentFillHistory(intent_id.clone()),
+            &fill_history,
+        );
         Self::bump_intent_ttl(&env, &intent_id);
 
         // ── Interactions: token transfers ────────────────────────────────────
@@ -1924,6 +2010,18 @@ impl IntentSettlement {
         env.storage().persistent().get(&DataKey::Intent(intent_id))
     }
 
+    /// Bounded on-chain fill-history log for `intent_id`: `(solver, amount,
+    /// timestamp)` per partial fill, oldest first. Capped at
+    /// `MAX_FILL_HISTORY` entries — see `fill_intent`'s eviction policy.
+    /// Returns an empty `Vec` if the intent has never been filled (or never
+    /// submitted).
+    pub fn get_intent_fill_history(env: Env, intent_id: BytesN<32>) -> Vec<(Address, i128, u64)> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::IntentFillHistory(intent_id))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
     /// Fetch a solver's full record by address, or None if never registered.
     pub fn get_solver(env: Env, solver: Address) -> Option<SolverRecord> {
         env.storage().persistent().get(&DataKey::Solver(solver))
@@ -1968,6 +2066,25 @@ impl IntentSettlement {
     /// may execute it.
     pub fn get_pending_fee_recipient(env: Env) -> Option<(Address, u64)> {
         env.storage().instance().get(&DataKey::PendingFeeRecipient)
+    }
+
+    /// Pending admin-transfer proposal, if any: `(new_admin, eta)` where
+    /// `eta` is the ledger timestamp at which `accept_admin_transfer` may
+    /// execute it.
+    pub fn get_pending_admin(env: Env) -> Option<(Address, u64)> {
+        env.storage().instance().get(&DataKey::PendingAdmin)
+    }
+
+    /// Pending dst-token allowlist addition, if any: the ledger timestamp
+    /// at which `execute_add_dst_token` may execute it for `token`.
+    pub fn get_pending_dst_token_add(env: Env, token: Address) -> Option<u64> {
+        env.storage().instance().get(&DataKey::PendingDstTokenAdd(token))
+    }
+
+    /// Pending dst-token allowlist removal, if any: the ledger timestamp
+    /// at which `execute_remove_dst_token` may execute it for `token`.
+    pub fn get_pending_dst_token_remove(env: Env, token: Address) -> Option<u64> {
+        env.storage().instance().get(&DataKey::PendingDstTokenRemove(token))
     }
 
     /// Returns the bond token address (USDC SAC), or `None` before initialization.

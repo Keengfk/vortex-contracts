@@ -476,3 +476,10 @@ ledger order.
    before reaching `Filled`. Each emission carries that fill's incremental
    `fill_amount` (not cumulative). Sum all `intent_filled.data[1]` for the
    same `intent_id` to get total volume for that intent.
+
+   As of #244, this no longer strictly requires event replay:
+   `get_intent_fill_history(intent_id)` returns an on-chain
+   `Vec<(solver, amount, timestamp)>` log of each fill for that intent
+   directly, bounded at `MAX_FILL_HISTORY` (20) entries with the oldest
+   entry evicted first once the cap is reached. For intents with more than
+   20 partial fills, event replay is still required for the full history.
