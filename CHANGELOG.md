@@ -11,6 +11,12 @@ first deploys to mainnet.
 
 ### Fixed
 
+- **`fill_intent` now charges the live, admin-configured `protocol_fee_bps`**
+  (via `set_config`) instead of the compile-time `PROTOCOL_FEE_BPS`
+  constant, which previously made fee-rate changes silently have no effect.
+- `validate_src_token` now recognizes `"avalanche"` and `"bsc"` as EVM
+  chains, closing a gap where malformed source-token addresses on those two
+  chains passed with no format validation.
 - `deregister_solver` now refuses to return a solver's bond while they hold
   an `Accepted` intent, closing a path to dodge `slash_solver` by
   withdrawing before the fill window expired.

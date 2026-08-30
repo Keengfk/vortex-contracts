@@ -215,6 +215,16 @@ Reject the intent immediately if:
 
 ## The Accept → Fill Loop
 
+> **Scoped authorization (2026 update):** `accept_intent` and `fill_intent`
+> now call `require_auth_for_args` instead of `require_auth`, scoped to
+> `(intent_id)` and `(solver, intent_id, fill_amount)` respectively (see
+> `docs/auth-audit.md`). If you invoke directly via `stellar contract invoke`
+> or the standard SDK contract client with your own solver key, this is
+> transparent — the simulated auth entries are signed for you as before. It
+> only matters if you construct and sign `SorobanAuthorizationEntry` values
+> by hand (e.g. for a delegated/invoker-contract flow): the signed payload
+> must now match the specific call's arguments, not just the function name.
+
 ### Step 1 — Accept
 
 Call `accept_intent` to claim the exclusive 5-minute fill window:

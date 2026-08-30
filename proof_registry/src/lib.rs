@@ -97,6 +97,10 @@ pub enum Error {
     InvalidPayload = 6,
     /// Contract not initialized (`Admin` key absent).
     NotInitialized = 7,
+    /// `set_authorized_emitter` called with a `chain_id` that exceeds
+    /// `u16::MAX` — the real Wormhole chain-ID space is 16 bits, so such a
+    /// value can never appear in a decoded VAA.
+    ChainIdOutOfRange = 8,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -128,6 +132,9 @@ impl ProofRegistry {
     /// accepted by `receive_message`.
     pub fn set_authorized_emitter(env: Env, chain_id: u32, emitter: BytesN<32>) {
         Self::require_admin(&env);
+        if chain_id > u16::MAX as u32 {
+            panic_with_error!(&env, Error::ChainIdOutOfRange);
+        }
         env.storage()
             .instance()
             .set(&ProofKey::AuthorizedEmitter(chain_id), &emitter);

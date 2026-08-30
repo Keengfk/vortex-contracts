@@ -8,7 +8,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, token, xdr::ToXdr,
-    Address, Bytes, BytesN, Env, String, Symbol, Vec,
+    Address, Bytes, BytesN, Env, IntoVal, String, Symbol, Vec,
 };
 
 #[cfg(test)]
@@ -1176,13 +1176,18 @@ impl IntentSettlement {
         min_dst_amount: i128,
         deadline: Option<u64>,
     ) -> BytesN<32> {
-        // Auth audit: require_auth() is correct. The user must sign to assert
-        // ownership of the address receiving output tokens (dst). If a third-party
-        // contract were ever to call submit_intent on a user's behalf, switching to
-        // require_auth_for_args scoped to (user, dst_token, min_dst_amount) would
-        // limit the scope of delegated authorisation — noted as a future hardening
-        // opportunity if composable intent submission is added.
-        user.require_auth();
+        // Auth audit (see docs/auth-audit.md): upgraded from require_auth() to
+        // require_auth_for_args, scoped to (user, dst_token, min_dst_amount),
+        // so a delegating invoker contract cannot redirect a user's signed
+        // submission toward a different destination token or minimum output.
+        user.require_auth_for_args(Vec::from_array(
+            &env,
+            [
+                user.into_val(&env),
+                dst_token.into_val(&env),
+                min_dst_amount.into_val(&env),
+            ],
+        ));
         Self::require_not_paused(&env);
         Self::bump_instance_ttl(&env);
 
@@ -1324,12 +1329,10 @@ impl IntentSettlement {
 
     /// Solver claims an intent (exclusive fill right for FILL_WINDOW seconds)
     pub fn accept_intent(env: Env, solver: Address, intent_id: BytesN<32>) {
-        // Auth audit: require_auth() is correct. The solver must sign to
-        // voluntarily take on the fill obligation and bond risk associated with
-        // this intent. require_auth_for_args scoped to intent_id could prevent a
-        // malicious invoker contract from accepting an unintended intent on the
-        // solver's behalf; noted as a future hardening opportunity.
-        solver.require_auth();
+        // Auth audit (see docs/auth-audit.md): upgraded from require_auth() to
+        // require_auth_for_args, scoped to intent_id, so a delegating invoker
+        // contract cannot accept an unintended intent on the solver's behalf.
+        solver.require_auth_for_args(Vec::from_array(&env, [intent_id.into_val(&env)]));
         Self::require_not_paused(&env);
         Self::bump_instance_ttl(&env);
 
@@ -1418,14 +1421,20 @@ impl IntentSettlement {
     /// The protocol fee is taken on each individual fill so the fee accounting
     /// stays consistent regardless of how many fills it takes.
     pub fn fill_intent(env: Env, solver: Address, intent_id: BytesN<32>, fill_amount: i128) {
-        // Auth audit: require_auth() is correct. The solver must sign to
-        // authorise the token transfer from their address to the user and fee
-        // recipient. This is the highest-value call site: the solver authorises
-        // a token transfer, so the auth is load-bearing. require_auth_for_args
-        // scoped to (solver, intent_id, fill_amount) would meaningfully tighten
-        // the scope if a delegated-execution pattern is ever introduced — noted
-        // as the strongest candidate for future hardening.
-        solver.require_auth();
+        // Auth audit (see docs/auth-audit.md): upgraded from require_auth() to
+        // require_auth_for_args, scoped to (solver, intent_id, fill_amount) —
+        // the highest-value call site, since it authorises a token transfer.
+        // This closes the gap where a delegating invoker contract could
+        // authorise a fill of different size or against a different intent
+        // than the solver actually signed for.
+        solver.require_auth_for_args(Vec::from_array(
+            &env,
+            [
+                solver.into_val(&env),
+                intent_id.into_val(&env),
+                fill_amount.into_val(&env),
+            ],
+        ));
         Self::require_not_paused(&env);
         Self::bump_instance_ttl(&env);
 
@@ -1458,12 +1467,14 @@ impl IntentSettlement {
             panic_with_error!(&env, Error::ZeroAmount);
         }
 
+        let protocol_fee_bps = Self::load_config(&env).protocol_fee_bps;
+
         // Deliver this fill's tokens to the user.
         let dst_client = token::Client::new(&env, &intent.dst_token);
         dst_client.transfer(&solver, &intent.user, &fill_amount);
 
         // Solver also pays the protocol fee on each fill.
-        let fee = fill_amount * PROTOCOL_FEE_BPS / 10_000;
+        let fee = fill_amount * protocol_fee_bps / 10_000;
         // ── Effects first (CEI) ──────────────────────────────────────────────
         // Mark the intent Filled and write every state change to storage
         // *before* any external token transfer executes. A hostile SEP-41
@@ -1482,7 +1493,7 @@ impl IntentSettlement {
         // visible in code, rather than relying solely on the Cargo.toml
         // overflow-checks = true release-profile setting (issue #31).
         let fee = fill_amount
-            .checked_mul(PROTOCOL_FEE_BPS)
+            .checked_mul(protocol_fee_bps)
             .unwrap_or_else(|| panic_with_error!(&env, Error::FeeOverflow))
             .checked_div(10_000)
             .unwrap_or_else(|| panic_with_error!(&env, Error::FeeOverflow));
@@ -1567,7 +1578,7 @@ impl IntentSettlement {
         // fee from the solver — rather than clawing it back from the user — keeps
         // the user's received amount at or above `min_dst_amount`, and keeps every
         // token transfer authorized by the solver who signed this call.
-        let fee = fill_amount * PROTOCOL_FEE_BPS / 10_000;
+        let fee = fill_amount * protocol_fee_bps / 10_000;
         if fee > 0 {
             let fee_recipient: Address = env
                 .storage()
@@ -2164,7 +2175,9 @@ impl IntentSettlement {
             || chain_is(b"base")
             || chain_is(b"polygon")
             || chain_is(b"arbitrum")
-            || chain_is(b"optimism");
+            || chain_is(b"optimism")
+            || chain_is(b"avalanche")
+            || chain_is(b"bsc");
 
         if is_evm {
             // EVM token address: exactly "0x" + 40 hex chars = 42 characters.
