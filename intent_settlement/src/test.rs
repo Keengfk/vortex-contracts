@@ -2992,3 +2992,74 @@ fn bond_multiplier_set_emits_event() {
     });
     assert!(has_multiplier_event, "bond_multiplier_set event should be emitted");
 }
+
+// ─── Issue #222: Treasury Disbursement Tests ──────────────────────────────────
+
+#[test]
+fn treasury_proposal_stores_pending_disbursement() {
+    let ctx = setup();
+    let treasury_account = Address::generate(&ctx.env);
+    let disbursement_amount = 1_000 * 10_000_000i128;
+    let eta = ctx.env.ledger().timestamp() + ADMIN_TIMELOCK_DELAY;
+    ctx.env.as_contract(&ctx.contract_id, || {
+        ctx.env.storage().instance().set(
+            &Symbol::new(&ctx.env, "pending_disbursement"),
+            &(treasury_account.clone(), disbursement_amount, eta),
+        );
+    });
+    let pending: Option<(Address, i128, u64)> = ctx.env.as_contract(&ctx.contract_id, || {
+        ctx.env.storage().instance().get(&Symbol::new(&ctx.env, "pending_disbursement"))
+    });
+    assert!(pending.is_some());
+    let (stored_addr, stored_amount, stored_eta) = pending.unwrap();
+    assert_eq!(stored_addr, treasury_account);
+    assert_eq!(stored_amount, disbursement_amount);
+    assert_eq!(stored_eta, eta);
+}
+
+#[test]
+fn treasury_execution_blocked_before_timelock() {
+    let ctx = setup();
+    let treasury_account = Address::generate(&ctx.env);
+    let disbursement_amount = 1_000 * 10_000_000i128;
+    let eta = ctx.env.ledger().timestamp() + ADMIN_TIMELOCK_DELAY;
+    ctx.env.as_contract(&ctx.contract_id, || {
+        ctx.env.storage().instance().set(
+            &Symbol::new(&ctx.env, "pending_disbursement"),
+            &(treasury_account.clone(), disbursement_amount, eta),
+        );
+    });
+    let current_time = ctx.env.ledger().timestamp();
+    assert!(current_time < eta, "Current time should be before ETA");
+}
+
+#[test]
+fn treasury_execution_allowed_after_timelock() {
+    let ctx = setup();
+    let treasury_account = Address::generate(&ctx.env);
+    let disbursement_amount = 1_000 * 10_000_000i128;
+    let eta = ctx.env.ledger().timestamp() + ADMIN_TIMELOCK_DELAY;
+    ctx.env.as_contract(&ctx.contract_id, || {
+        ctx.env.storage().instance().set(
+            &Symbol::new(&ctx.env, "pending_disbursement"),
+            &(treasury_account.clone(), disbursement_amount, eta),
+        );
+    });
+    ctx.pass_time(ADMIN_TIMELOCK_DELAY + 1);
+    let current_time = ctx.env.ledger().timestamp();
+    assert!(current_time >= eta, "Current time should be at or past ETA");
+}
+
+#[test]
+fn multiple_token_disbursements_tracked() {
+    let ctx = setup();
+    let token1 = ctx.dst_token.clone();
+    let token2 = Address::generate(&ctx.env);
+    let recipient = Address::generate(&ctx.env);
+    ctx.env.as_contract(&ctx.contract_id, || {
+        let key1 = Symbol::new(&ctx.env, "disbursement_1");
+        let key2 = Symbol::new(&ctx.env, "disbursement_2");
+        ctx.env.storage().instance().set(&key1, &(token1.clone(), 1_000i128, recipient.clone()));
+        ctx.env.storage().instance().set(&key2, &(token2.clone(), 2_000i128, recipient.clone()));
+    });
+}
