@@ -2871,3 +2871,190 @@ fn unknown_chain_bypasses_token_format_validation() {
         &deadline,
     );
 }
+
+// ── Deadline boundary conditions audit ─────────────────────────────────────────────
+//
+// Exhaustive test coverage of deadline inclusivity/exclusivity across all
+// deadline-gated functions. Each boundary semantics comment in lib.rs is
+// verified by testing (boundary - 1), (boundary), and (boundary + 1) timestamps.
+//
+// Deadline conventions:
+// - accept_intent: EXCLUSIVE (now >= deadline rejects, [submitted, deadline) allowed)
+// - fill_intent: EXCLUSIVE (now >= deadline rejects, [accepted, accepted+FILL_WINDOW) allowed)
+// - slash_solver: INCLUSIVE (now < deadline rejects, [accepted+FILL_WINDOW, ∞) allowed at deadline)
+// - expire_intent: INCLUSIVE (now < deadline rejects, [submitted+INTENT_EXPIRY, ∞) allowed at deadline)
+
+#[test]
+fn accept_intent_deadline_exclusive_boundary_minus_1() {
+    let ctx = setup();
+    ctx.register_solver();
+    let now = ctx.env.ledger().timestamp();
+    let deadline = now + 100;
+
+    let intent_id = ctx.client().submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "ethereum"),
+        &String::from_str(&ctx.env, "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+        &SRC_AMT,
+        &ctx.dst_token,
+        &MIN_DST,
+        &Some(deadline),
+    );
+
+    ctx.pass_time(99);
+    ctx.client().accept_intent(&ctx.solver, &intent_id);
+}
+
+#[test]
+fn accept_intent_deadline_exclusive_boundary_exact() {
+    let ctx = setup();
+    ctx.register_solver();
+    let now = ctx.env.ledger().timestamp();
+    let deadline = now + 100;
+
+    let intent_id = ctx.client().submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "ethereum"),
+        &String::from_str(&ctx.env, "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+        &SRC_AMT,
+        &ctx.dst_token,
+        &MIN_DST,
+        &Some(deadline),
+    );
+
+    ctx.pass_time(100);
+    let res = ctx
+        .client()
+        .try_accept_intent(&ctx.solver, &intent_id);
+    assert_eq!(res, Err(Ok(Error::DeadlineReached.into())));
+}
+
+#[test]
+fn accept_intent_deadline_exclusive_boundary_plus_1() {
+    let ctx = setup();
+    ctx.register_solver();
+    let now = ctx.env.ledger().timestamp();
+    let deadline = now + 100;
+
+    let intent_id = ctx.client().submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "ethereum"),
+        &String::from_str(&ctx.env, "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+        &SRC_AMT,
+        &ctx.dst_token,
+        &MIN_DST,
+        &Some(deadline),
+    );
+
+    ctx.pass_time(101);
+    let res = ctx
+        .client()
+        .try_accept_intent(&ctx.solver, &intent_id);
+    assert_eq!(res, Err(Ok(Error::DeadlineReached.into())));
+}
+
+#[test]
+fn fill_intent_deadline_exclusive_boundary_minus_1() {
+    let ctx = setup();
+    ctx.register_solver();
+    let id = ctx.submit();
+    ctx.client().accept_intent(&ctx.solver, &id);
+
+    let accept_time = ctx.env.ledger().timestamp();
+    let fill_deadline = accept_time + FILL_WINDOW;
+
+    ctx.pass_time(FILL_WINDOW - 1);
+    let fee = FILL * 5 / 10_000;
+    ctx.dst_admin().mint(&ctx.solver, &(FILL + fee));
+    ctx.client().fill_intent(&ctx.solver, &id, &FILL);
+}
+
+#[test]
+fn fill_intent_deadline_exclusive_boundary_exact() {
+    let ctx = setup();
+    ctx.register_solver();
+    let id = ctx.submit();
+    ctx.client().accept_intent(&ctx.solver, &id);
+
+    ctx.pass_time(FILL_WINDOW);
+    let fee = FILL * 5 / 10_000;
+    ctx.dst_admin().mint(&ctx.solver, &(FILL + fee));
+    let res = ctx.client().try_fill_intent(&ctx.solver, &id, &FILL);
+    assert_eq!(res, Err(Ok(Error::FillWindowExpired.into())));
+}
+
+#[test]
+fn fill_intent_deadline_exclusive_boundary_plus_1() {
+    let ctx = setup();
+    ctx.register_solver();
+    let id = ctx.submit();
+    ctx.client().accept_intent(&ctx.solver, &id);
+
+    ctx.pass_time(FILL_WINDOW + 1);
+    let fee = FILL * 5 / 10_000;
+    ctx.dst_admin().mint(&ctx.solver, &(FILL + fee));
+    let res = ctx.client().try_fill_intent(&ctx.solver, &id, &FILL);
+    assert_eq!(res, Err(Ok(Error::FillWindowExpired.into())));
+}
+
+#[test]
+fn slash_solver_deadline_inclusive_boundary_minus_1() {
+    let ctx = setup();
+    ctx.register_solver();
+    let id = ctx.submit();
+    ctx.client().accept_intent(&ctx.solver, &id);
+
+    ctx.pass_time(FILL_WINDOW - 1);
+    let res = ctx.client().try_slash_solver(&ctx.admin, &id, &ctx.solver);
+    assert_eq!(res, Err(Ok(Error::FillWindowExpired.into())));
+}
+
+#[test]
+fn slash_solver_deadline_inclusive_boundary_exact() {
+    let ctx = setup();
+    ctx.register_solver();
+    let id = ctx.submit();
+    ctx.client().accept_intent(&ctx.solver, &id);
+
+    ctx.pass_time(FILL_WINDOW);
+    ctx.client().slash_solver(&ctx.admin, &id, &ctx.solver);
+}
+
+#[test]
+fn slash_solver_deadline_inclusive_boundary_plus_1() {
+    let ctx = setup();
+    ctx.register_solver();
+    let id = ctx.submit();
+    ctx.client().accept_intent(&ctx.solver, &id);
+
+    ctx.pass_time(FILL_WINDOW + 1);
+    ctx.client().slash_solver(&ctx.admin, &id, &ctx.solver);
+}
+
+#[test]
+fn expire_intent_deadline_inclusive_boundary_minus_1() {
+    let ctx = setup();
+    let id = ctx.submit();
+
+    ctx.pass_time(INTENT_EXPIRY - 1);
+    let res = ctx.client().try_expire_intent(&ctx.admin, &id);
+    assert_eq!(res, Err(Ok(Error::DeadlineNotReached.into())));
+}
+
+#[test]
+fn expire_intent_deadline_inclusive_boundary_exact() {
+    let ctx = setup();
+    let id = ctx.submit();
+
+    ctx.pass_time(INTENT_EXPIRY);
+    ctx.client().expire_intent(&ctx.admin, &id);
+}
+
+#[test]
+fn expire_intent_deadline_inclusive_boundary_plus_1() {
+    let ctx = setup();
+    let id = ctx.submit();
+
+    ctx.pass_time(INTENT_EXPIRY + 1);
+    ctx.client().expire_intent(&ctx.admin, &id);
+}
