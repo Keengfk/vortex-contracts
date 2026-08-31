@@ -61,6 +61,69 @@ const PERSISTENT_TTL_EXTEND_TO: u32 = DAY_IN_LEDGERS * 30;
 const INSTANCE_TTL_THRESHOLD: u32 = DAY_IN_LEDGERS * 30;
 const INSTANCE_TTL_EXTEND_TO: u32 = DAY_IN_LEDGERS * 60;
 
+// ── Default ProtocolConfig values (used by initialize and load_config fallback) ─
+//
+// These mirror the legacy compile-time constants so that contracts deployed
+// before the configurable-config upgrade behave identically: load_config falls
+// back to these when no Config key is present in instance storage, and
+// initialize seeds storage with them so the contract is immediately usable.
+const DEFAULT_MIN_BOND: i128 = MIN_BOND;           // 50 USDC
+const DEFAULT_FILL_WINDOW: u64 = FILL_WINDOW;      // 300 s
+const DEFAULT_INTENT_EXPIRY: u64 = INTENT_EXPIRY;  // 1 800 s
+const DEFAULT_PROTOCOL_FEE_BPS: i128 = PROTOCOL_FEE_BPS; // 5 bps
+
+// ── set_config validation bounds ─────────────────────────────────────────────
+/// Maximum `protocol_fee_bps` an admin may set (10%).  Prevents accidentally
+/// routing the majority of fill value to the fee recipient.
+const MAX_PROTOCOL_FEE_BPS: i128 = 1_000;
+/// Minimum `fill_window` an admin may set (60 s).  A solver must have at
+/// least a minute to fill after accepting; below this the window is too tight
+/// to be reliable on mainnet.
+const MIN_FILL_WINDOW_SECS: u64 = 60;
+/// Minimum `intent_expiry` an admin may set (300 s).  Must also be strictly
+/// greater than `fill_window` so there is always a meaningful open-bidding
+/// period before the window begins.
+const MIN_INTENT_EXPIRY_SECS: u64 = 300;
+/// Minimum `min_bond` an admin may set (one bond_token unit at 7 decimals).
+/// Prevents accidentally setting a zero or negligible bond floor.
+const MIN_BOND_FLOOR: i128 = 10_000_000; // 1 USDC (7 dp)
+
+// ── Slash / cancel cooldowns ──────────────────────────────────────────────────
+/// Seconds a solver must wait after being slashed before they can accept new
+/// intents.  Discourages rapidly cycling through slash events; paired with
+/// the accept_intent guard on `last_slash_time`.
+///
+/// Archival note: the SolverRecord that stores `last_slash_time` already has
+/// its TTL managed by `bump_solver_ttl` on every write — no separate TTL bump
+/// is needed for this cooldown to function correctly.
+const SLASH_COOLDOWN: u64 = 3_600; // 1 hour
+
+/// Seconds a user must wait between `cancel_intent` calls.  Prevents a
+/// malicious user from rapidly submitting and cancelling intents to grief
+/// solvers.  Stored in `DataKey::CancelCooldown(Address)` (persistent).
+///
+/// Archival note: see #271 — `bump_cancel_cooldown_ttl` is called on every
+/// write to `CancelCooldown` to prevent silent archival from resetting the
+/// cooldown to "never cancelled".
+const CANCEL_COOLDOWN: u64 = 60; // 1 minute
+
+// ── Fill-window extension ─────────────────────────────────────────────────────
+/// Maximum extra seconds an accepted intent's deadline may be extended by
+/// `request_extension`.  Each intent gets exactly one extension, so the
+/// absolute worst-case fill deadline is `FILL_WINDOW + MAX_EXTENSION_DURATION`
+/// seconds after acceptance.
+///
+/// Archival note: see #271 — `bump_extension_granted_ttl` is called on every
+/// write to `ExtensionGranted` so the one-extension-per-intent flag is not
+/// silently reset by archival.
+const MAX_EXTENSION_DURATION: u64 = 300; // 5 minutes
+
+// ── Batch limits ──────────────────────────────────────────────────────────────
+/// Maximum number of intents that may be submitted or accepted in a single
+/// `batch_submit_intent` / `batch_accept_intent` call.  Prevents a single
+/// transaction from consuming an unbounded amount of ledger resources.
+const MAX_BATCH_SIZE: u32 = 10;
+
 // ─── Storage Keys ─────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -144,6 +207,88 @@ pub enum DataKey {
     /// unpause access) -- resuming the protocol always needs the full
     /// admin's judgment.
     Pauser,
+
+    /// **Instance storage.** The active `ProtocolConfig` struct containing
+    /// `min_bond`, `fill_window`, `intent_expiry`, and `protocol_fee_bps`.
+    /// Written by `initialize` (with defaults) and by `set_config`.
+    Config,
+
+    /// **Instance storage.** Pending admin transfer: `(Address, u64)` where
+    /// the `u64` is the earliest ledger timestamp at which
+    /// `accept_admin_transfer` may execute it.  Written by
+    /// `propose_admin_transfer`, cleared by `accept_admin_transfer`.
+    PendingAdmin,
+
+    /// **Instance storage.** The ordered list of all `Address` values
+    /// currently in the dst_token allowlist (#117).  Kept in sync by
+    /// `add_to_dst_token_list` / `remove_from_dst_token_list`.  Read by
+    /// `list_allowed_dst_tokens`.
+    AllowedDstTokenList,
+
+    /// **Persistent storage.** Custom bond multiplier (i128, scale ×10) for
+    /// a specific dst_token.  Unset tokens default to 10 (1.0×).  Written by
+    /// `set_min_bond_multiplier`, read by `get_adjusted_min_bond` on every
+    /// `accept_intent` call.
+    ///
+    /// TTL: bumped by `bump_min_bond_multiplier_ttl` on every write (#271).
+    /// Without this bump an archived entry silently reverts the token's bond
+    /// requirement to the 1.0× default, potentially under-collateralising
+    /// accepts on high-risk tokens.
+    MinBondMultiplier(Address),
+
+    /// **Persistent storage.** Ledger timestamp (`u64`) of the most recent
+    /// `cancel_intent` call by this user.  Written by `cancel_intent`, read at
+    /// the top of `cancel_intent` to enforce `CANCEL_COOLDOWN`.
+    ///
+    /// TTL: bumped by `bump_cancel_cooldown_ttl` on every write (#271).
+    /// Without this bump an archived entry silently resets the cooldown to
+    /// "never cancelled", letting a user cancel at full rate after any
+    /// sufficiently long gap — defeating the spam-deterrence mechanism.
+    CancelCooldown(Address),
+
+    /// **Persistent storage.** Presence flag (`bool true`) indicating that
+    /// intent `intent_id` has already consumed its one allowed fill-window
+    /// extension.  Written by `request_extension`, checked (via `has`) at the
+    /// start of `request_extension`.
+    ///
+    /// TTL: bumped by `bump_extension_granted_ttl` on every write (#271).
+    /// Without this bump an archived flag would let a solver request a second
+    /// extension on the same intent — bypassing the one-shot constraint that
+    /// prevents extension abuse.
+    ExtensionGranted(BytesN<32>),
+
+    /// **Persistent storage.** Per-user list of all intent IDs
+    /// (`Vec<BytesN<32>>`) submitted by `user`.  Written by `submit_intent`,
+    /// read by `list_intents_by_user`.
+    ///
+    /// TTL: bumped by `bump_user_intents_ttl` on every write (#271).
+    /// Without this bump an archived list silently returns empty/incomplete
+    /// history from `list_intents_by_user`, breaking the user-facing intent
+    /// history view.
+    UserIntents(Address),
+
+    /// **Instance storage.** Pending dst-token addition: timestamp (`u64`) at
+    /// which `execute_add_dst_token` may run.  Written by
+    /// `propose_add_dst_token`, cleared by `execute_add_dst_token`.
+    PendingDstTokenAdd(Address),
+
+    /// **Instance storage.** Pending dst-token removal: timestamp (`u64`) at
+    /// which `execute_remove_dst_token` may run.  Written by
+    /// `propose_remove_dst_token`, cleared by `execute_remove_dst_token`.
+    PendingDstTokenRemove(Address),
+
+    /// **Persistent storage.** Reputation snapshot preserved across a
+    /// deregister/re-register cycle (#272).  Written by `deregister_solver`
+    /// just before the `SolverRecord` is removed; read and merged by
+    /// `register_solver` when the same address registers again.
+    ///
+    /// Storing only the reputation-relevant fields (not bond or active-intent
+    /// state) ensures re-registering solvers must still meet the bond minimum
+    /// but cannot wipe their fill history or bypass `SLASH_COOLDOWN`.
+    ///
+    /// TTL: same as solver records (PERSISTENT_TTL_THRESHOLD / EXTEND_TO) so
+    /// the snapshot survives the period between deregister and re-register.
+    SolverReputation(Address),
 }
 
 // ─── Data Structs ─────────────────────────────────────────────────────────────
@@ -276,6 +421,38 @@ pub struct ProtocolHealth {
     pub total_solvers: u32,
 }
 
+/// Reputation fields preserved across a `deregister_solver` / `register_solver`
+/// cycle for the same solver address (#272).
+///
+/// When `deregister_solver` runs it writes this snapshot to
+/// `DataKey::SolverReputation(address)` *before* deleting the `SolverRecord`.
+/// When `register_solver` runs for the same address it reads this snapshot (if
+/// present) and carries the fields forward into the new `SolverRecord`, then
+/// removes the snapshot.
+///
+/// Only the fields that matter for cooldown enforcement and reputation scoring
+/// are preserved — `bond_amount`, `active_intents`, `registered_at`, and
+/// `is_active` are intentionally reset (the solver is starting a new bonding
+/// period; they must re-post bond and are active again from the moment of
+/// re-registration).
+#[contracttype]
+#[derive(Clone)]
+pub struct ReputationSnapshot {
+    /// Timestamp of the most recent slash event, carried forward so that the
+    /// `SLASH_COOLDOWN` guard in `accept_intent` remains effective even after
+    /// a deregister/re-register cycle.
+    pub last_slash_time: u64,
+    /// Cumulative successful fills; preserved so `compute_reputation_score`
+    /// reflects the solver's true track record.
+    pub fills_completed: u32,
+    /// Cumulative failed fills (missed windows); preserved to prevent solvers
+    /// from wiping a bad fill ratio by cycling through deregister/re-register.
+    pub fills_failed: u32,
+    /// Cumulative dst-token volume delivered across all fills; preserved so
+    /// the volume-based bonus in `compute_reputation_score` cannot be reset.
+    pub total_volume: i128,
+}
+
 // ─── Errors ───────────────────────────────────────────────────────────────────
 
 #[contracterror]
@@ -389,13 +566,13 @@ pub enum Error {
     /// Duplicate `intent_id` detected in `submit_intent` (hash collision guard).
     IntentAlreadyExists = 22,
     /// #30: no pending fee-recipient proposal to accept
-    NoPendingFeeRecipient = 22,
+    NoPendingFeeRecipient = 29,
     /// #31: fee arithmetic overflowed (fill_amount is astronomically large)
     FeeOverflow = 23,
     /// #33: the address passed to add_allowed_dst_token doesn't implement SEP-41
     InvalidTokenInterface = 24,
-    SrcChainNotAllowed = 22,
-    RescueProtectedToken = 23,
+    SrcChainNotAllowed = 25,
+    RescueProtectedToken = 26,
     /// #127: `submit_intent` was called with a `src_token` whose format does
     /// not match the conventions of the declared `src_chain`.
     ///
@@ -408,6 +585,36 @@ pub enum Error {
     /// If `src_chain` is unknown this error is never raised — unknown chains
     /// bypass token-format validation so the allowlist remains the sole gate.
     InvalidSrcToken = 28,
+
+    /// The timelock delay since a `propose_*` call has not yet elapsed.
+    /// Raised by `accept_fee_recipient`, `accept_admin_transfer`,
+    /// `execute_add_dst_token`, and `execute_remove_dst_token`.
+    TimelockNotElapsed = 30,
+
+    /// `accept_admin_transfer` was called but no prior `propose_admin_transfer`
+    /// is on record.
+    NoPendingAdminTransfer = 31,
+
+    /// `execute_add_dst_token` or `execute_remove_dst_token` was called but
+    /// no matching pending proposal exists for the given token.
+    NoPendingDstTokenChange = 32,
+
+    /// `submit_intent` was called with `src_amount` or `min_dst_amount`
+    /// exceeding `MAX_AMOUNT` (10^30).
+    AmountTooLarge = 33,
+
+    /// `set_config` was called with out-of-bounds parameter values.
+    InvalidConfig = 34,
+
+    /// `cancel_intent` was called within `CANCEL_COOLDOWN` seconds of the
+    /// user's most recent cancellation.
+    CancelCooldownNotExpired = 35,
+
+    /// `get_adjusted_min_bond` computed `min_bond × multiplier` and the
+    /// intermediate product overflowed `i128`.  This should only occur if an
+    /// admin sets an astronomically large `MinBondMultiplier` value — the
+    /// guard prevents a DoS on the `accept_intent` hot path (#269).
+    BondMultiplierOverflow = 36,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -802,6 +1009,8 @@ impl IntentSettlement {
         env.storage()
             .persistent()
             .set(&DataKey::MinBondMultiplier(token.clone()), &multiplier);
+        // #271: bump TTL so the multiplier is not silently archived back to 1.0×.
+        Self::bump_min_bond_multiplier_ttl(&env, &token);
         env.events().publish(
             (Symbol::new(&env, "bond_multiplier_set"),),
             (token, multiplier),
@@ -1011,23 +1220,52 @@ impl IntentSettlement {
         // transfer were to fail (or a re-entrant call were made mid-transfer),
         // the record either doesn't exist yet (new solver) or still reflects
         // the pre-topup balance, rather than an inflated balance with no matching funds.
+        //
+        // #272: When creating a brand-new SolverRecord (no existing record),
+        // check for a preserved ReputationSnapshot from a prior deregistration.
+        // If one exists, carry forward last_slash_time, fills_completed,
+        // fills_failed, and total_volume rather than zeroing them.  This
+        // prevents the deregister/re-register cycle from being used to bypass
+        // SLASH_COOLDOWN or reset the fill-history reputation score.
+        // A never-slashed, never-registered solver has no snapshot, so they
+        // get the same zero-initialised record as before — no change to the
+        // happy path.
         let record = match existing {
             Some(mut s) => {
                 s.bond_amount += bond_amount;
                 s.is_active = true;
                 s
             }
-            None => SolverRecord {
-                address: solver.clone(),
-                bond_amount,
-                fills_completed: 0,
-                fills_failed: 0,
-                total_volume: 0,
-                is_active: true,
-                registered_at: env.ledger().timestamp(),
-                active_intents: 0,
-                last_slash_time: 0,
-            },
+            None => {
+                // Look up any preserved reputation from a prior deregistration.
+                let snapshot: Option<ReputationSnapshot> = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::SolverReputation(solver.clone()));
+
+                let (fills_completed, fills_failed, total_volume, last_slash_time) =
+                    match snapshot {
+                        Some(s) => (s.fills_completed, s.fills_failed, s.total_volume, s.last_slash_time),
+                        None => (0, 0, 0, 0),
+                    };
+
+                // Consume the snapshot — it has been merged into the new record.
+                env.storage()
+                    .persistent()
+                    .remove(&DataKey::SolverReputation(solver.clone()));
+
+                SolverRecord {
+                    address: solver.clone(),
+                    bond_amount,
+                    fills_completed,
+                    fills_failed,
+                    total_volume,
+                    is_active: true,
+                    registered_at: env.ledger().timestamp(),
+                    active_intents: 0,
+                    last_slash_time,
+                }
+            }
         };
 
         env.storage()
@@ -1082,6 +1320,30 @@ impl IntentSettlement {
         // Remove the solver record and update the counter *before* the external
         // token transfer so that any re-entrant call sees no record and would
         // panic with SolverNotRegistered rather than processing a double-refund.
+        //
+        // #272: Before removing the SolverRecord, persist a ReputationSnapshot
+        // keyed by the solver's address.  If the solver re-registers later,
+        // register_solver picks up this snapshot and carries the reputation
+        // fields forward, preventing the deregister/re-register cycle from
+        // being used to (a) bypass SLASH_COOLDOWN by resetting last_slash_time
+        // to zero, or (b) wipe a bad fill history to clean-slate the reputation
+        // score.  Only reputation-relevant fields are preserved; bond_amount,
+        // active_intents, and registered_at are intentionally reset.
+        env.storage().persistent().set(
+            &DataKey::SolverReputation(solver.clone()),
+            &ReputationSnapshot {
+                last_slash_time: record.last_slash_time,
+                fills_completed: record.fills_completed,
+                fills_failed: record.fills_failed,
+                total_volume: record.total_volume,
+            },
+        );
+        env.storage().persistent().extend_ttl(
+            &DataKey::SolverReputation(solver.clone()),
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_EXTEND_TO,
+        );
+
         env.storage()
             .persistent()
             .remove(&DataKey::Solver(solver.clone()));
@@ -1293,6 +1555,9 @@ impl IntentSettlement {
         env.storage()
             .persistent()
             .set(&DataKey::UserIntents(user.clone()), &user_intents);
+        // #271: bump TTL so list_intents_by_user never silently returns an
+        // incomplete list due to archival.
+        Self::bump_user_intents_ttl(&env, &user);
 
         let total: u64 = env
             .storage()
@@ -1458,42 +1723,24 @@ impl IntentSettlement {
             panic_with_error!(&env, Error::ZeroAmount);
         }
 
-        // Deliver this fill's tokens to the user.
-        let dst_client = token::Client::new(&env, &intent.dst_token);
-        dst_client.transfer(&solver, &intent.user, &fill_amount);
-
-        // Solver also pays the protocol fee on each fill.
-        let fee = fill_amount * PROTOCOL_FEE_BPS / 10_000;
         // ── Effects first (CEI) ──────────────────────────────────────────────
-        // Mark the intent Filled and write every state change to storage
-        // *before* any external token transfer executes. A hostile SEP-41
-        // token that attempts to re-enter fill_intent or slash_solver during
-        // the transfer would see the intent already Filled and be rejected.
-        // Solver delivers the full requested output to the user.
-        let dst_client = token::Client::new(&env, &intent.dst_token);
-        dst_client.transfer(&solver, &intent.user, &fill_amount);
+        // Accumulate the fill, update intent state, and write all storage changes
+        // *before* any external token transfer executes.  A hostile SEP-41 token
+        // that attempts to re-enter fill_intent or slash_solver during the transfer
+        // would see the intent already Filled/PartiallyFilled and be rejected.
 
-        // Solver also pays the protocol fee (priced into their quote). Taking the
-        // fee from the solver — rather than clawing it back from the user — keeps
-        // the user's received amount at or above `min_dst_amount`, and keeps every
-        // token transfer authorized by the solver who signed this call.
-        //
+        // Compute protocol fee with explicit checked arithmetic (#269 / #31).
+        // Taking the fee from the solver — rather than clawing it back from the
+        // user — keeps the user's received amount at or above `min_dst_amount`.
         // Explicit checked_mul/checked_div makes the overflow-safety property
         // visible in code, rather than relying solely on the Cargo.toml
-        // overflow-checks = true release-profile setting (issue #31).
+        // overflow-checks = true release-profile setting.
+        let fee_bps = Self::get_tiered_fee_bps(&env);
         let fee = fill_amount
-            .checked_mul(PROTOCOL_FEE_BPS)
+            .checked_mul(fee_bps)
             .unwrap_or_else(|| panic_with_error!(&env, Error::FeeOverflow))
             .checked_div(10_000)
             .unwrap_or_else(|| panic_with_error!(&env, Error::FeeOverflow));
-        if fee > 0 {
-            let fee_recipient: Address = env
-                .storage()
-                .instance()
-                .get(&DataKey::FeeRecipient)
-                .unwrap();
-            dst_client.transfer(&solver, &fee_recipient, &fee);
-        }
 
         // Accumulate the fill.
         intent.total_filled += fill_amount;
@@ -1563,11 +1810,7 @@ impl IntentSettlement {
         let dst_client = token::Client::new(&env, &intent.dst_token);
         dst_client.transfer(&solver, &intent.user, &fill_amount);
 
-        // Solver also pays the protocol fee (priced into their quote). Taking the
-        // fee from the solver — rather than clawing it back from the user — keeps
-        // the user's received amount at or above `min_dst_amount`, and keeps every
-        // token transfer authorized by the solver who signed this call.
-        let fee = fill_amount * PROTOCOL_FEE_BPS / 10_000;
+        // Solver also pays the protocol fee (priced into their quote).
         if fee > 0 {
             let fee_recipient: Address = env
                 .storage()
@@ -1643,6 +1886,9 @@ impl IntentSettlement {
         env.storage()
             .persistent()
             .set(&DataKey::CancelCooldown(user.clone()), &now);
+        // #271: bump TTL so the cooldown is not silently archived (which would
+        // reset it to "never cancelled" and defeat spam-deterrence).
+        Self::bump_cancel_cooldown_ttl(&env, &user);
 
         env.events()
             .publish((Symbol::new(&env, "intent_cancelled"), user), intent_id);
@@ -1889,6 +2135,9 @@ impl IntentSettlement {
         env.storage()
             .persistent()
             .set(&DataKey::ExtensionGranted(intent_id.clone()), &true);
+        // #271: bump TTL so the one-shot flag is not silently archived,
+        // which would allow a second extension request on the same intent.
+        Self::bump_extension_granted_ttl(&env, &intent_id);
 
         env.storage()
             .persistent()
@@ -2314,7 +2563,19 @@ impl IntentSettlement {
             .persistent()
             .get::<_, i128>(&DataKey::MinBondMultiplier(dst_token.clone()))
             .unwrap_or(10);
-        (MIN_BOND * multiplier) / 10
+        // #269: Use checked_mul/checked_div to make the overflow-safety property
+        // explicit, consistent with the discipline established for fee arithmetic
+        // in fill_intent.  An admin setting an extreme MinBondMultiplier combined
+        // with a large min_bond could theoretically overflow i128 with unchecked
+        // multiplication; the checked path returns BondMultiplierOverflow instead
+        // of a silent panic or wrapping (even though overflow-checks = true in the
+        // release profile, a panic on this hot path is a DoS concern).
+        let product = MIN_BOND
+            .checked_mul(multiplier)
+            .unwrap_or_else(|| panic_with_error!(env, Error::BondMultiplierOverflow));
+        product
+            .checked_div(10)
+            .unwrap_or_else(|| panic_with_error!(env, Error::BondMultiplierOverflow))
     }
 
     /// Load the protocol config from storage, falling back to defaults for
@@ -2387,6 +2648,69 @@ impl IntentSettlement {
     fn bump_solver_ttl(env: &Env, solver: &Address) {
         env.storage().persistent().extend_ttl(
             &DataKey::Solver(solver.clone()),
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_EXTEND_TO,
+        );
+    }
+
+    /// #271: Bump the TTL of a `CancelCooldown` entry after every write.
+    ///
+    /// An unmanaged `CancelCooldown` entry will archive after ~30 days of
+    /// inactivity (Soroban's minimum persistent-storage TTL).  Once archived,
+    /// the entry reads as absent, which `cancel_intent` interprets as "user
+    /// has never cancelled" — silently resetting the cooldown and allowing
+    /// the user to cancel at full rate again.  Bumping on every write prevents
+    /// this by ensuring the entry survives as long as the solver/intent records
+    /// it guards against.
+    fn bump_cancel_cooldown_ttl(env: &Env, user: &Address) {
+        env.storage().persistent().extend_ttl(
+            &DataKey::CancelCooldown(user.clone()),
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_EXTEND_TO,
+        );
+    }
+
+    /// #271: Bump the TTL of a `MinBondMultiplier` entry after every write.
+    ///
+    /// An unmanaged `MinBondMultiplier` entry will archive after inactivity.
+    /// Once archived it reads as absent, reverting the token's bond requirement
+    /// to the 1.0× default and potentially allowing solvers to accept
+    /// high-risk-token intents with an under-sized bond.  Bumping on every
+    /// write keeps admin-configured multipliers alive for the same window as
+    /// solver records.
+    fn bump_min_bond_multiplier_ttl(env: &Env, token: &Address) {
+        env.storage().persistent().extend_ttl(
+            &DataKey::MinBondMultiplier(token.clone()),
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_EXTEND_TO,
+        );
+    }
+
+    /// #271: Bump the TTL of an `ExtensionGranted` flag after every write.
+    ///
+    /// An unmanaged `ExtensionGranted` entry will archive after inactivity.
+    /// Once archived it reads as absent, allowing a solver to request a second
+    /// extension on an intent that has already used its one-shot quota.
+    /// Bumping on every write ensures the flag outlives the intent it protects
+    /// (intents themselves are bumped by `bump_intent_ttl`).
+    fn bump_extension_granted_ttl(env: &Env, intent_id: &BytesN<32>) {
+        env.storage().persistent().extend_ttl(
+            &DataKey::ExtensionGranted(intent_id.clone()),
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_EXTEND_TO,
+        );
+    }
+
+    /// #271: Bump the TTL of a `UserIntents` list after every write.
+    ///
+    /// An unmanaged `UserIntents` entry will archive after inactivity.  Once
+    /// archived `list_intents_by_user` silently returns an empty or incomplete
+    /// list — breaking the user-facing intent history view relied on by
+    /// front-ends and indexers.  Bumping on every write mirrors the pattern
+    /// `bump_intent_ttl` uses for individual intent records.
+    fn bump_user_intents_ttl(env: &Env, user: &Address) {
+        env.storage().persistent().extend_ttl(
+            &DataKey::UserIntents(user.clone()),
             PERSISTENT_TTL_THRESHOLD,
             PERSISTENT_TTL_EXTEND_TO,
         );
