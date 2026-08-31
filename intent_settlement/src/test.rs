@@ -7,7 +7,7 @@
 
 use crate::{
     DataKey, Error, IntentSettlement, IntentSettlementClient, IntentState, SolverRecord,
-    FILL_WINDOW, INTENT_EXPIRY, MIN_BOND, ADMIN_TIMELOCK_DELAY,
+    FILL_WINDOW, INTENT_EXPIRY, MIN_BOND, ADMIN_TIMELOCK_DELAY, CANCEL_COOLDOWN,
 };
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
@@ -380,6 +380,8 @@ fn pauser_cannot_unpause() {
         "unpause must require admin auth, not the pauser; got: {:?}",
         auths
     );
+}
+
 #[test]
 fn pause_blocks_fill_intent() {
     let ctx = setup();
