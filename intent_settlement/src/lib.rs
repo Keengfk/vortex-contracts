@@ -82,6 +82,15 @@ pub enum DataKey {
     /// timestamp at which `accept_fee_recipient` may execute it (issue #30,
     /// timelock added by #115): `(Address, u64)`.
     PendingFeeRecipient,
+    /// Proposed-but-not-yet-accepted new admin plus the ledger timestamp at
+    /// which `accept_admin_transfer` may execute it: `(Address, u64)`.
+    PendingAdmin,
+    /// Proposed-but-not-yet-accepted dst token addition plus the ledger
+    /// timestamp at which `execute_add_dst_token` may execute it: `u64`.
+    PendingDstTokenAdd(Address),
+    /// Proposed-but-not-yet-accepted dst token removal plus the ledger
+    /// timestamp at which `execute_remove_dst_token` may execute it: `u64`.
+    PendingDstTokenRemove(Address),
     BondToken,          // USDC address for bonds
     Intent(BytesN<32>), // intent_id -> IntentRecord
     Solver(Address),    // address -> SolverRecord
@@ -524,6 +533,29 @@ impl IntentSettlement {
         );
     }
 
+    /// Admin-only: cancel a pending fee recipient proposal and emit a
+    /// `fee_recipient_proposal_cancelled` event. Allows the admin to withdraw a
+    /// mistaken proposal without simultaneously replacing it with a new one (#210).
+    /// Calling `accept_fee_recipient` after cancellation fails with
+    /// `NoPendingFeeRecipient`, exactly as if no proposal had been made.
+    pub fn cancel_pending_fee_recipient(env: Env) {
+        env.current_contract_address().require_auth();
+        let pending = env
+            .storage()
+            .instance()
+            .get::<_, (Address, u64)>(&DataKey::PendingFeeRecipient)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoPendingFeeRecipient));
+
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingFeeRecipient);
+
+        env.events().publish(
+            (Symbol::new(&env, "fee_recipient_proposal_cancelled"),),
+            pending.0,
+        );
+    }
+
     /// Admin-only: propose transferring the admin role to a new address. A
     /// `admin_transfer_proposed` event fires immediately for off-chain
     /// monitors (#116); the transfer itself only takes effect once
@@ -578,6 +610,33 @@ impl IntentSettlement {
 
         env.events()
             .publish((Symbol::new(&env, "admin_transferred"),), new_admin);
+    }
+
+    /// Admin-only: cancel a pending admin transfer proposal and emit an
+    /// `admin_transfer_proposal_cancelled` event. Allows the current admin to
+    /// withdraw a mistaken proposal without simultaneously replacing it with a
+    /// new one (#210). Calling `accept_admin_transfer` after cancellation fails
+    /// with `NoPendingAdminTransfer`, exactly as if no proposal had been made.
+    pub fn cancel_pending_admin_transfer(env: Env) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        admin.require_auth();
+
+        let pending = env
+            .storage()
+            .instance()
+            .get::<_, (Address, u64)>(&DataKey::PendingAdmin)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoPendingAdminTransfer));
+
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+
+        env.events().publish(
+            (Symbol::new(&env, "admin_transfer_proposal_cancelled"),),
+            pending.0,
+        );
     }
 
     // ── Protocol Config ───────────────────────────────────────────────────────
@@ -699,6 +758,30 @@ impl IntentSettlement {
             .publish((Symbol::new(&env, "dst_token_allowed"),), token);
     }
 
+    /// Admin-only: cancel a pending dst_token_add proposal for the given token
+    /// and emit a `dst_token_add_proposal_cancelled` event. Allows the admin to
+    /// withdraw a mistaken proposal without simultaneously replacing it with a
+    /// new one (#210). Calling `execute_add_dst_token` after cancellation fails
+    /// with `NoPendingDstTokenChange`, exactly as if no proposal had been made.
+    pub fn cancel_pending_dst_token_add(env: Env, token: Address) {
+        Self::require_admin(&env);
+
+        let _eta: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingDstTokenAdd(token.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoPendingDstTokenChange));
+
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingDstTokenAdd(token.clone()));
+
+        env.events().publish(
+            (Symbol::new(&env, "dst_token_add_proposal_cancelled"),),
+            token,
+        );
+    }
+
     /// Admin-only: propose disallowing a dst_token. Fires a
     /// `dst_token_remove_proposed` event immediately (#116); the token stays
     /// allowed until `execute_remove_dst_token` is called after the timelock
@@ -740,6 +823,30 @@ impl IntentSettlement {
 
         env.events()
             .publish((Symbol::new(&env, "dst_token_disallowed"),), token);
+    }
+
+    /// Admin-only: cancel a pending dst_token_remove proposal for the given token
+    /// and emit a `dst_token_remove_proposal_cancelled` event. Allows the admin to
+    /// withdraw a mistaken proposal without simultaneously replacing it with a
+    /// new one (#210). Calling `execute_remove_dst_token` after cancellation fails
+    /// with `NoPendingDstTokenChange`, exactly as if no proposal had been made.
+    pub fn cancel_pending_dst_token_remove(env: Env, token: Address) {
+        Self::require_admin(&env);
+
+        let _eta: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingDstTokenRemove(token.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoPendingDstTokenChange));
+
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingDstTokenRemove(token.clone()));
+
+        env.events().publish(
+            (Symbol::new(&env, "dst_token_remove_proposal_cancelled"),),
+            token,
+        );
     }
 
     /// Returns `true` if `token` is on the dst_token allowlist.
