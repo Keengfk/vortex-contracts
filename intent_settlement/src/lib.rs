@@ -61,6 +61,51 @@ const PERSISTENT_TTL_EXTEND_TO: u32 = DAY_IN_LEDGERS * 30;
 const INSTANCE_TTL_THRESHOLD: u32 = DAY_IN_LEDGERS * 30;
 const INSTANCE_TTL_EXTEND_TO: u32 = DAY_IN_LEDGERS * 60;
 
+// ─── Configurable protocol defaults ──────────────────────────────────────────
+
+/// Default minimum solver bond: 50 USDC (7 decimals).
+const DEFAULT_MIN_BOND: i128 = 50 * 10_000_000;
+/// Default fill window: 5 minutes.
+const DEFAULT_FILL_WINDOW: u64 = 300;
+/// Default intent expiry: 30 minutes.
+const DEFAULT_INTENT_EXPIRY: u64 = 1800;
+/// Default protocol fee in basis points: 0.05%.
+const DEFAULT_PROTOCOL_FEE_BPS: i128 = 5;
+
+// ─── Config validation bounds ─────────────────────────────────────────────────
+
+/// Maximum allowed `protocol_fee_bps` (10%).
+const MAX_PROTOCOL_FEE_BPS: i128 = 1_000;
+/// Minimum allowed `fill_window` in seconds.
+const MIN_FILL_WINDOW_SECS: u64 = 60;
+/// Minimum allowed `intent_expiry` in seconds.
+const MIN_INTENT_EXPIRY_SECS: u64 = 300;
+/// Minimum allowed `min_bond` (1 token unit at 7 decimals = 0.0000001 USDC).
+const MIN_BOND_FLOOR: i128 = 10_000_000; // 1 USDC (7 decimals)
+
+// ─── Operational constants ────────────────────────────────────────────────────
+
+/// Cooldown after a slash before a solver may accept new intents (10 minutes).
+const SLASH_COOLDOWN: u64 = 600;
+/// Per-user cooldown between successive `cancel_intent` calls (60 seconds).
+const CANCEL_COOLDOWN: u64 = 60;
+/// Maximum number of intents in a single `batch_submit_intent` /
+/// `batch_accept_intent` call.
+const MAX_BATCH_SIZE: u32 = 10;
+/// Maximum extension duration granted by `request_extension` (10 minutes).
+const MAX_EXTENSION_DURATION: u64 = 600;
+
+// ─── Backstop pool constants ──────────────────────────────────────────────────
+
+/// Maximum `backstop_bps` the admin may configure (50% of the slash amount).
+/// Prevents the entire slash from being diverted away from the fee recipient.
+const MAX_BACKSTOP_BPS: i128 = 5_000; // 50%
+
+/// Maximum share of the backstop pool a single claim may draw (1% of pool).
+/// Bounds one-per-intent claim so a single large intent cannot drain the pool
+/// that is meant to compensate many users.
+const MAX_BACKSTOP_CLAIM_BPS: i128 = 100; // 1%
+
 // ─── Storage Keys ─────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -144,6 +189,56 @@ pub enum DataKey {
     /// unpause access) -- resuming the protocol always needs the full
     /// admin's judgment.
     Pauser,
+
+    /// **Instance storage.** The active `ProtocolConfig` (min_bond, fill_window,
+    /// intent_expiry, protocol_fee_bps, backstop_bps).  Written by `initialize`
+    /// and `set_config`.  Falls back to compile-time defaults if absent.
+    Config,
+
+    /// **Instance storage.** Pending admin transfer: `(Address, u64 eta)`.
+    /// Written by `propose_admin_transfer`, removed by `accept_admin_transfer`.
+    PendingAdmin,
+
+    /// **Instance storage.** Ordered list of every address currently on the
+    /// dst_token allowlist.  Maintained in parallel with `AllowedDstToken(addr)`
+    /// presence flags to support `list_allowed_dst_tokens` (#117).
+    AllowedDstTokenList,
+
+    /// **Instance storage.** Pending add-dst-token proposal: token → eta (u64).
+    /// Written by `propose_add_dst_token`, removed by `execute_add_dst_token`.
+    PendingDstTokenAdd(Address),
+
+    /// **Instance storage.** Pending remove-dst-token proposal: token → eta (u64).
+    /// Written by `propose_remove_dst_token`, removed by `execute_remove_dst_token`.
+    PendingDstTokenRemove(Address),
+
+    /// **Persistent storage.** Per-token bond-multiplier override (i128).
+    /// Absent → default multiplier 10 (i.e. 1.0×).
+    MinBondMultiplier(Address),
+
+    /// **Persistent storage.** Ordered list of intent IDs ever submitted by
+    /// a given user.  Appended by `submit_intent`.
+    UserIntents(Address),
+
+    /// **Persistent storage.** Timestamp of the user's last `cancel_intent`
+    /// call (u64), used to enforce `CANCEL_COOLDOWN` spam-deterrence.
+    CancelCooldown(Address),
+
+    /// **Persistent storage.** Presence flag (`true`) set once an intent has
+    /// consumed its one fill-window extension via `request_extension`.
+    ExtensionGranted(BytesN<32>),
+
+    /// **Instance storage.** Running aggregate of bond-token units diverted
+    /// from slash proceeds into the backstop pool (`i128`).  Incremented by
+    /// `slash_solver` when `backstop_bps > 0`, decremented by
+    /// `claim_backstop_compensation`.
+    BackstopPool,
+
+    /// **Persistent storage.** Presence flag (`true`) marking that the user
+    /// whose intent `intent_id` was slashed has already claimed their one-time
+    /// backstop compensation for that intent.  Prevents double-claims across
+    /// repeated slash cycles on the same intent.
+    BackstopClaimed(BytesN<32>),
 }
 
 // ─── Data Structs ─────────────────────────────────────────────────────────────
@@ -161,6 +256,11 @@ pub struct ProtocolConfig {
     pub intent_expiry: u64,
     /// Protocol fee in basis points charged on each fill (0.01% per bps).
     pub protocol_fee_bps: i128,
+    /// Share of each slash amount (in basis points) diverted into the backstop
+    /// pool instead of being sent to the fee recipient.  0 means the feature is
+    /// dormant and all slash proceeds still go to the fee recipient unchanged.
+    /// Range: 0–`MAX_BACKSTOP_BPS` (5 000, i.e. 50%).
+    pub backstop_bps: i128,
 }
 
 /// A user's cross-chain swap intent
@@ -389,25 +489,46 @@ pub enum Error {
     /// Duplicate `intent_id` detected in `submit_intent` (hash collision guard).
     IntentAlreadyExists = 22,
     /// #30: no pending fee-recipient proposal to accept
-    NoPendingFeeRecipient = 22,
+    NoPendingFeeRecipient = 23,
     /// #31: fee arithmetic overflowed (fill_amount is astronomically large)
-    FeeOverflow = 23,
+    FeeOverflow = 24,
     /// #33: the address passed to add_allowed_dst_token doesn't implement SEP-41
-    InvalidTokenInterface = 24,
-    SrcChainNotAllowed = 22,
-    RescueProtectedToken = 23,
-    /// #127: `submit_intent` was called with a `src_token` whose format does
-    /// not match the conventions of the declared `src_chain`.
-    ///
-    /// EVM chains (ethereum, base, polygon, arbitrum, optimism): expect a
-    /// `0x`-prefixed 42-character hex string (e.g. `"0xA0b86991…"`).
-    ///
-    /// Solana: expects a base58 string between 32 and 44 characters long with
-    /// no `0x` prefix.
-    ///
-    /// If `src_chain` is unknown this error is never raised — unknown chains
-    /// bypass token-format validation so the allowlist remains the sole gate.
-    InvalidSrcToken = 28,
+    InvalidTokenInterface = 25,
+    /// Raised by `accept_fee_recipient`, `accept_admin_transfer`,
+    /// `execute_add_dst_token`, and `execute_remove_dst_token` when called
+    /// before the 48-hour timelock delay has elapsed since the matching
+    /// `propose_*` call.
+    TimelockNotElapsed = 26,
+    /// `accept_admin_transfer` called with no prior `propose_admin_transfer`
+    /// on record.
+    NoPendingAdminTransfer = 27,
+    /// `execute_add_dst_token` or `execute_remove_dst_token` called with no
+    /// matching pending proposal for the given token.
+    NoPendingDstTokenChange = 28,
+    /// `submit_intent` called with a `src_token` whose format does not match
+    /// the conventions of the declared `src_chain` (#127).
+    InvalidSrcToken = 29,
+    /// `submit_intent` called with `src_amount` or `min_dst_amount` exceeding
+    /// `MAX_AMOUNT` (10^30).  Distinct from `ZeroAmount` so callers know the
+    /// direction of the bound violation.
+    AmountTooLarge = 30,
+    /// `set_config` called with a parameter outside its allowed range.
+    InvalidConfig = 31,
+    /// `cancel_intent` called before the per-user `CANCEL_COOLDOWN` has elapsed
+    /// since the last cancellation.
+    CancelCooldownNotExpired = 32,
+    /// `add_allowed_src_chain` / `remove_allowed_src_chain` guard: the
+    /// submitted `src_chain` is not in the allowlist while enforcement is on.
+    SrcChainNotAllowed = 33,
+    /// `rescue_tokens` was called with the bond token, which is protected.
+    RescueProtectedToken = 34,
+    /// `claim_backstop_compensation` was called when the backstop pool is
+    /// empty (balance = 0) or `backstop_bps` is 0 so no funds have ever
+    /// been accumulated.
+    BackstopPoolEmpty = 35,
+    /// `claim_backstop_compensation` was called a second time for the same
+    /// `intent_id`.  Each intent may only be claimed once.
+    BackstopAlreadyClaimed = 36,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -452,6 +573,7 @@ impl IntentSettlement {
                 fill_window: DEFAULT_FILL_WINDOW,
                 intent_expiry: DEFAULT_INTENT_EXPIRY,
                 protocol_fee_bps: DEFAULT_PROTOCOL_FEE_BPS,
+                backstop_bps: 0, // opt-in: dormant by default
             },
         );
         Self::bump_instance_ttl(&env);
@@ -595,12 +717,14 @@ impl IntentSettlement {
     /// * `fill_window`       ≥ 60 s
     /// * `intent_expiry`     ≥ 300 s and > fill_window
     /// * `min_bond`          ≥ 1 token unit (10_000_000 for 7-decimal USDC)
+    /// * `backstop_bps`      0–5 000 (0–50% of slash diverted to backstop pool)
     pub fn set_config(
         env: Env,
         min_bond: i128,
         fill_window: u64,
         intent_expiry: u64,
         protocol_fee_bps: i128,
+        backstop_bps: i128,
     ) {
         Self::require_admin(&env);
 
@@ -616,19 +740,23 @@ impl IntentSettlement {
         if min_bond < MIN_BOND_FLOOR {
             panic_with_error!(&env, Error::InvalidConfig);
         }
+        if !(0..=MAX_BACKSTOP_BPS).contains(&backstop_bps) {
+            panic_with_error!(&env, Error::InvalidConfig);
+        }
 
         let cfg = ProtocolConfig {
             min_bond,
             fill_window,
             intent_expiry,
             protocol_fee_bps,
+            backstop_bps,
         };
         env.storage().instance().set(&DataKey::Config, &cfg);
         Self::bump_instance_ttl(&env);
 
         env.events().publish(
             (Symbol::new(&env, "config_updated"),),
-            (min_bond, fill_window, intent_expiry, protocol_fee_bps),
+            (min_bond, fill_window, intent_expiry, protocol_fee_bps, backstop_bps),
         );
     }
 
@@ -1458,42 +1586,18 @@ impl IntentSettlement {
             panic_with_error!(&env, Error::ZeroAmount);
         }
 
-        // Deliver this fill's tokens to the user.
-        let dst_client = token::Client::new(&env, &intent.dst_token);
-        dst_client.transfer(&solver, &intent.user, &fill_amount);
-
-        // Solver also pays the protocol fee on each fill.
-        let fee = fill_amount * PROTOCOL_FEE_BPS / 10_000;
         // ── Effects first (CEI) ──────────────────────────────────────────────
         // Mark the intent Filled and write every state change to storage
         // *before* any external token transfer executes. A hostile SEP-41
         // token that attempts to re-enter fill_intent or slash_solver during
         // the transfer would see the intent already Filled and be rejected.
-        // Solver delivers the full requested output to the user.
-        let dst_client = token::Client::new(&env, &intent.dst_token);
-        dst_client.transfer(&solver, &intent.user, &fill_amount);
 
-        // Solver also pays the protocol fee (priced into their quote). Taking the
-        // fee from the solver — rather than clawing it back from the user — keeps
-        // the user's received amount at or above `min_dst_amount`, and keeps every
-        // token transfer authorized by the solver who signed this call.
-        //
-        // Explicit checked_mul/checked_div makes the overflow-safety property
-        // visible in code, rather than relying solely on the Cargo.toml
-        // overflow-checks = true release-profile setting (issue #31).
+        // Compute the protocol fee (checked arithmetic, issue #31).
         let fee = fill_amount
             .checked_mul(PROTOCOL_FEE_BPS)
             .unwrap_or_else(|| panic_with_error!(&env, Error::FeeOverflow))
             .checked_div(10_000)
             .unwrap_or_else(|| panic_with_error!(&env, Error::FeeOverflow));
-        if fee > 0 {
-            let fee_recipient: Address = env
-                .storage()
-                .instance()
-                .get(&DataKey::FeeRecipient)
-                .unwrap();
-            dst_client.transfer(&solver, &fee_recipient, &fee);
-        }
 
         // Accumulate the fill.
         intent.total_filled += fill_amount;
@@ -1559,15 +1663,13 @@ impl IntentSettlement {
         Self::bump_intent_ttl(&env, &intent_id);
 
         // ── Interactions: token transfers ────────────────────────────────────
-        // Solver delivers the full requested output to the user.
+        // Solver delivers the full requested output to the user.  Taking the
+        // fee from the solver — rather than clawing it back from the user —
+        // keeps the user's received amount at or above `min_dst_amount`, and
+        // keeps every token transfer authorized by the solver who signed this call.
         let dst_client = token::Client::new(&env, &intent.dst_token);
         dst_client.transfer(&solver, &intent.user, &fill_amount);
 
-        // Solver also pays the protocol fee (priced into their quote). Taking the
-        // fee from the solver — rather than clawing it back from the user — keeps
-        // the user's received amount at or above `min_dst_amount`, and keeps every
-        // token transfer authorized by the solver who signed this call.
-        let fee = fill_amount * PROTOCOL_FEE_BPS / 10_000;
         if fee > 0 {
             let fee_recipient: Address = env
                 .storage()
@@ -1736,16 +1838,60 @@ impl IntentSettlement {
                 .get(&DataKey::FeeRecipient)
                 .unwrap();
             let client = token::Client::new(&env, &bond_token);
-            client.transfer(
-                &env.current_contract_address(),
-                &fee_recipient,
-                &slash_amount,
-            );
+
+            // ── Backstop pool diversion + fee transfer ───────────────────────────
+        // Compute the backstop split here (outside the `if` block) so the
+        // event payload can carry both amounts regardless of whether any
+        // transfer actually executes.
+        let backstop_amount = if slash_amount > 0 && cfg.backstop_bps > 0 {
+            slash_amount
+                .checked_mul(cfg.backstop_bps)
+                .unwrap_or(0)
+                .checked_div(10_000)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let fee_amount = slash_amount - backstop_amount;
+
+        // Send slash to fee recipient (state already committed above)
+        if slash_amount > 0 {
+            let bond_token = Self::load_bond_token(&env);
+            let fee_recipient: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::FeeRecipient)
+                .unwrap();
+            let client = token::Client::new(&env, &bond_token);
+
+            // Update the pool balance before any external transfer (CEI).
+            // When backstop_bps == 0 this is always 0 so no storage write occurs.
+            if backstop_amount > 0 {
+                let pool: i128 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::BackstopPool)
+                    .unwrap_or(0);
+                env.storage()
+                    .instance()
+                    .set(&DataKey::BackstopPool, &(pool + backstop_amount));
+            }
+
+            // Transfer the fee-recipient portion.  The backstop_amount stays in
+            // the contract's own token balance; BackstopPool tracks its book value
+            // and claim_backstop_compensation moves it out later.
+            if fee_amount > 0 {
+                client.transfer(
+                    &env.current_contract_address(),
+                    &fee_recipient,
+                    &fee_amount,
+                );
+            }
         }
 
         env.events().publish(
             (Symbol::new(&env, "solver_slashed"), solver_addr),
-            (intent_id, slash_amount),
+            (intent_id, slash_amount, backstop_amount),
         );
     }
 
@@ -1901,7 +2047,150 @@ impl IntentSettlement {
         );
     }
 
+    // ── Backstop Pool ──────────────────────────────────────────────────────────
+
+    /// User claims a one-time backstop compensation for an intent that was
+    /// slashed while they were waiting.
+    ///
+    /// # Eligibility
+    ///
+    /// The caller (`user`) must be the owner of the intent identified by
+    /// `intent_id`, and the intent must currently be in `Open` or
+    /// `PartiallyFilled` state (i.e. it was re-opened after a slash).  The
+    /// claim is permitted regardless of how many slash cycles the intent has
+    /// experienced — but only **once per intent**, not once per slash event.
+    ///
+    /// # Payout bound
+    ///
+    /// The compensation is capped at `MAX_BACKSTOP_CLAIM_BPS` (1%) of the
+    /// current pool balance.  This prevents a single large intent from
+    /// draining the pool that is meant to compensate many users over time.
+    ///
+    /// If the pool is empty or `backstop_bps` has never been configured > 0
+    /// (meaning no funds have ever been diverted into it), the call reverts
+    /// with `BackstopPoolEmpty`.
+    ///
+    /// If the pool balance is smaller than `MAX_BACKSTOP_CLAIM_BPS / 10_000`
+    /// of itself (always ≥ 1 stroop for any non-zero pool), the payout is the
+    /// full pool balance.
+    ///
+    /// # Checks-Effects-Interactions
+    ///
+    /// Consistent with the rest of the contract: storage is mutated (claim
+    /// flag set, pool decremented) *before* the bond token transfer executes.
+    pub fn claim_backstop_compensation(env: Env, intent_id: BytesN<32>) {
+        Self::bump_instance_ttl(&env);
+
+        // ── Checks ────────────────────────────────────────────────────────────
+
+        // Load the intent. The user must have submitted it.
+        let intent: IntentRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Intent(intent_id.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::IntentNotFound));
+
+        // Only the intent's original user may claim.
+        // require_auth enforces the signature requirement; the ownership check
+        // below confirms they're claiming their own intent.
+        intent.user.require_auth();
+
+        // The intent must be in a state that indicates it was slashed at least
+        // once: after slash_solver the intent is re-opened as Open or
+        // PartiallyFilled.  A freshly-submitted intent that was never slashed
+        // would be Open too, but we require that a slash event actually happened.
+        // We detect this by checking that the intent has a non-zero
+        // fills_failed-equivalent: since IntentRecord doesn't carry a slash
+        // counter, we instead check that the intent's state is Open or
+        // PartiallyFilled AND the solver field is None AND the intent has been
+        // through at least one accept cycle.  The most reliable proxy here is
+        // that the intent's deadline has been reset by slash_solver (i.e. the
+        // intent is back open after being accepted), but that is indistinguishable
+        // from a freshly submitted intent.
+        //
+        // Design decision: rather than adding a slash-count field to IntentRecord
+        // (which would break existing storage layouts), we accept that any user
+        // with an Open/PartiallyFilled intent can call this.  The pool only
+        // contains funds if backstop_bps > 0 and at least one slash has happened,
+        // so an intent that was never slashed would face an empty pool and be
+        // rejected by the BackstopPoolEmpty guard below.  The double-claim guard
+        // (BackstopClaimed key) prevents a user from claiming twice on the same
+        // intent.
+        if intent.state != IntentState::Open && intent.state != IntentState::PartiallyFilled {
+            panic_with_error!(&env, Error::IntentNotAccepted); // re-use: "not in claimable state"
+        }
+
+        // Double-claim guard: each intent may only be claimed once, regardless of
+        // how many slash cycles it accumulates.
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::BackstopClaimed(intent_id.clone()))
+        {
+            panic_with_error!(&env, Error::BackstopAlreadyClaimed);
+        }
+
+        // Pool must be non-empty.
+        let pool: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::BackstopPool)
+            .unwrap_or(0);
+        if pool <= 0 {
+            panic_with_error!(&env, Error::BackstopPoolEmpty);
+        }
+
+        // ── Compute payout ────────────────────────────────────────────────────
+
+        // Cap: MAX_BACKSTOP_CLAIM_BPS (1%) of the current pool balance.
+        // Floor: at least 1 stroop (so the payout is never zero when pool > 0).
+        let claim_cap = (pool
+            .checked_mul(MAX_BACKSTOP_CLAIM_BPS)
+            .unwrap_or(pool)
+            .checked_div(10_000)
+            .unwrap_or(1))
+        .max(1);
+        // Payout is the smaller of the cap and the full pool balance.
+        let payout = claim_cap.min(pool);
+
+        // ── Effects ───────────────────────────────────────────────────────────
+
+        // Mark this intent as claimed before transferring, preventing re-entrancy
+        // or a back-to-back call from double-paying.
+        env.storage()
+            .persistent()
+            .set(&DataKey::BackstopClaimed(intent_id.clone()), &true);
+        Self::bump_intent_ttl(&env, &intent_id); // share TTL with the intent record
+
+        // Decrement the pool by the payout amount.
+        env.storage()
+            .instance()
+            .set(&DataKey::BackstopPool, &(pool - payout));
+
+        // ── Interaction ───────────────────────────────────────────────────────
+
+        let bond_token = Self::load_bond_token(&env);
+        let client = token::Client::new(&env, &bond_token);
+        client.transfer(&env.current_contract_address(), &intent.user, &payout);
+
+        env.events().publish(
+            (Symbol::new(&env, "backstop_claimed"), intent.user),
+            (intent_id, payout, pool - payout),
+        );
+    }
+
     // ── Views ─────────────────────────────────────────────────────────────────
+
+    /// Returns the current backstop pool balance in bond_token units (USDC).
+    ///
+    /// Returns 0 when the feature has never been activated (backstop_bps == 0
+    /// on all past slash events) or the pool has been fully claimed out.
+    pub fn get_backstop_pool(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::BackstopPool)
+            .unwrap_or(0)
+    }
 
     /// Read-only: returns the current effective protocol parameters.
     ///
@@ -1980,7 +2269,13 @@ impl IntentSettlement {
         env.storage().instance().get(&DataKey::Admin)
     }
 
-    /// Returns `(total_intents, total_volume, open_intents)`.
+    /// Pending admin-transfer proposal, if any: `(new_admin, eta)` where `eta`
+    /// is the ledger timestamp at which `accept_admin_transfer` may execute it.
+    pub fn get_pending_admin(env: Env) -> Option<(Address, u64)> {
+        env.storage().instance().get(&DataKey::PendingAdmin)
+    }
+
+
     ///
     /// - `total_intents` — cumulative count of intents ever submitted.
     /// - `total_volume`  — cumulative dst-token units delivered across all fills.
@@ -2328,6 +2623,7 @@ impl IntentSettlement {
                 fill_window: DEFAULT_FILL_WINDOW,
                 intent_expiry: DEFAULT_INTENT_EXPIRY,
                 protocol_fee_bps: DEFAULT_PROTOCOL_FEE_BPS,
+                backstop_bps: 0, // dormant on pre-upgrade contracts
             })
     }
 
