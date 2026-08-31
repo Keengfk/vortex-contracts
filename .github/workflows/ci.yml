@@ -6,6 +6,37 @@ on:
   pull_request:
     branches: [main]
 
+# ── GITHUB_TOKEN permission policy ────────────────────────────────────────────
+#
+# Hardened to the minimum required by every job in this workflow.
+#
+# Why contents: read and nothing else:
+#   All jobs here only need to check out source code (contents: read).
+#   None of them write commits, create releases, post PR comments, call the
+#   Packages API, or use any other GitHub API scope.  GITHUB_STEP_SUMMARY
+#   writes are local runner file writes — not a GitHub API permission.
+#
+# Trigger coverage:
+#   For `pull_request` events from forks, GitHub already restricts the token
+#   to read-only.  For `push` to `main` from the same repo, the default token
+#   carries `contents: write`.  This explicit block overrides both trigger
+#   types and removes that unneeded write privilege.
+#
+# Future jobs that need elevated scope:
+#   Add an explicit job-level `permissions:` override with only the additional
+#   scope that job requires (e.g. `pull-requests: write` for a PR comment job).
+#   Do NOT widen the top-level block.
+#
+# Per-job audit (all trigger types, checked 2026-08-31):
+#   fmt           — checkout only                    → contents: read  ✓
+#   contract      — checkout, clippy, test           → contents: read  ✓
+#   wasm-size     — checkout, build, STEP_SUMMARY    → contents: read  ✓
+#   proptest      — checkout, cargo test             → contents: read  ✓
+#   audit         — checkout, cargo audit            → contents: read  ✓
+#   mutants       — checkout, cargo mutants          → contents: read  ✓
+permissions:
+  contents: read
+
 # Cancel in-progress runs for the same branch/PR
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -15,6 +46,7 @@ jobs:
   fmt:
     name: Formatting
     runs-on: ubuntu-latest
+    # Needs: contents: read (checkout only). Inherits workflow-level minimum.
     defaults:
       run:
         working-directory: intent_settlement
@@ -30,6 +62,7 @@ jobs:
   contract:
     name: Contract (${{ matrix.toolchain }})
     runs-on: ubuntu-latest
+    # Needs: contents: read (checkout only). Inherits workflow-level minimum.
     strategy:
       fail-fast: false
       matrix:
@@ -76,6 +109,9 @@ jobs:
   wasm-size:
     name: Wasm size budget
     runs-on: ubuntu-latest
+    # Needs: contents: read (checkout only). GITHUB_STEP_SUMMARY is a local
+    # runner file write — it does not require any GitHub API permission.
+    # Inherits workflow-level minimum.
     defaults:
       run:
         working-directory: intent_settlement
@@ -113,6 +149,7 @@ jobs:
   proptest:
     name: Bond-conservation proptest
     runs-on: ubuntu-latest
+    # Needs: contents: read (checkout only). Inherits workflow-level minimum.
     defaults:
       run:
         working-directory: intent_settlement
@@ -134,6 +171,9 @@ jobs:
   audit:
     name: Dependency audit
     runs-on: ubuntu-latest
+    # Needs: contents: read (checkout only). cargo-audit reads Cargo.lock from
+    # the checked-out tree and queries the RustSec advisory DB over HTTPS —
+    # neither operation touches the GitHub API. Inherits workflow-level minimum.
     defaults:
       run:
         working-directory: intent_settlement
@@ -152,6 +192,9 @@ jobs:
   mutants:
     name: Mutation testing
     runs-on: ubuntu-latest
+    # Needs: contents: read (checkout only). cargo-mutants mutates source in a
+    # temporary copy on the runner — no GitHub API calls. Inherits workflow-level
+    # minimum.
     defaults:
       run:
         working-directory: intent_settlement
