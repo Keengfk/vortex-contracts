@@ -1954,6 +1954,23 @@ fn partial_fill_left_incomplete_past_deadline_can_be_expired() {
 
 #[test]
 fn single_fill_at_or_above_minimum_completes_immediately() {
+    let ctx = setup();
+    let c = ctx.client();
+    ctx.register_solver();
+
+    let id = ctx.submit();
+    c.accept_intent(&ctx.solver, &id);
+
+    let fee = FILL * 5 / 10_000;
+    ctx.dst_admin().mint(&ctx.solver, &(FILL + fee));
+    c.fill_intent(&ctx.solver, &id, &FILL);
+
+    let intent = c.get_intent(&id).unwrap();
+    assert_eq!(intent.state, IntentState::Filled);
+    assert_eq!(intent.total_filled, FILL);
+    assert_eq!(intent.fill_amount, Some(FILL));
+}
+
 // ─── #29: slash_solver ordering ─────────────────────────────────────────────────
 
 /// Calling slash_solver twice on the same intent_id must fail on the second
@@ -1961,6 +1978,25 @@ fn single_fill_at_or_above_minimum_completes_immediately() {
 /// the token transfer, so the second call hits the guard immediately.
 #[test]
 fn double_slash_second_call_rejected() {
+    let ctx = setup();
+    let c = ctx.client();
+    ctx.register_solver();
+
+    let id = ctx.submit();
+    c.accept_intent(&ctx.solver, &id);
+    ctx.pass_time(FILL_WINDOW + 1);
+
+    let intent = c.get_intent(&id).unwrap();
+    assert!(intent.state == IntentState::Accepted);
+
+    c.slash_solver(&id);
+    let intent = c.get_intent(&id).unwrap();
+    assert!(intent.state == IntentState::Open);
+
+    let res = c.try_slash_solver(&id);
+    assert_eq!(res, Err(Ok(crate::Error::IntentNotAccepted.into())));
+}
+
 // ─── Issue #31: fee overflow boundary ────────────────────────────────────────────
 
 /// #31: fill_amount just above i128::MAX / PROTOCOL_FEE_BPS (5) overflows the
@@ -1976,17 +2012,11 @@ fn fill_intent_fee_overflow_returns_error() {
     let id = ctx.submit();
     c.accept_intent(&ctx.solver, &id);
 
-    ctx.pass_time(FILL_WINDOW + 1);
+    let overflow_fill: i128 = i128::MAX / 5 + 1;
 
-    // First slash succeeds.
-    c.slash_solver(&id);
-    let intent = c.get_intent(&id).unwrap();
-    assert!(intent.state == IntentState::Open);
-
-    // Second slash on the same id must be rejected: the intent is now Open,
-    // not Accepted.
-    let res = c.try_slash_solver(&id);
-    assert_eq!(res, Err(Ok(crate::Error::IntentNotAccepted.into())));
+    ctx.dst_admin().mint(&ctx.solver, &(overflow_fill + 1));
+    let res = c.try_fill_intent(&ctx.solver, &id, &overflow_fill);
+    assert_eq!(res, Err(Ok(Error::FeeOverflow.into())));
 }
 
 // ─── #47: reputation score ───────────────────────────────────────────────────────
