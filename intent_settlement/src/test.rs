@@ -1857,6 +1857,8 @@ fn slash_cooldown_expires_after_time_window() {
     let id2 = ctx.submit();
     ctx.client().accept_intent(&ctx.solver, &id2);
     assert_eq!(ctx.client().get_intent(&id2).unwrap().solver, Some(ctx.solver.clone()));
+}
+
 // ─── get_protocol_params view ────────────────────────────────────────────────────
 
 #[test]
@@ -1871,6 +1873,8 @@ fn get_protocol_params_returns_current_constants() {
     assert_eq!(params.fill_window, FILL_WINDOW);
     assert_eq!(params.intent_expiry, INTENT_EXPIRY);
     assert_eq!(params.protocol_fee_bps, PROTOCOL_FEE_BPS);
+}
+
 // ─── Partial fills ───────────────────────────────────────────────────────────────
 
 #[test]
