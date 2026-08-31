@@ -1364,10 +1364,12 @@ impl IntentSettlement {
         // `now >= intent.deadline` rejects at the boundary second (`now == deadline`)
         // so the full [created_at, deadline) half-open window is available for solvers.
         if now >= intent.deadline {
-            env.storage()
-                .persistent()
-                .set(&DataKey::Intent(intent_id.clone()), &intent);
-            Self::bump_intent_ttl(&env, &intent_id);
+            // Note: no storage write is performed here.  Soroban discards all
+            // state mutations made during a panicking invocation, so any
+            // `.set()` or `bump_intent_ttl` call immediately before
+            // `panic_with_error!` would be a dead write that never commits.
+            // The durable `Open → Expired` transition is handled exclusively
+            // by `expire_intent`.
             panic_with_error!(&env, Error::IntentExpired);
         }
 

@@ -1213,6 +1213,49 @@ fn accept_expired_intent_fails() {
     assert_eq!(res, Err(Ok(Error::IntentExpired.into())));
 }
 
+/// Regression test: accept_intent's expiry branch panics with IntentExpired
+/// and must NOT persist any state change.  Soroban discards all storage
+/// writes made during a panicking invocation, so a get_intent call after the
+/// failed accept must still report the original Open state — not Expired.
+///
+/// This guards against the dead-write pattern removed in the cleanup tracked
+/// by docs/111-expire-intent-event-coverage.md: even if a `.set()` call were
+/// re-introduced immediately before the panic, it would still not commit, but
+/// the test makes the expected observable behavior explicit so any regression
+/// is caught immediately.
+#[test]
+fn accept_expired_intent_state_unchanged() {
+    let ctx = setup();
+    ctx.register_solver();
+    let id = ctx.submit();
+
+    // Advance past the intent deadline so accept_intent will hit the expiry branch.
+    ctx.pass_time(INTENT_EXPIRY + 1);
+
+    // The call must fail with IntentExpired.
+    let res = ctx.client().try_accept_intent(&ctx.solver, &id);
+    assert_eq!(res, Err(Ok(Error::IntentExpired.into())));
+
+    // Because Soroban discards all writes from a panicking invocation, the
+    // stored intent state must remain Open — exactly as it was before the
+    // failed accept attempt.
+    let intent = ctx
+        .client()
+        .get_intent(&id)
+        .expect("intent must still exist after failed accept");
+    assert_eq!(
+        intent.state,
+        IntentState::Open,
+        "failed accept_intent must not mutate intent state: expected Open, got {:?}",
+        intent.state
+    );
+    // The solver field must also remain unset — no partial write committed.
+    assert!(
+        intent.solver.is_none(),
+        "failed accept_intent must not set intent.solver"
+    );
+}
+
 #[test]
 fn cannot_accept_already_accepted_intent() {
     let ctx = setup();
