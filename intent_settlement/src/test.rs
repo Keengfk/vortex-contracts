@@ -380,6 +380,8 @@ fn pauser_cannot_unpause() {
         "unpause must require admin auth, not the pauser; got: {:?}",
         auths
     );
+}
+
 #[test]
 fn pause_blocks_fill_intent() {
     let ctx = setup();
@@ -1855,6 +1857,8 @@ fn slash_cooldown_expires_after_time_window() {
     let id2 = ctx.submit();
     ctx.client().accept_intent(&ctx.solver, &id2);
     assert_eq!(ctx.client().get_intent(&id2).unwrap().solver, Some(ctx.solver.clone()));
+}
+
 // ─── get_protocol_params view ────────────────────────────────────────────────────
 
 #[test]
@@ -1869,6 +1873,7 @@ fn get_protocol_params_returns_current_constants() {
     assert_eq!(params.fill_window, FILL_WINDOW);
     assert_eq!(params.intent_expiry, INTENT_EXPIRY);
     assert_eq!(params.protocol_fee_bps, PROTOCOL_FEE_BPS);
+}
 // ─── Partial fills ───────────────────────────────────────────────────────────────
 
 #[test]
@@ -1948,6 +1953,14 @@ fn partial_fill_left_incomplete_past_deadline_can_be_expired() {
 
 #[test]
 fn single_fill_at_or_above_minimum_completes_immediately() {
+    let ctx = setup();
+    ctx.register_solver();
+    let id = ctx.submit();
+    ctx.client().accept_intent(&ctx.solver, &id);
+    ctx.client().fill_intent(&ctx.solver, &id, &SRC_AMT);
+    assert_eq!(ctx.client().get_intent(&id).unwrap().state, IntentState::Filled);
+}
+
 // ─── #29: slash_solver ordering ─────────────────────────────────────────────────
 
 /// Calling slash_solver twice on the same intent_id must fail on the second
@@ -1955,6 +1968,15 @@ fn single_fill_at_or_above_minimum_completes_immediately() {
 /// the token transfer, so the second call hits the guard immediately.
 #[test]
 fn double_slash_second_call_rejected() {
+    let ctx = setup();
+    ctx.register_solver();
+    let id = ctx.submit();
+    ctx.client().accept_intent(&ctx.solver, &id);
+    ctx.pass_time(FILL_WINDOW + 1);
+    ctx.client().slash_solver(&id);
+    let res = ctx.client().try_slash_solver(&id);
+    assert_eq!(res, Err(Ok(Error::IntentNotAccepted.into())));
+}
 // ─── Issue #31: fee overflow boundary ────────────────────────────────────────────
 
 /// #31: fill_amount just above i128::MAX / PROTOCOL_FEE_BPS (5) overflows the
@@ -2871,3 +2893,128 @@ fn unknown_chain_bypasses_token_format_validation() {
         &deadline,
     );
 }
+
+// ─── Multi-Issue Hardening Unit & Regression Tests (#265, #268, #266, #267) ─────
+
+/// Issue #265: rescue_tokens refuses to move bond_token.
+#[test]
+fn test_rescue_tokens_refuses_bond_token() {
+    let ctx = setup();
+    let recipient = Address::generate(&ctx.env);
+    let res = ctx.client().try_rescue_tokens(&ctx.bond_token, &recipient, &100);
+    assert_eq!(res, Err(Ok(Error::RescueProtectedToken.into())));
+}
+
+/// Issue #268: slash_solver caller rebate payout and fee recipient share.
+#[test]
+fn test_slash_solver_caller_rebate() {
+    let ctx = setup();
+    ctx.register_solver();
+
+    let id = ctx.submit();
+    ctx.client().accept_intent(&ctx.solver, &id);
+
+    ctx.pass_time(FILL_WINDOW + 1);
+
+    let caller = Address::generate(&ctx.env);
+    let bond_client = token::Client::new(&ctx.env, &ctx.bond_token);
+
+    let caller_balance_before = bond_client.balance(&caller);
+    let fee_recipient_balance_before = bond_client.balance(&ctx.fee_recipient);
+
+    ctx.env.mock_all_auths();
+    ctx.client().slash_solver(&id);
+
+    // Initial bond was MIN_BOND (500_000_000). 10% slash = 50_000_000.
+    // 5% caller rebate = 50_000_000 / 20 = 2_500_000.
+    // Fee recipient share = 50_000_000 - 2_500_000 = 47_500_000.
+    let solver_rec = ctx.client().get_solver(&ctx.solver).unwrap();
+    assert_eq!(solver_rec.bond_amount, MIN_BOND - 50_000_000);
+
+    let fee_recipient_balance_after = bond_client.balance(&ctx.fee_recipient);
+    assert_eq!(
+        fee_recipient_balance_after - fee_recipient_balance_before,
+        47_500_000
+    );
+}
+
+/// Issue #266: dst_token allowlist removal does not disrupt in-flight intent fills.
+#[test]
+fn test_remove_dst_token_in_flight_intent_fill() {
+    let ctx = setup();
+    let c = ctx.client();
+    ctx.register_solver();
+
+    c.add_dst_token(&ctx.dst_token);
+    c.set_dst_allowlist_enabled(&true);
+
+    let id = ctx.submit();
+    c.accept_intent(&ctx.solver, &id);
+
+    // Propose and execute removal of dst_token while intent is Accepted
+    c.propose_remove_dst_token(&ctx.dst_token);
+    ctx.pass_time(ADMIN_TIMELOCK_DELAY + 1);
+    c.execute_remove_dst_token(&ctx.dst_token);
+
+    assert!(!c.is_dst_token_allowed(&ctx.dst_token));
+
+    // Fill intent succeeds despite token being removed from allowlist
+    c.fill_intent(&ctx.solver, &id, &SRC_AMT);
+    assert_eq!(c.get_intent(&id).unwrap().state, IntentState::Filled);
+}
+
+/// Issue #266: dst_token allowlist removal blocks new submissions.
+#[test]
+fn test_remove_dst_token_blocks_new_submissions() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    c.add_dst_token(&ctx.dst_token);
+    c.set_dst_allowlist_enabled(&true);
+
+    c.propose_remove_dst_token(&ctx.dst_token);
+    ctx.pass_time(ADMIN_TIMELOCK_DELAY + 1);
+    c.execute_remove_dst_token(&ctx.dst_token);
+
+    let deadline: Option<u64> = None;
+    let res = c.try_submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "ethereum"),
+        &String::from_str(&ctx.env, "0x1234567890123456789012345678901234567890"),
+        &SRC_AMT,
+        &ctx.dst_token,
+        &MIN_DST,
+        &deadline,
+    );
+    assert_eq!(res, Err(Ok(Error::DstTokenNotAllowed.into())));
+}
+
+/// Issue #267: Nonce guarantees unique compute_intent_id within same ledger block.
+#[test]
+fn test_compute_intent_id_nonce_uniqueness() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    let deadline: Option<u64> = None;
+    let id1 = c.submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "ethereum"),
+        &String::from_str(&ctx.env, "0x1234567890123456789012345678901234567890"),
+        &SRC_AMT,
+        &ctx.dst_token,
+        &MIN_DST,
+        &deadline,
+    );
+    let id2 = c.submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "ethereum"),
+        &String::from_str(&ctx.env, "0x1234567890123456789012345678901234567890"),
+        &SRC_AMT,
+        &ctx.dst_token,
+        &MIN_DST,
+        &deadline,
+    );
+
+    assert_ne!(id1, id2);
+}
+
