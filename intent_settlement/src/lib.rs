@@ -28,6 +28,7 @@ const PROTOCOL_FEE_BPS: i128 = 5; // 0.05%
 /// competing quotes via `bid_intent`; the best quote wins once the window
 /// closes.
 const BID_WINDOW: u64 = 120; // 2 minutes
+const CANCEL_COOLDOWN: u64 = 3600; // 1 hour — minimum time between user cancellations
 
 /// Delay enforced between proposing and executing a sensitive admin change
 /// (admin transfer, fee recipient handover, dst_token allowlist changes).
