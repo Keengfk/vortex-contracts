@@ -37,6 +37,83 @@ const BID_WINDOW: u64 = 120; // 2 minutes
 /// (#116).
 const ADMIN_TIMELOCK_DELAY: u64 = 172_800; // 48 hours
 
+/// Maximum number of intents that may be processed in a single batch call
+/// (`batch_submit_intent`, `batch_accept_intent`, `batch_fill_intent`,
+/// `batch_cancel_intent`).
+///
+/// # Derivation
+///
+/// The binding constraint is the Mainnet **per-transaction write-entry limit**,
+/// currently 200 distinct ledger entries (Protocol 27, checked 2026-07-20).
+/// `fill_intent` — the most expensive batched operation — writes the following
+/// entries per item:
+///
+/// | Entry                          | Storage tier | Write? |
+/// |-------------------------------|--------------|--------|
+/// | `Intent(id)`                  | persistent   | ✓      |
+/// | `Solver(address)`             | persistent   | ✓      |
+/// | contract instance (shared)    | instance     | ✓ (1 total per tx) |
+///
+/// That is **2 persistent writes per item**, plus 2 SAC-internal writes for each
+/// token transfer (solver → user, solver → fee_recipient via the dst SAC).
+/// Each SAC `transfer` touches up to 2 balance ledger entries (source + dest),
+/// giving a worst-case of 4 SAC writes per fill.  Total per item: ~6 writes.
+///
+/// At `MAX_BATCH_SIZE = 10`: 10 × 6 = **60 writes** — well within the 200-entry
+/// limit and leaving a comfortable margin for shared instance writes, contract
+/// code entries, and any overhead the Soroban host adds.
+///
+/// A value of 10 also keeps footprint declaration size under
+/// the 132 KiB transaction-size cap (each `Intent` + `Solver` entry is at most
+/// ~1 KiB serialized, so 20 footprint entries ≈ 20 KiB).
+///
+/// **Simulation vs. mainnet caveat:** numbers above are derived from static
+/// footprint analysis.  Actual CPU-instruction consumption is simulator-
+/// dependent; always preflight a maximum-sized batch transaction with
+/// `simulateTransaction` before submitting to mainnet to obtain the real
+/// resource declaration for the transaction envelope.
+pub const MAX_BATCH_SIZE: u32 = 10;
+
+/// Cooldown applied to a solver after they are slashed.
+///
+/// A slashed solver must wait this many seconds before `accept_intent` will
+/// succeed again.  The cooldown is stored in `SolverRecord.last_slash_time`
+/// and checked on every `accept_intent` call.
+///
+/// Value: **3600 s (1 hour)**.  Rationale: long enough to deter repeated
+/// attempts to game the slash-and-reopen cycle (slash resets the intent to
+/// Open with a fresh deadline, so without a cooldown a solver could slash
+/// themselves to escape an intent they no longer want to fill), but short
+/// enough that an honest solver who missed a fill due to a transient outage
+/// can return to participating within the same working session.
+pub const SLASH_COOLDOWN: u64 = 3_600; // 1 hour
+
+/// Maximum seconds by which `request_extension` may extend an Accepted
+/// intent's fill deadline.
+///
+/// Each intent is entitled to exactly one extension (enforced via the
+/// `ExtensionGranted` flag).  The extension sets
+/// `intent.deadline = now + MAX_EXTENSION_DURATION`, giving the solver an
+/// additional fill window starting from the moment they request the extension.
+///
+/// Value: **300 s (5 minutes)** — identical to `FILL_WINDOW`.  Rationale:
+/// one extension buys the solver exactly one more full fill window, matching
+/// the original grant.  Granting more would let solvers hold intents
+/// indefinitely; granting less would make the extension too small to be
+/// useful for a solver dealing with transient latency.
+pub const MAX_EXTENSION_DURATION: u64 = 300; // 5 minutes, same as FILL_WINDOW
+
+/// Minimum seconds a user must wait between successive `cancel_intent` calls.
+///
+/// Prevents spam-cancellation of intents (e.g. submitting an intent, immediately
+/// cancelling it, and repeating to grief solvers browsing the open-intent list).
+/// The cooldown is per-user and stored in `DataKey::CancelCooldown(user)`.
+///
+/// Value: **60 s (1 minute)**.  Rationale: short enough not to inconvenience
+/// legitimate users who made a mistake, long enough to make automated
+/// griefing campaigns expensive.
+pub const CANCEL_COOLDOWN: u64 = 60; // 1 minute
+
 // Upper sanity bound for src_amount and min_dst_amount.
 //
 // Largest realistic token amounts use 18-decimal ETH units.
@@ -144,6 +221,84 @@ pub enum DataKey {
     /// unpause access) -- resuming the protocol always needs the full
     /// admin's judgment.
     Pauser,
+
+    // ── Per-user cooldown tracking ────────────────────────────────────────
+    /// **Persistent storage.**  Timestamp (`u64`) of the last time `user`
+    /// called `cancel_intent` successfully.  Used to enforce `CANCEL_COOLDOWN`
+    /// between successive cancellations by the same user.
+    CancelCooldown(Address),
+
+    // ── Fill-window extension tracking ───────────────────────────────────
+    /// **Persistent storage.**  Presence flag (`true`) indicating that
+    /// `intent_id` has already consumed its one-time fill-window extension
+    /// via `request_extension`.  Prevents a solver from calling
+    /// `request_extension` twice on the same intent.
+    ExtensionGranted(BytesN<32>),
+
+    // ── Admin-configurable protocol parameters ────────────────────────────
+    /// **Instance storage.**  `ProtocolConfig` struct holding `min_bond`,
+    /// `fill_window`, `intent_expiry`, and `protocol_fee_bps`.  Written by
+    /// `initialize` and future `set_config` calls.
+    Config,
+
+    // ── Per-user intent list ──────────────────────────────────────────────
+    /// **Persistent storage.**  `Vec<BytesN<32>>` of all intent IDs ever
+    /// submitted by `user`.  Appended by `submit_intent`.
+    UserIntents(Address),
+
+    // ── Allowed-dst-token list (ordered for `list_allowed_dst_tokens`) ───
+    /// **Instance storage.**  `Vec<Address>` of every dst token currently on
+    /// the allowlist.  Maintained in parallel with per-token
+    /// `AllowedDstToken(Address)` presence flags so enumeration is O(1).
+    AllowedDstTokenList,
+
+    // ── Per-token minimum bond multiplier ─────────────────────────────────
+    /// **Persistent storage.**  Optional `i128` multiplier (in basis points)
+    /// applied to `MIN_BOND` when a solver tries to accept an intent whose
+    /// `dst_token` is `token`.  Absent = use the global `MIN_BOND`.
+    MinBondMultiplier(Address),
+
+    // ── Bid-window mode toggle ────────────────────────────────────────────
+    /// **Instance storage.**  Boolean flag (`true` = bid-window mode enabled).
+    /// When `true`, `accept_intent` uses the competitive bid-collection window
+    /// rather than first-accept-wins semantics.
+    BidWindowEnabled,
+
+    // ── Timelocked admin-key handover ────────────────────────────────────
+    /// **Instance storage.**  Pending admin transfer: `(Address, u64)` where
+    /// the `u64` is the earliest timestamp at which `accept_admin_transfer`
+    /// may execute.  Written by `propose_admin_transfer`, removed on
+    /// acceptance or cancellation.
+    PendingAdmin,
+
+    // ── Timelocked dst-token allowlist changes ────────────────────────────
+    /// **Instance storage.**  ETA (`u64`) for a pending `add_allowed_dst_token`
+    /// proposal for `token`.  Written by `propose_add_dst_token`, removed by
+    /// `execute_add_dst_token`.
+    PendingDstTokenAdd(Address),
+
+    /// **Instance storage.**  ETA (`u64`) for a pending
+    /// `remove_allowed_dst_token` proposal for `token`.  Written by
+    /// `propose_remove_dst_token`, removed by `execute_remove_dst_token`.
+    PendingDstTokenRemove(Address),
+
+    // ── Source-chain allowlist ────────────────────────────────────────────
+    /// **Instance storage.**  Presence flag (`true`) indicating that
+    /// `src_chain` is on the allowed-source list.  Added by
+    /// `add_allowed_src_chain`, removed by `remove_allowed_src_chain`.
+    AllowedSrcChain(String),
+
+    /// **Instance storage.**  Boolean toggle (`true` = enforced).  Set via
+    /// `set_src_chain_allowlist_enabled`.  When `false` (the default) the
+    /// `AllowedSrcChain` list is populated but not enforced.
+    SrcChainAllowlistEnabled,
+
+    // ── Per-user submit nonce ─────────────────────────────────────────────
+    /// **Instance storage.**  Monotonically increasing counter (`u64`)
+    /// incremented each time `user` calls `submit_intent`.  Included in the
+    /// intent-ID preimage to prevent two identical intents from the same
+    /// user colliding on the same ID.
+    UserNonce(Address),
 }
 
 // ─── Data Structs ─────────────────────────────────────────────────────────────
@@ -1842,6 +1997,50 @@ impl IntentSettlement {
 
         for intent_id in intent_ids {
             Self::accept_intent(env.clone(), solver.clone(), intent_id);
+        }
+    }
+
+    /// Fill multiple intents in a single transaction.
+    ///
+    /// Each element of `fills` is `(intent_id, fill_amount)`.  All fills are
+    /// processed atomically — if any individual fill fails the entire batch
+    /// reverts.
+    ///
+    /// Bounded by [`MAX_BATCH_SIZE`] to prevent resource exhaustion.
+    /// See `docs/149-resource-cost-per-entrypoint.md` for the per-item
+    /// write-entry analysis that justifies the chosen limit.
+    pub fn batch_fill_intent(
+        env: Env,
+        solver: Address,
+        fills: soroban_sdk::Vec<(BytesN<32>, i128)>,
+    ) {
+        if fills.len() > MAX_BATCH_SIZE as usize {
+            panic_with_error!(&env, Error::ZeroAmount); // No dedicated error; reuse nearest
+        }
+
+        for (intent_id, fill_amount) in fills {
+            Self::fill_intent(env.clone(), solver.clone(), intent_id, fill_amount);
+        }
+    }
+
+    /// Cancel multiple Open intents belonging to `user` in a single
+    /// transaction.
+    ///
+    /// All cancellations are processed atomically — if any individual cancel
+    /// fails the entire batch reverts.
+    ///
+    /// Bounded by [`MAX_BATCH_SIZE`] to prevent resource exhaustion.
+    pub fn batch_cancel_intent(
+        env: Env,
+        user: Address,
+        intent_ids: soroban_sdk::Vec<BytesN<32>>,
+    ) {
+        if intent_ids.len() > MAX_BATCH_SIZE as usize {
+            panic_with_error!(&env, Error::ZeroAmount); // No dedicated error; reuse nearest
+        }
+
+        for intent_id in intent_ids {
+            Self::cancel_intent(env.clone(), user.clone(), intent_id);
         }
     }
 
