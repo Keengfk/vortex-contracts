@@ -9,6 +9,9 @@ use crate::{
     DataKey, Error, IntentSettlement, IntentSettlementClient, IntentState, SolverRecord,
     FILL_WINDOW, INTENT_EXPIRY, MIN_BOND, ADMIN_TIMELOCK_DELAY,
 };
+// Issue #190: proof-gated fill tests drive the real ProofRegistry contract and
+// inject records through its `mock_set_proof` testutils entry-point.
+use vortex_proof_registry::{ProofRecord, ProofRegistry, ProofRegistryClient};
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
     token, Address, BytesN, Env, String, Symbol,
@@ -144,6 +147,49 @@ fn cannot_initialize_twice() {
     assert_eq!(res, Err(Ok(Error::AlreadyInitialized.into())));
 }
 
+/// Issue #148: a second `initialize` call must be rejected *and* must not
+/// mutate any of the addresses recorded by the first call.
+///
+/// `cannot_initialize_twice` above only re-passes the original arguments, so it
+/// cannot catch an implementation that accepts the second call and silently
+/// overwrites `Admin` / `FeeRecipient` / `BondToken`. Here the second call
+/// supplies three brand-new, distinct addresses; we assert it fails with
+/// `AlreadyInitialized` and that every stored address still equals the value
+/// from the first call.
+#[test]
+fn initialize_rejects_second_call_and_keeps_original_config() {
+    let ctx = setup();
+
+    // Snapshot the state established by `setup()`'s first `initialize`.
+    let admin_before = ctx.client().get_admin();
+    let fee_recipient_before = ctx.client().get_fee_recipient();
+    let bond_token_before = ctx.client().get_bond_token();
+    assert_eq!(admin_before, Some(ctx.admin.clone()));
+    assert_eq!(fee_recipient_before, Some(ctx.fee_recipient.clone()));
+    assert_eq!(bond_token_before, Some(ctx.bond_token.clone()));
+
+    // Attempt a second initialization with entirely different parameters.
+    let other_admin = Address::generate(&ctx.env);
+    let other_fee_recipient = Address::generate(&ctx.env);
+    let other_bond_token = ctx
+        .env
+        .register_stellar_asset_contract_v2(other_admin.clone())
+        .address();
+    assert_ne!(other_admin, ctx.admin);
+    assert_ne!(other_fee_recipient, ctx.fee_recipient);
+    assert_ne!(other_bond_token, ctx.bond_token);
+
+    let res = ctx
+        .client()
+        .try_initialize(&other_admin, &other_fee_recipient, &other_bond_token);
+    assert_eq!(res, Err(Ok(Error::AlreadyInitialized.into())));
+
+    // Nothing was reset: the rejected call had no side effects.
+    assert_eq!(ctx.client().get_admin(), admin_before);
+    assert_eq!(ctx.client().get_fee_recipient(), fee_recipient_before);
+    assert_eq!(ctx.client().get_bond_token(), bond_token_before);
+}
+
 // ─── Admin ──────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -181,7 +227,7 @@ fn admin_can_propose_and_accept_fee_recipient() {
     c.accept_intent(&ctx.solver, &id);
     let fee = FILL * 5 / 10_000;
     ctx.dst_admin().mint(&ctx.solver, &(FILL + fee));
-    c.fill_intent(&ctx.solver, &id, &FILL);
+    c.fill_intent(&ctx.solver, &id, &FILL, &false);
     assert_eq!(ctx.dst().balance(&new_recipient), fee);
 }
 
@@ -392,7 +438,7 @@ fn pause_blocks_fill_intent() {
 
     let fee = FILL * 5 / 10_000;
     ctx.dst_admin().mint(&ctx.solver, &(FILL + fee));
-    let res = c.try_fill_intent(&ctx.solver, &id, &FILL);
+    let res = c.try_fill_intent(&ctx.solver, &id, &FILL, &false);
     assert_eq!(res, Err(Ok(Error::ContractPaused.into())));
 }
 
@@ -444,7 +490,7 @@ fn pause_blocks_submit_accept_fill_but_allows_cancel_and_slash() {
 
     let fee = FILL * 5 / 10_000;
     ctx.dst_admin().mint(&ctx.solver, &(FILL + fee));
-    let res = c.try_fill_intent(&ctx.solver, &id, &FILL);
+    let res = c.try_fill_intent(&ctx.solver, &id, &FILL, &false);
     assert_eq!(res, Err(Ok(Error::ContractPaused.into())));
 
     // Test allowed operations
@@ -801,7 +847,7 @@ fn active_intents_counts_multiple_concurrent_accepted_intents() {
     // Clearing one via fill decrements the counter but doesn't zero it.
     let fee = FILL * 5 / 10_000;
     ctx.dst_admin().mint(&ctx.solver, &(FILL + fee));
-    c.fill_intent(&ctx.solver, &id1, &FILL);
+    c.fill_intent(&ctx.solver, &id1, &FILL, &false);
     assert_eq!(c.get_solver(&ctx.solver).unwrap().active_intents, 1);
     let res = c.try_deregister_solver(&ctx.solver);
     assert_eq!(res, Err(Ok(Error::SolverHasActiveIntents.into())));
@@ -823,7 +869,7 @@ fn deregister_after_fill_succeeds() {
 
     let fee = FILL * 5 / 10_000;
     ctx.dst_admin().mint(&ctx.solver, &(FILL + fee));
-    c.fill_intent(&ctx.solver, &id, &FILL);
+    c.fill_intent(&ctx.solver, &id, &FILL, &false);
 
     // Obligation cleared on fill, so deregistration now succeeds.
     c.deregister_solver(&ctx.solver);
@@ -1121,7 +1167,7 @@ fn full_lifecycle_submit_accept_fill() {
     // Fill — fund the solver with the output plus the protocol fee they pay.
     let fee = FILL * 5 / 10_000;
     ctx.dst_admin().mint(&ctx.solver, &(FILL + fee));
-    c.fill_intent(&ctx.solver, &id, &FILL);
+    c.fill_intent(&ctx.solver, &id, &FILL, &false);
 
     let intent = c.get_intent(&id).unwrap();
     assert!(intent.state == IntentState::Filled);
@@ -1155,7 +1201,7 @@ fn get_stats_reflects_cumulative_totals_across_multiple_fills() {
     c.accept_intent(&ctx.solver, &id1);
     let fee1 = FILL * 5 / 10_000;
     ctx.dst_admin().mint(&ctx.solver, &(FILL + fee1));
-    c.fill_intent(&ctx.solver, &id1, &FILL);
+    c.fill_intent(&ctx.solver, &id1, &FILL, &false);
 
     let (total_intents, total_volume) = c.get_stats();
     assert_eq!(total_intents, 1);
@@ -1167,7 +1213,7 @@ fn get_stats_reflects_cumulative_totals_across_multiple_fills() {
     let fill2 = 200 * 10_000_000;
     let fee2 = fill2 * 5 / 10_000;
     ctx.dst_admin().mint(&ctx.solver, &(fill2 + fee2));
-    c.fill_intent(&ctx.solver, &id2, &fill2);
+    c.fill_intent(&ctx.solver, &id2, &fill2, &false);
 
     let (total_intents, total_volume) = c.get_stats();
     assert_eq!(total_intents, 2);
@@ -1266,7 +1312,7 @@ fn fill_zero_amount_fails() {
     let id = ctx.submit();
     ctx.client().accept_intent(&ctx.solver, &id);
 
-    let res = ctx.client().try_fill_intent(&ctx.solver, &id, &0);
+    let res = ctx.client().try_fill_intent(&ctx.solver, &id, &0, &false);
     assert_eq!(res, Err(Ok(Error::ZeroAmount.into())));
 }
 
@@ -1279,7 +1325,7 @@ fn fill_after_window_fails() {
 
     ctx.pass_time(FILL_WINDOW + 1);
     ctx.dst_admin().mint(&ctx.solver, &FILL);
-    let res = ctx.client().try_fill_intent(&ctx.solver, &id, &FILL);
+    let res = ctx.client().try_fill_intent(&ctx.solver, &id, &FILL, &false);
     assert_eq!(res, Err(Ok(Error::FillWindowExpired.into())));
 }
 
@@ -1295,7 +1341,7 @@ fn fill_by_wrong_solver_fails() {
     ctx.client().register_solver(&other, &BOND);
     ctx.dst_admin().mint(&other, &FILL);
 
-    let res = ctx.client().try_fill_intent(&other, &id, &FILL);
+    let res = ctx.client().try_fill_intent(&other, &id, &FILL, &false);
     assert_eq!(res, Err(Ok(Error::Unauthorized.into())));
 }
 
@@ -1713,7 +1759,7 @@ fn fill_intent_state_committed_before_transfer_and_double_fill_rejected() {
     ctx.dst_admin().mint(&ctx.solver, &(FILL + fee));
 
     // Happy-path fill.
-    c.fill_intent(&ctx.solver, &id, &FILL);
+    c.fill_intent(&ctx.solver, &id, &FILL, &false);
 
     // 1. Storage reflects Filled and fill_amount is set.
     let intent = c.get_intent(&id).unwrap();
@@ -1728,7 +1774,7 @@ fn fill_intent_state_committed_before_transfer_and_double_fill_rejected() {
     // 3. A second fill attempt is rejected before any transfer — this is exactly
     //    what a re-entrant token would hit mid-transfer after the CEI reorder.
     ctx.dst_admin().mint(&ctx.solver, &(FILL + fee)); // give solver funds again
-    let res = c.try_fill_intent(&ctx.solver, &id, &FILL);
+    let res = c.try_fill_intent(&ctx.solver, &id, &FILL, &false);
     assert_eq!(res, Err(Ok(Error::IntentAlreadyFilled.into())));
 
     // User's balance must not have increased — no double-payment.
@@ -1885,7 +1931,7 @@ fn two_partial_fills_complete_intent() {
     let fee1 = half * 5 / 10_000;
     ctx.dst_admin().mint(&ctx.solver, &(half + fee1));
     c.accept_intent(&ctx.solver, &id);
-    c.fill_intent(&ctx.solver, &id, &half);
+    c.fill_intent(&ctx.solver, &id, &half, &false);
 
     // Intent should now be PartiallyFilled and re-opened (solver reset).
     let intent = c.get_intent(&id).unwrap();
@@ -1901,7 +1947,7 @@ fn two_partial_fills_complete_intent() {
     let fee2 = remainder * 5 / 10_000;
     ctx.dst_admin().mint(&ctx.solver, &(remainder + fee2));
     c.accept_intent(&ctx.solver, &id);
-    c.fill_intent(&ctx.solver, &id, &remainder);
+    c.fill_intent(&ctx.solver, &id, &remainder, &false);
 
     let intent = c.get_intent(&id).unwrap();
     assert_eq!(intent.state, IntentState::Filled);
@@ -1930,7 +1976,7 @@ fn partial_fill_left_incomplete_past_deadline_can_be_expired() {
     let fee = partial * 5 / 10_000;
     ctx.dst_admin().mint(&ctx.solver, &(partial + fee));
     c.accept_intent(&ctx.solver, &id);
-    c.fill_intent(&ctx.solver, &id, &partial);
+    c.fill_intent(&ctx.solver, &id, &partial, &false);
 
     // Intent is PartiallyFilled and re-opened with a fresh INTENT_EXPIRY deadline.
     assert_eq!(
@@ -2086,7 +2132,7 @@ fn get_reputation_score_after_fill_is_nonzero() {
     c.accept_intent(&ctx.solver, &id);
     let fee = FILL * 5 / 10_000;
     ctx.dst_admin().mint(&ctx.solver, &(FILL + fee));
-    c.fill_intent(&ctx.solver, &id, &FILL);
+    c.fill_intent(&ctx.solver, &id, &FILL, &false);
 
     let score = c.get_reputation_score(&ctx.solver).unwrap();
     assert!(score > 0, "score after fill should be > 0");
@@ -2099,7 +2145,7 @@ fn get_reputation_score_after_fill_is_nonzero() {
     // rolls back on panic_with_error, so the user's balance stays zero).
     ctx.dst_admin().mint(&ctx.solver, &overflow_fill);
 
-    let res = c.try_fill_intent(&ctx.solver, &id, &overflow_fill);
+    let res = c.try_fill_intent(&ctx.solver, &id, &overflow_fill, &false);
     assert_eq!(res, Err(Ok(Error::FeeOverflow.into())));
 }
 
@@ -2118,7 +2164,7 @@ fn fill_intent_fee_at_boundary_does_not_overflow() {
     ctx.dst_admin().mint(&ctx.solver, &(boundary_fill + fee));
 
     // Should succeed (no overflow).
-    c.fill_intent(&ctx.solver, &id, &boundary_fill);
+    c.fill_intent(&ctx.solver, &id, &boundary_fill, &false);
     assert!(c.get_intent(&id).unwrap().state == IntentState::Filled);
 }
 
@@ -2434,7 +2480,7 @@ fn unpause_restores_solver_bond_management() {
     let fee = MIN_DST * 5 / 10_000;
     ctx.dst_admin().mint(&ctx.solver, &(MIN_DST + fee));
     c.accept_intent(&ctx.solver, &id);
-    c.fill_intent(&ctx.solver, &id, &MIN_DST);
+    c.fill_intent(&ctx.solver, &id, &MIN_DST, &false);
 
     let intent = c.get_intent(&id).unwrap();
     assert_eq!(intent.state, IntentState::Filled);
@@ -2870,4 +2916,141 @@ fn unknown_chain_bypasses_token_format_validation() {
         &MIN_DST,
         &deadline,
     );
+}
+
+// ─── Proof-gated fills (issue #190, docs/129-proof-mismatch-fallback.md) ─────
+
+/// Deploy a `ProofRegistry`, initialise it, and point the settlement contract
+/// at it via `set_proof_registry`. Returns the registry address.
+fn deploy_proof_registry(ctx: &Ctx) -> Address {
+    // The Wormhole Core address is irrelevant here — these tests inject proofs
+    // through `mock_set_proof`, which never touches the verification path.
+    let wormhole_core = Address::generate(&ctx.env);
+    let reg_id = ctx.env.register_contract(None, ProofRegistry);
+    ProofRegistryClient::new(&ctx.env, &reg_id).initialize(&ctx.admin, &wormhole_core);
+    ctx.client().set_proof_registry(&reg_id);
+    reg_id
+}
+
+/// Inject a proof record for `intent_id` into the registry at `reg_id`.
+fn set_proof(ctx: &Ctx, reg_id: &Address, intent_id: &BytesN<32>, src_chain_id: u32, src_amount: i128) {
+    ProofRegistryClient::new(&ctx.env, reg_id).mock_set_proof(&ProofRecord {
+        intent_id: intent_id.clone(),
+        src_user: String::from_str(&ctx.env, "0x0000000000000000000000000000000000000000"),
+        src_chain_id,
+        src_token: String::from_str(&ctx.env, "0x0000000000000000000000000000000000000000"),
+        src_amount,
+        vaa_sequence: 1,
+        received_at: 0,
+    });
+}
+
+/// Register the solver, submit a standard `"ethereum"` intent (Wormhole chain
+/// id 2), accept it, and mint the solver enough dst token to fill + fee.
+fn accepted_intent(ctx: &Ctx) -> BytesN<32> {
+    ctx.register_solver();
+    let id = ctx.submit();
+    ctx.client().accept_intent(&ctx.solver, &id);
+    let fee = FILL * 5 / 10_000;
+    ctx.dst_admin().mint(&ctx.solver, &(FILL + fee));
+    id
+}
+
+/// `require_proof = false` behaves exactly as before — no registry needed.
+#[test]
+fn proof_gate_off_leaves_behaviour_unchanged() {
+    let ctx = setup();
+    let id = accepted_intent(&ctx);
+    ctx.client().fill_intent(&ctx.solver, &id, &FILL, &false);
+    assert_eq!(ctx.client().get_intent(&id).unwrap().state, IntentState::Filled);
+}
+
+/// docs/129 §2.4 — `require_proof = true` with no registry configured.
+#[test]
+fn proof_required_without_registry_is_config_error() {
+    let ctx = setup();
+    let id = accepted_intent(&ctx);
+    let res = ctx.client().try_fill_intent(&ctx.solver, &id, &FILL, &true);
+    assert_eq!(res, Err(Ok(Error::ProofRegistryNotSet.into())));
+    // No slash path triggered — intent is still Accepted.
+    assert_eq!(ctx.client().get_intent(&id).unwrap().state, IntentState::Accepted);
+}
+
+/// docs/129 §2.3 — registry configured but no proof for this intent.
+#[test]
+fn proof_required_but_absent_rejects_fill() {
+    let ctx = setup();
+    let _reg = deploy_proof_registry(&ctx);
+    let id = accepted_intent(&ctx);
+    let res = ctx.client().try_fill_intent(&ctx.solver, &id, &FILL, &true);
+    assert_eq!(res, Err(Ok(Error::ProofNotFound.into())));
+    assert_eq!(ctx.client().get_intent(&id).unwrap().state, IntentState::Accepted);
+}
+
+/// docs/129 §2.2 — proof exists but for the wrong source chain.
+#[test]
+fn proof_chain_mismatch_rejects_fill() {
+    let ctx = setup();
+    let reg = deploy_proof_registry(&ctx);
+    let id = accepted_intent(&ctx);
+    // Intent is "ethereum" (chain id 2); proof claims Polygon (5).
+    set_proof(&ctx, &reg, &id, 5, SRC_AMT);
+    let res = ctx.client().try_fill_intent(&ctx.solver, &id, &FILL, &true);
+    assert_eq!(res, Err(Ok(Error::ProofChainMismatch.into())));
+    let intent = ctx.client().get_intent(&id).unwrap();
+    assert_eq!(intent.state, IntentState::Accepted); // still slashable
+
+    // slash_solver stays reachable after the mismatch rejection (docs/129 §3).
+    ctx.pass_time(FILL_WINDOW + 1);
+    ctx.client().slash_solver(&id);
+    assert_eq!(ctx.client().get_intent(&id).unwrap().state, IntentState::Open);
+}
+
+/// docs/129 §2.1 — proof's source deposit is smaller than the intent requires.
+#[test]
+fn proof_amount_insufficient_rejects_fill() {
+    let ctx = setup();
+    let reg = deploy_proof_registry(&ctx);
+    let id = accepted_intent(&ctx);
+    set_proof(&ctx, &reg, &id, 2, SRC_AMT - 1);
+    let res = ctx.client().try_fill_intent(&ctx.solver, &id, &FILL, &true);
+    assert_eq!(res, Err(Ok(Error::ProofAmountInsufficient.into())));
+    assert_eq!(ctx.client().get_intent(&id).unwrap().state, IntentState::Accepted);
+}
+
+/// Happy path — matching chain and sufficient amount → the fill goes through.
+#[test]
+fn matching_proof_allows_fill() {
+    let ctx = setup();
+    let reg = deploy_proof_registry(&ctx);
+    let id = accepted_intent(&ctx);
+    set_proof(&ctx, &reg, &id, 2, SRC_AMT);
+    ctx.client().fill_intent(&ctx.solver, &id, &FILL, &true);
+    assert_eq!(ctx.client().get_intent(&id).unwrap().state, IntentState::Filled);
+}
+
+/// An `intent.src_chain` outside the docs/129 §4 mapping table cannot be
+/// proof-validated.
+#[test]
+fn unsupported_src_chain_rejects_gated_fill() {
+    let ctx = setup();
+    let reg = deploy_proof_registry(&ctx);
+    ctx.register_solver();
+    // Submit a "cosmos" intent (not in the Wormhole chain-id table).
+    let deadline: Option<u64> = None;
+    let id = ctx.client().submit_intent(
+        &ctx.user,
+        &String::from_str(&ctx.env, "cosmos"),
+        &String::from_str(&ctx.env, "cosmos1qyqa2zn5c925lyz4gq5qxsrx5gq5qxsr"),
+        &SRC_AMT,
+        &ctx.dst_token,
+        &MIN_DST,
+        &deadline,
+    );
+    ctx.client().accept_intent(&ctx.solver, &id);
+    let fee = FILL * 5 / 10_000;
+    ctx.dst_admin().mint(&ctx.solver, &(FILL + fee));
+    set_proof(&ctx, &reg, &id, 2, SRC_AMT);
+    let res = ctx.client().try_fill_intent(&ctx.solver, &id, &FILL, &true);
+    assert_eq!(res, Err(Ok(Error::SrcChainNotSupported.into())));
 }
