@@ -219,8 +219,10 @@ unilaterally by the admin without other protocol preconditions being met first
   admin-set per-token minimum; a price-oracle-based comparison remains on the
   roadmap.
 - **Intent re-open after slash.** After `slash_solver` the intent is reset to
-  `Open` with a fresh `INTENT_EXPIRY` deadline.  There is currently no cap on
-  how many times an intent can cycle through `Open → Accepted → Slashed`.
+  `Open` (or `PartiallyFilled`) with a fresh deadline. This is now bounded:
+  `ProtocolConfig.max_slash_cycles` caps how many times an intent can cycle
+  through `Open → Accepted → Slashed` before it transitions to the terminal
+  `Abandoned` state instead of re-opening.
 - **No allowlist by default.** Until an admin calls `set_dst_allowlist_enabled(true)`,
   any token address — including malicious contracts — can be used as `dst_token`.
 

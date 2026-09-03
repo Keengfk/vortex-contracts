@@ -2585,13 +2585,12 @@ impl IntentSettlement {
             solver_record.is_active = false;
         }
 
-        // Re-open the intent, preserving partial-fill progress if any.
-        // The intent transitions back to Open/PartiallyFilled, so increment open_intents.
-        intent.state = if intent.total_filled > 0 {
-            IntentState::PartiallyFilled
-        } else {
-            IntentState::Open
-        };
+        // Track this Accepted -> Slashed cycle. Once it reaches the
+        // admin-configured cap, retire the intent instead of re-opening it
+        // indefinitely (issue #241).
+        intent.slash_cycles += 1;
+        let abandoned = intent.slash_cycles >= cfg.max_slash_cycles;
+
         intent.solver = None;
         intent.solver_tier = 0; // #197: cleared with the solver assignment
         intent.deadline = now + cfg.intent_expiry;
@@ -2633,8 +2632,13 @@ impl IntentSettlement {
 
         env.events().publish(
             (Symbol::new(&env, "solver_slashed"), solver_addr),
-            (intent_id, slash_amount),
+            (intent_id.clone(), slash_amount),
         );
+
+        if abandoned {
+            env.events()
+                .publish((Symbol::new(&env, "intent_abandoned"),), intent_id);
+        }
     }
 
     /// Permissionless: materialize an Open intent's Expired state once its
