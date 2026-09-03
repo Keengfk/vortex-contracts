@@ -101,18 +101,32 @@ data   : (min_bond: i128, fill_window: u64, intent_expiry: u64, protocol_fee_bps
 
 #### `paused`
 
-Emitted by both `pause` and `unpause`. The data value distinguishes the
-direction: `true` means the contract is now paused, `false` means it is now
-unpaused.
+Emitted by `pause` when the contract is halted for incident response.
 
 | Field | Type | Description |
 |-------|------|-------------|
 | **topics[0]** | `Symbol` | `"paused"` |
-| **data** | `bool` | `true` = contract paused; `false` = contract unpaused |
+| **data** | `()` | (empty payload — topic alone is sufficient) |
 
 ```
 topics : ("paused",)
-data   : <is_paused: bool>
+data   : ()
+```
+
+---
+
+#### `unpaused`
+
+Emitted by `unpause` when the contract resumes normal operation after a pause.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| **topics[0]** | `Symbol` | `"unpaused"` |
+| **data** | `()` | (empty payload — topic alone is sufficient) |
+
+```
+topics : ("unpaused",)
+data   : ()
 ```
 
 ---
@@ -201,6 +215,40 @@ Emitted by `remove_allowed_src_chain`.
 ```
 topics : ("src_chain_disallowed",)
 data   : <chain: String>
+```
+
+---
+
+#### `dst_allowlist_enabled`
+
+Emitted by `set_dst_allowlist_enabled` to signal a change in whether the
+destination token allowlist is actively enforced by `submit_intent`.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| **topics[0]** | `Symbol` | `"dst_allowlist_enabled"` |
+| **data** | `bool` | `true` = allowlist enforcement active; `false` = disabled |
+
+```
+topics : ("dst_allowlist_enabled",)
+data   : <enabled: bool>
+```
+
+---
+
+#### `src_chain_allowlist_enabled`
+
+Emitted by `set_src_chain_allowlist_enabled` to signal a change in whether
+the source-chain allowlist is actively enforced by `submit_intent`.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| **topics[0]** | `Symbol` | `"src_chain_allowlist_enabled"` |
+| **data** | `bool` | `true` = allowlist enforcement active; `false` = disabled |
+
+```
+topics : ("src_chain_allowlist_enabled",)
+data   : <enabled: bool>
 ```
 
 ---
