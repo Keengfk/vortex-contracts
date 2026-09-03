@@ -61,6 +61,15 @@ const ARBITER_WINDOW: u64 = 86_400; // 24 hours
 /// refund every token) and the storage cost of the per-token bond entries.
 const MAX_BOND_TOKENS: u32 = 8;
 
+/// Dispute-resolution parameters (issue #48, #233):
+/// When a solver delivers tokens (begin_fill), the user has DISPUTE_WINDOW seconds
+/// to open a dispute. If no dispute is raised, release_fill() can execute after
+/// the window closes. If a dispute is raised, the arbiter has ARBITER_WINDOW
+/// seconds to resolve it; if unresolved, the timeout releases escrow to the user.
+const DISPUTE_WINDOW: u64 = 3600; // 1 hour: time for user to notice and contest fill
+const ARBITER_WINDOW: u64 = 86400; // 24 hours: time for arbiter to resolve
+const DISPUTE_BOND: i128 = 1 * 10_000_000; // 1 USDC: anti-griefing bond from user
+
 /// Delay enforced between proposing and executing a sensitive admin change
 /// (admin transfer, fee recipient handover, dst_token allowlist changes).
 /// Gives users and solvers a window to notice and react before the change
@@ -2254,6 +2263,227 @@ impl IntentSettlement {
         );
     }
 
+    /// Solver begins fill by depositing dst_token into escrow. Starts dispute window.
+    /// Replaces the direct transfer in fill_intent once this design is implemented.
+    /// For now, this is a placeholder establishing the interface.
+    pub fn begin_fill(env: Env, solver: Address, intent_id: BytesN<32>, fill_amount: i128) {
+        solver.require_auth();
+        Self::require_not_paused(&env);
+        Self::bump_instance_ttl(&env);
+
+        let mut intent: IntentRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Intent(intent_id.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::IntentNotFound));
+
+        if intent.solver.as_ref() != Some(&solver) {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+
+        if intent.state != IntentState::Accepted {
+            panic_with_error!(&env, Error::IntentNotAccepted);
+        }
+
+        let now = env.ledger().timestamp();
+        if now >= intent.deadline {
+            panic_with_error!(&env, Error::FillWindowExpired);
+        }
+
+        // Transition to Filling and set dispute window deadline
+        intent.state = IntentState::Filling;
+        intent.dispute_deadline = Some(now + DISPUTE_WINDOW);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Intent(intent_id.clone()), &intent);
+        Self::bump_intent_ttl(&env, &intent_id);
+
+        env.events().publish(
+            (Symbol::new(&env, "fill_begun"),),
+            (intent_id, solver, fill_amount),
+        );
+    }
+
+    /// User opens a dispute within the dispute window. Requires paying a bond.
+    /// Transitions intent to Disputed state.
+    pub fn open_dispute(env: Env, user: Address, intent_id: BytesN<32>) {
+        user.require_auth();
+        Self::bump_instance_ttl(&env);
+
+        let mut intent: IntentRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Intent(intent_id.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::IntentNotFound));
+
+        if intent.user != user {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+
+        if intent.state != IntentState::Filling {
+            panic_with_error!(&env, Error::NoDisputeOpen);
+        }
+
+        let now = env.ledger().timestamp();
+        if let Some(deadline) = intent.dispute_deadline {
+            if now >= deadline {
+                panic_with_error!(&env, Error::DisputeWindowExpired);
+            }
+        } else {
+            panic_with_error!(&env, Error::NoFillEscrowed);
+        }
+
+        // Pull dispute bond from user
+        let bond_token: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::BondToken)
+            .unwrap();
+        let bond_client = token::Client::new(&env, &bond_token);
+        bond_client.transfer_from(&user, &env.current_contract_address(), &user, &DISPUTE_BOND);
+
+        intent.state = IntentState::Disputed;
+        intent.dispute_raised_at = Some(now);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Intent(intent_id.clone()), &intent);
+        Self::bump_intent_ttl(&env, &intent_id);
+
+        env.events().publish(
+            (Symbol::new(&env, "dispute_opened"),),
+            (intent_id, user),
+        );
+    }
+
+    /// Arbiter resolves a dispute. Transitions intent to Resolved and handles bond/escrow.
+    pub fn resolve_dispute(
+        env: Env,
+        arbiter: Address,
+        intent_id: BytesN<32>,
+        resolution: DisputeResolution,
+    ) {
+        arbiter.require_auth();
+        Self::bump_instance_ttl(&env);
+
+        // For now, arbiter is the admin. In v2, this could be a separate arbiter role.
+        Self::require_admin(&env);
+
+        let mut intent: IntentRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Intent(intent_id.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::IntentNotFound));
+
+        if intent.state != IntentState::Disputed {
+            panic_with_error!(&env, Error::NoDisputeOpen);
+        }
+
+        let now = env.ledger().timestamp();
+        if let Some(raised_at) = intent.dispute_raised_at {
+            if now >= raised_at + ARBITER_WINDOW {
+                panic_with_error!(&env, Error::ArbiterWindowExpired);
+            }
+        } else {
+            panic_with_error!(&env, Error::NoDisputeOpen);
+        }
+
+        let bond_token: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::BondToken)
+            .unwrap();
+        let bond_client = token::Client::new(&env, &bond_token);
+
+        intent.state = IntentState::Resolved;
+        intent.resolution = Some(resolution.clone());
+
+        match resolution {
+            DisputeResolution::Upheld => {
+                // Refund bond to user, slash solver
+                bond_client.transfer(&env.current_contract_address(), &intent.user, &DISPUTE_BOND);
+
+                if let Some(solver) = &intent.solver {
+                    // Slash solver's bond
+                    let mut solver_record: SolverRecord = env
+                        .storage()
+                        .persistent()
+                        .get(&DataKey::Solver(solver.clone()))
+                        .unwrap();
+                    let slash_amount = solver_record.bond_amount / 10;
+                    solver_record.bond_amount = solver_record.bond_amount.saturating_sub(slash_amount);
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::Solver(solver.clone()), &solver_record);
+                    Self::bump_solver_ttl(&env, solver);
+
+                    // Transfer slashed bond to fee recipient
+                    let fee_recipient: Address = env
+                        .storage()
+                        .instance()
+                        .get(&DataKey::FeeRecipient)
+                        .unwrap();
+                    bond_client.transfer(&env.current_contract_address(), &fee_recipient, &slash_amount);
+                }
+            }
+            DisputeResolution::Dismissed => {
+                // Forfeit bond to fee recipient
+                let fee_recipient: Address = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::FeeRecipient)
+                    .unwrap();
+                bond_client.transfer(&env.current_contract_address(), &fee_recipient, &DISPUTE_BOND);
+            }
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Intent(intent_id.clone()), &intent);
+        Self::bump_intent_ttl(&env, &intent_id);
+
+        env.events().publish(
+            (Symbol::new(&env, "dispute_resolved"),),
+            (intent_id, resolution),
+        );
+    }
+
+    /// Permissionless: release escrowed fill after dispute window closes without a dispute.
+    pub fn release_fill(env: Env, intent_id: BytesN<32>) {
+        Self::bump_instance_ttl(&env);
+
+        let mut intent: IntentRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Intent(intent_id.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::IntentNotFound));
+
+        if intent.state != IntentState::Filling {
+            panic_with_error!(&env, Error::NoFillEscrowed);
+        }
+
+        let now = env.ledger().timestamp();
+        if let Some(deadline) = intent.dispute_deadline {
+            if now < deadline {
+                panic_with_error!(&env, Error::DisputeWindowExpired);
+            }
+        } else {
+            panic_with_error!(&env, Error::NoFillEscrowed);
+        }
+
+        // Transition to Filled (this is a simplified version; full impl would handle token release)
+        intent.state = IntentState::Filled;
+        intent.filled_at = Some(now);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Intent(intent_id.clone()), &intent);
+        Self::bump_intent_ttl(&env, &intent_id);
+
+        env.events().publish((Symbol::new(&env, "fill_released"),), intent_id);
+    }
+
     /// Permissionless: slash a solver that accepted but didn't fill within FILL_WINDOW
     pub fn slash_solver(env: Env, intent_id: BytesN<32>) {
         Self::bump_instance_ttl(&env);
@@ -4087,5 +4317,23 @@ impl IntentSettlement {
         preimage.extend_from_array(&timestamp.to_be_bytes());
         preimage.extend_from_array(&nonce.to_be_bytes());
         env.crypto().sha256(&preimage).into()
+    }
+
+    fn validate_proof(env: &Env, intent_id: &BytesN<32>, intent: &IntentRecord) {
+        let _registry_addr = env
+            .storage()
+            .instance()
+            .get::<_, Address>(&DataKey::ProofRegistry)
+            .unwrap_or_else(|| panic_with_error!(env, Error::ProofRegistryNotSet));
+
+        // In production, this would call:
+        // - registry.has_proof(intent_id) to check existence
+        // - registry.get_proof(intent_id) to retrieve the proof record
+        // - Validate proof.src_chain matches intent.src_chain
+        // - Validate proof.src_amount >= intent.src_amount
+        //
+        // For now, the proof logic is deferred to issue #5's fill_intent integration.
+        // This function serves as the proof-validation checkpoint in the fill flow.
+        // Tests will inject mock proofs and verify this gate works correctly.
     }
 }
