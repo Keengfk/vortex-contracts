@@ -50,6 +50,43 @@ Core protocol logic (`intent_settlement/src/lib.rs`):
 - `list_allowed_dst_tokens()` — enumerate the full current dst_token allowlist (#117)
 - `add_allowed_src_chain()` / `remove_allowed_src_chain()` / `set_src_chain_allowlist_enabled()` — optional src_chain allowlist (#34)
 - `rescue_tokens()` — admin-only recovery of non-bond tokens accidentally sent to the contract (#35)
+- `propose_upgrade()` / `execute_upgrade()` / `get_pending_upgrade()` / `migrate()` — timelocked in-place contract upgrade + one-time storage-migration hook (#194)
+- `set_fee_discount_tiers()` / `get_fee_schedule()` — volume-tier protocol-fee discounts for solvers (#192)
+
+#### Protocol fee & volume-tier discounts (#192)
+
+`fill_intent` charges a protocol fee, paid by the solver, on each fill:
+
+```
+fee = fill_amount * effective_fee_bps / 10_000
+```
+
+The base rate is `ProtocolConfig.protocol_fee_bps` (default **5 bps = 0.05%**,
+admin-tunable via `set_config`, hard-capped at 1 000 bps / 10%).
+
+High-volume solvers can earn a discount on that base rate. The admin sets a
+**data-driven discount schedule** — an ordered list of
+`(min_volume, discount_bps)` tiers, ascending by `min_volume`:
+
+```bash
+# 1M dst-token cumulative volume ⇒ 20% off the fee; 10M ⇒ 50% off.
+stellar contract invoke --id <CONTRACT_ID> --source <ADMIN_SECRET_KEY> --network testnet -- \
+  set_fee_discount_tiers --tiers '[[10000000000,2000],[100000000000,5000]]'
+```
+
+- `discount_bps` is a fraction **of the fee**, in hundredths of a percent
+  (`2000` = 20% off, `10000` = fee waived entirely).
+- A solver pays the base rate reduced by the highest tier whose `min_volume`
+  their cumulative `SolverRecord.total_volume` has reached (`>=`, inclusive).
+- The effective rate is always clamped to `0 ..= base` — a discount can never
+  make the fee negative or larger than the un-discounted rate.
+- With **no schedule set (the default)** every solver pays the flat base rate,
+  so this is fully backward-compatible.
+- `set_fee_discount_tiers` rejects (`InvalidFeeTiers`) a schedule that isn't
+  strictly ascending by `min_volume` or has any `discount_bps > 10 000`. Pass
+  an empty list to clear all discounts.
+- Solver bots can call `get_fee_schedule(solver)` to read `(tiers,
+  effective_fee_bps)` and price a fill before submitting.
 
 #### Usage examples
 

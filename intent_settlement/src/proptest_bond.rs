@@ -31,6 +31,7 @@ use soroban_sdk::{
     testutils::{Address as _, Ledger},
     token, Address, Env, String,
 };
+use std::vec::Vec;
 
 use crate::{IntentSettlement, IntentSettlementClient, FILL_WINDOW, MIN_BOND, SLASH_COOLDOWN};
 

@@ -21,17 +21,15 @@ mod test;
 #[cfg(test)]
 mod proptest_bond;
 
+#[cfg(test)]
+mod bench;
+
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const INTENT_EXPIRY: u64 = 1800; // 30 minutes
 const FILL_WINDOW: u64 = 300; // 5 minutes to fill after intent accepted
 const MIN_BOND: i128 = 50 * 10_000_000; // 50 USDC minimum solver bond
 const PROTOCOL_FEE_BPS: i128 = 5; // 0.05%
-/// Duration of the competitive bid-collection window when bid-window mode is
-/// enabled.  Solvers have this many seconds after `submit_intent` to submit
-/// competing quotes via `bid_intent`; the best quote wins once the window
-/// closes.
-const BID_WINDOW: u64 = 120; // 2 minutes
 
 /// Baseline slash rate in basis points (1 000 bps = 10%).
 ///
@@ -70,6 +68,36 @@ const MAX_BOND_TOKENS: u32 = 8;
 /// so off-chain monitors get advance notice even before the delay elapses
 /// (#116).
 const ADMIN_TIMELOCK_DELAY: u64 = 172_800; // 48 hours
+
+// ── Defaults seeded into `ProtocolConfig` by `initialize`, and the fallback
+// `load_config` returns for contracts deployed before the configurable-params
+// feature existed.  They mirror the historical compile-time constants above.
+const DEFAULT_MIN_BOND: i128 = MIN_BOND;
+const DEFAULT_FILL_WINDOW: u64 = FILL_WINDOW;
+const DEFAULT_INTENT_EXPIRY: u64 = INTENT_EXPIRY;
+const DEFAULT_PROTOCOL_FEE_BPS: i128 = PROTOCOL_FEE_BPS;
+
+// ── `set_config` bounds.  A parameter outside any of these ranges is rejected
+// with `Error::InvalidConfig`.
+const MAX_PROTOCOL_FEE_BPS: i128 = 1_000; // 10% hard cap on the protocol fee
+const MIN_FILL_WINDOW_SECS: u64 = 60; // a solver needs at least a minute to fill
+const MIN_INTENT_EXPIRY_SECS: u64 = 300; // and must always exceed the fill window
+const MIN_BOND_FLOOR: i128 = 10_000_000; // one 7-decimal USDC unit
+
+// ── Cooldowns / limits enforced outside `ProtocolConfig`.
+const SLASH_COOLDOWN: u64 = 3600; // 1 hour a slashed solver must wait before accepting again
+const CANCEL_COOLDOWN: u64 = 3600; // 1 hour between a user's successive intent cancellations
+const MAX_EXTENSION_DURATION: u64 = 300; // one extra fill window granted by `request_extension`
+
+// ── Storage-migration schema version (#194). Bumped whenever a `migrate()`
+// body is added for a new release; `initialize` stamps fresh deploys with the
+// current value and `migrate` refuses to run once the contract is already at
+// it, so a migration can never be applied twice.
+const MIGRATION_VERSION: u32 = 1;
+
+// Basis-points denominator, shared by the protocol fee and the #192 discount
+// schedule (`discount_bps` is a fraction of the fee, not of the fill).
+const BPS_DENOMINATOR: i128 = 10_000;
 
 // Upper sanity bound for src_amount and min_dst_amount.
 //
@@ -459,49 +487,6 @@ pub struct SolverRecord {
     pub bond_tokens: Vec<Address>,
 }
 
-/// Return type for `get_protocol_params`.
-/// Exposes the four effective protocol values as named fields so integrators
-/// don't have to rely on source-code comments for the constant definitions.
-#[contracttype]
-#[derive(Clone)]
-pub struct ProtocolParams {
-    /// Minimum USDC bond (in token's smallest unit) a solver must hold.
-    pub min_bond: i128,
-    /// Seconds a solver has to fill an intent after accepting it.
-    pub fill_window: u64,
-    /// Default intent lifetime in seconds (when no explicit deadline is passed).
-    pub intent_expiry: u64,
-    /// Protocol fee charged on each fill, in basis points (1 bps = 0.01%).
-    pub protocol_fee_bps: i128,
-}
-
-/// Tracks the leading bid for an intent that is in the `Bidding` state.
-/// Only the current best bid is kept — a new submission replaces it only
-/// if it quotes a strictly higher `quoted_dst_amount`.
-#[contracttype]
-#[derive(Clone)]
-pub struct BestBidRecord {
-    pub solver: Address,
-    pub quoted_dst_amount: i128,
-}
-
-/// Aggregate protocol-wide health snapshot, returned by `get_protocol_health`.
-/// Bundles the fields that previously required three separate calls
-/// (`is_paused`, `get_stats`, `get_solver_count`) into one, so
-/// dashboard/monitoring integrations need a single round-trip.
-#[contracttype]
-#[derive(Clone)]
-pub struct ProtocolHealth {
-    /// Mirrors `is_paused()` — true when submit/accept/fill are halted.
-    pub paused: bool,
-    /// Mirrors `get_stats().0` — total intents ever submitted.
-    pub total_intents: u64,
-    /// Mirrors `get_stats().1` — cumulative dst_token volume across all fills.
-    pub total_volume: i128,
-    /// Mirrors `get_solver_count()` — currently registered solvers.
-    pub total_solvers: u32,
-}
-
 // ─── Errors ───────────────────────────────────────────────────────────────────
 
 #[contracterror]
@@ -715,6 +700,11 @@ impl IntentSettlement {
                 protocol_fee_bps: DEFAULT_PROTOCOL_FEE_BPS,
             },
         );
+        // Fresh deploys are already at the current schema — `migrate` is a
+        // no-op unless a later upgrade bumps `MIGRATION_VERSION` (#194).
+        env.storage()
+            .instance()
+            .set(&DataKey::MigrationVersion, &MIGRATION_VERSION);
         Self::bump_instance_ttl(&env);
     }
 
@@ -840,6 +830,92 @@ impl IntentSettlement {
 
         env.events()
             .publish((Symbol::new(&env, "admin_transferred"),), new_admin);
+    }
+
+    // ── Contract Upgrade (#194) ───────────────────────────────────────────────
+
+    /// Admin-only: propose swapping the contract's Wasm for the code with hash
+    /// `new_wasm_hash` (already uploaded to the ledger, e.g. via
+    /// `stellar contract upload`). Timelocked exactly like the other sensitive
+    /// admin actions: an `upgrade_proposed` event fires immediately for
+    /// off-chain monitors, and `execute_upgrade` may only run once
+    /// `ADMIN_TIMELOCK_DELAY` has elapsed. A fresh proposal overwrites any
+    /// prior pending one (and resets the timelock).
+    pub fn propose_upgrade(env: Env, new_wasm_hash: BytesN<32>) {
+        Self::require_admin(&env);
+        let eta = env.ledger().timestamp() + ADMIN_TIMELOCK_DELAY;
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingUpgrade, &(new_wasm_hash.clone(), eta));
+        Self::bump_instance_ttl(&env);
+        env.events().publish(
+            (Symbol::new(&env, "upgrade_proposed"),),
+            (new_wasm_hash, eta),
+        );
+    }
+
+    /// Apply a previously proposed upgrade once its timelock has elapsed.
+    /// Admin-only (the proposal is re-confirmed here so a stale proposal can't
+    /// be executed by a third party). `new_wasm_hash` must match the pending
+    /// proposal. Emits `upgraded`; after this the new code is live and callers
+    /// should run [`migrate`] if the release requires it.
+    pub fn execute_upgrade(env: Env, new_wasm_hash: BytesN<32>) {
+        Self::require_admin(&env);
+        let (pending, eta): (BytesN<32>, u64) = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingUpgrade)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoPendingUpgrade));
+        if pending != new_wasm_hash {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+        if env.ledger().timestamp() < eta {
+            panic_with_error!(&env, Error::TimelockNotElapsed);
+        }
+        env.storage().instance().remove(&DataKey::PendingUpgrade);
+        env.deployer()
+            .update_current_contract_wasm(new_wasm_hash.clone());
+        env.events()
+            .publish((Symbol::new(&env, "upgraded"),), new_wasm_hash);
+    }
+
+    /// The pending upgrade proposal, if any: `(new_wasm_hash, eta)`.
+    pub fn get_pending_upgrade(env: Env) -> Option<(BytesN<32>, u64)> {
+        env.storage().instance().get(&DataKey::PendingUpgrade)
+    }
+
+    /// Admin-only, run-once-per-release storage migration hook (#194).
+    ///
+    /// Guarded by `DataKey::MigrationVersion`: it refuses (`AlreadyMigrated`)
+    /// once the contract is at `MIGRATION_VERSION`, so a migration can never be
+    /// applied twice even if a later `execute_upgrade` forgets to bump the
+    /// version. Contracts deployed before this feature have no stored version
+    /// (`unwrap_or(0)`), so their first `migrate` runs.
+    ///
+    /// The body is intentionally empty in this release — no persisted shape has
+    /// changed. Future upgrades that reshape storage add their one-time
+    /// backfill here and bump `MIGRATION_VERSION`.
+    pub fn migrate(env: Env) {
+        Self::require_admin(&env);
+        let current: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MigrationVersion)
+            .unwrap_or(0);
+        if current >= MIGRATION_VERSION {
+            panic_with_error!(&env, Error::AlreadyMigrated);
+        }
+
+        // (no-op for MIGRATION_VERSION == 1)
+
+        env.storage()
+            .instance()
+            .set(&DataKey::MigrationVersion, &MIGRATION_VERSION);
+        Self::bump_instance_ttl(&env);
+        env.events().publish(
+            (Symbol::new(&env, "migrated"),),
+            (current, MIGRATION_VERSION),
+        );
     }
 
     // ── Protocol Config ───────────────────────────────────────────────────────
@@ -1650,25 +1726,9 @@ impl IntentSettlement {
             dst_token,
             min_dst_amount,
             solver: None,
-            // When bid-window mode is active, the intent opens in Bidding state
-            // so solvers can compete before one is assigned exclusive fill rights.
-            // The bid-window deadline is BID_WINDOW seconds from now, not the
-            // full intent expiry — settle_bids extends it to FILL_WINDOW once a
-            // winner is picked.  The original expiry is stored separately in
-            // deadline and reset after settlement.
-            state: if Self::is_bid_window_enabled(env.clone()) {
-                IntentState::Bidding
-            } else {
-                IntentState::Open
-            },
+            state: IntentState::Open,
             created_at: now,
-            // In bidding mode, deadline tracks the end of the bid window.
-            // In first-accept-wins mode, deadline tracks the intent expiry.
-            deadline: if Self::is_bid_window_enabled(env.clone()) {
-                now + BID_WINDOW
-            } else {
-                expiry
-            },
+            deadline: expiry,
             filled_at: None,
             fill_amount: None,
             total_filled: 0,
@@ -1682,10 +1742,7 @@ impl IntentSettlement {
             resolution: None,
         };
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::Intent(intent_id.clone()), &intent);
-        Self::bump_intent_ttl(&env, &intent_id);
+        Self::save_intent(&env, &intent_id, &intent);
 
         let mut user_intents: Vec<BytesN<32>> = env
             .storage()
@@ -1706,8 +1763,7 @@ impl IntentSettlement {
             .instance()
             .set(&DataKey::TotalIntents, &(total + 1));
 
-        // Increment open_intents: every new submission starts as Open (or Bidding,
-        // which also counts as an unfilled intent awaiting a solver).
+        // Increment open_intents: every new submission starts as Open.
         let open: u64 = env
             .storage()
             .instance()
@@ -1808,10 +1864,7 @@ impl IntentSettlement {
         // `now >= intent.deadline` rejects at the boundary second (`now == deadline`)
         // so the full [created_at, deadline) half-open window is available for solvers.
         if now >= intent.deadline {
-            env.storage()
-                .persistent()
-                .set(&DataKey::Intent(intent_id.clone()), &intent);
-            Self::bump_intent_ttl(&env, &intent_id);
+            Self::save_intent(&env, &intent_id, &intent);
             panic_with_error!(&env, Error::IntentExpired);
         }
 
@@ -1841,10 +1894,7 @@ impl IntentSettlement {
             .instance()
             .set(&DataKey::OpenIntents, &open.saturating_sub(1));
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::Intent(intent_id.clone()), &intent);
-        Self::bump_intent_ttl(&env, &intent_id);
+        Self::save_intent(&env, &intent_id, &intent);
 
         env.events().publish(
             (Symbol::new(&env, "intent_accepted"), solver),
@@ -1916,11 +1966,7 @@ impl IntentSettlement {
         Self::require_not_paused(&env);
         Self::bump_instance_ttl(&env);
 
-        let mut intent: IntentRecord = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Intent(intent_id.clone()))
-            .unwrap_or_else(|| panic_with_error!(&env, Error::IntentNotFound));
+        let mut intent = Self::load_intent(&env, &intent_id);
 
         let now = env.ledger().timestamp();
         // Boundary semantics: the fill-window deadline is EXCLUSIVE for filling.
@@ -1976,9 +2022,9 @@ impl IntentSettlement {
         // visible in code, rather than relying solely on the Cargo.toml
         // overflow-checks = true release-profile setting (issue #31).
         let fee = fill_amount
-            .checked_mul(PROTOCOL_FEE_BPS)
+            .checked_mul(fee_bps)
             .unwrap_or_else(|| panic_with_error!(&env, Error::FeeOverflow))
-            .checked_div(10_000)
+            .checked_div(BPS_DENOMINATOR)
             .unwrap_or_else(|| panic_with_error!(&env, Error::FeeOverflow));
 
         // ── Effects first (CEI) ──────────────────────────────────────────────
@@ -2045,10 +2091,7 @@ impl IntentSettlement {
             .instance()
             .set(&DataKey::TotalVolume, &(total_vol + fill_amount));
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::Intent(intent_id.clone()), &intent);
-        Self::bump_intent_ttl(&env, &intent_id);
+        Self::save_intent(&env, &intent_id, &intent);
 
         // ── Interactions: token transfers (state already committed above) ────
         // Solver delivers this fill's output to the user, then separately pays
@@ -2159,11 +2202,7 @@ impl IntentSettlement {
     pub fn slash_solver(env: Env, intent_id: BytesN<32>) {
         Self::bump_instance_ttl(&env);
 
-        let mut intent: IntentRecord = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Intent(intent_id.clone()))
-            .unwrap_or_else(|| panic_with_error!(&env, Error::IntentNotFound));
+        let mut intent = Self::load_intent(&env, &intent_id);
 
         let now = env.ledger().timestamp();
 
@@ -2242,10 +2281,7 @@ impl IntentSettlement {
             .persistent()
             .set(&DataKey::Solver(solver_addr.clone()), &solver_record);
         Self::bump_solver_ttl(&env, &solver_addr);
-        env.storage()
-            .persistent()
-            .set(&DataKey::Intent(intent_id.clone()), &intent);
-        Self::bump_intent_ttl(&env, &intent_id);
+        Self::save_intent(&env, &intent_id, &intent);
 
         // Send slash to fee recipient, in the same token the solver bonded
         // (issue #187), with state already committed above.
@@ -2276,11 +2312,7 @@ impl IntentSettlement {
     pub fn expire_intent(env: Env, intent_id: BytesN<32>) {
         Self::bump_instance_ttl(&env);
 
-        let mut intent: IntentRecord = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Intent(intent_id.clone()))
-            .unwrap_or_else(|| panic_with_error!(&env, Error::IntentNotFound));
+        let mut intent = Self::load_intent(&env, &intent_id);
 
         if intent.state != IntentState::Open && intent.state != IntentState::PartiallyFilled {
             panic_with_error!(&env, Error::IntentNotOpen);
@@ -2296,10 +2328,7 @@ impl IntentSettlement {
         }
 
         intent.state = IntentState::Expired;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Intent(intent_id.clone()), &intent);
-        Self::bump_intent_ttl(&env, &intent_id);
+        Self::save_intent(&env, &intent_id, &intent);
 
         // Decrement open_intents: intent is no longer open.
         let open: u64 = env
@@ -3121,10 +3150,7 @@ impl IntentSettlement {
             .persistent()
             .set(&DataKey::ExtensionGranted(intent_id.clone()), &true);
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::Intent(intent_id.clone()), &intent);
-        Self::bump_intent_ttl(&env, &intent_id);
+        Self::save_intent(&env, &intent_id, &intent);
 
         env.events().publish(
             (Symbol::new(&env, "extension_granted"), solver),
@@ -3133,22 +3159,6 @@ impl IntentSettlement {
     }
 
     // ── Views ─────────────────────────────────────────────────────────────────
-
-    /// Read-only: returns the current effective protocol parameters.
-    ///
-    /// Useful for integrators who need to know MIN_BOND, FILL_WINDOW,
-    /// INTENT_EXPIRY, and PROTOCOL_FEE_BPS without reading source code.
-    /// Returns the values as a dedicated struct so each field is named at
-    /// the call site rather than relying on tuple-position conventions.
-    pub fn get_protocol_params(env: Env) -> ProtocolParams {
-        let _ = env; // view — no storage read needed; values are compile-time constants
-        ProtocolParams {
-            min_bond: MIN_BOND,
-            fill_window: FILL_WINDOW,
-            intent_expiry: INTENT_EXPIRY,
-            protocol_fee_bps: PROTOCOL_FEE_BPS,
-        }
-    }
 
     /// Fetch an intent's full record by id, or None if it was never submitted.
     pub fn get_intent(env: Env, intent_id: BytesN<32>) -> Option<IntentRecord> {
@@ -3256,11 +3266,6 @@ impl IntentSettlement {
             .get(&DataKey::OpenIntents)
             .unwrap_or(0);
         (intents, volume, open)
-    }
-
-    /// Minimum bond required for solver registration.
-    pub fn get_min_bond(_env: Env) -> i128 {
-        MIN_BOND
     }
 
     /// List all intent IDs for a given user. Returns empty Vec if user has no intents.
@@ -3382,8 +3387,9 @@ impl IntentSettlement {
         // the curve. Only the shape matters — the constant can be tuned later.
         const VOLUME_SCALE: i128 = 1_000 * 100 * 10_000_000;
 
-        // decay_bps = VOLUME_SCALE / (VOLUME_SCALE + vol + 1) × 10_000
-        // ∈ (0, 10_000].  High volume → low decay_bps.
+        // decay_bps = VOLUME_SCALE / (VOLUME_SCALE + vol) × 10_000
+        // ∈ (0, 10_000].  High volume → low decay_bps.  `VOLUME_SCALE` is a
+        // positive constant and `vol >= 0`, so the denominator is never zero.
         let vol = record.total_volume.max(0);
         let decay_bps = ((VOLUME_SCALE as u64) * 10_000) / ((VOLUME_SCALE + vol + 1) as u64);
 
@@ -3891,6 +3897,22 @@ impl IntentSettlement {
             PERSISTENT_TTL_THRESHOLD,
             PERSISTENT_TTL_EXTEND_TO,
         );
+    }
+
+    /// Load an intent record, or panic `IntentNotFound`.
+    fn load_intent(env: &Env, intent_id: &BytesN<32>) -> IntentRecord {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Intent(intent_id.clone()))
+            .unwrap_or_else(|| panic_with_error!(env, Error::IntentNotFound))
+    }
+
+    /// Persist an intent record and bump its TTL.
+    fn save_intent(env: &Env, intent_id: &BytesN<32>, intent: &IntentRecord) {
+        env.storage()
+            .persistent()
+            .set(&DataKey::Intent(intent_id.clone()), intent);
+        Self::bump_intent_ttl(env, intent_id);
     }
 
     fn bump_solver_ttl(env: &Env, solver: &Address) {

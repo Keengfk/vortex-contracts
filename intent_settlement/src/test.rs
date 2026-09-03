@@ -306,7 +306,7 @@ fn paused_blocks_submit_accept_and_fill() {
     let res = c.try_submit_intent(
         &ctx.user,
         &String::from_str(&ctx.env, "ethereum"),
-        &String::from_str(&ctx.env, "0xabc"),
+        &String::from_str(&ctx.env, "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
         &SRC_AMT,
         &ctx.dst_token,
         &MIN_DST,
@@ -457,6 +457,9 @@ fn pause_blocks_submit_accept_fill_but_allows_cancel_and_slash() {
 
     // Submit another intent to test that it can't be accepted while paused
     let id2 = ctx.submit();
+    // And one more to cancel while paused (submission itself is blocked once
+    // paused, so it has to be created up front).
+    let id3 = ctx.submit();
 
     // Submit id3 now (before the pause) so we have an Open intent to cancel
     // while paused — submission itself is blocked once paused.
@@ -595,9 +598,18 @@ fn register_solver_topup_accumulates_bond() {
     c.register_solver(&ctx.solver, &MIN_BOND); // first: exactly MIN_BOND
     c.register_solver(&ctx.solver, &(MIN_BOND / 2)); // top up by 25 USDC
 
+    // Depositing the full minimum in one go succeeds.
+    c.register_solver(&ctx.solver, &MIN_BOND);
     let record = c.get_solver(&ctx.solver).unwrap();
     assert_eq!(record.bond_amount, MIN_BOND + MIN_BOND / 2);
     assert!(record.is_active);
+
+    // A later top-up lands on top of the existing bond.
+    c.register_solver(&ctx.solver, &half_min);
+    assert_eq!(
+        c.get_solver(&ctx.solver).unwrap().bond_amount,
+        MIN_BOND + half_min
+    );
 }
 
 #[test]
@@ -918,7 +930,7 @@ fn dst_allowlist_blocks_unlisted_token_once_enabled() {
     let res = c.try_submit_intent(
         &ctx.user,
         &String::from_str(&ctx.env, "ethereum"),
-        &String::from_str(&ctx.env, "0xabc"),
+        &String::from_str(&ctx.env, "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
         &SRC_AMT,
         &ctx.dst_token,
         &MIN_DST,
@@ -963,7 +975,7 @@ fn dst_allowlist_removal_blocks_previously_allowed_token() {
     let res = c.try_submit_intent(
         &ctx.user,
         &String::from_str(&ctx.env, "ethereum"),
-        &String::from_str(&ctx.env, "0xabc"),
+        &String::from_str(&ctx.env, "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
         &SRC_AMT,
         &ctx.dst_token,
         &MIN_DST,
@@ -993,7 +1005,7 @@ fn dst_allowlist_toggled_mid_lifecycle_does_not_retroactively_affect_open_intent
     let res = c.try_submit_intent(
         &ctx.user,
         &String::from_str(&ctx.env, "ethereum"),
-        &String::from_str(&ctx.env, "0xabc"),
+        &String::from_str(&ctx.env, "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
         &SRC_AMT,
         &ctx.dst_token,
         &MIN_DST,
@@ -1015,7 +1027,7 @@ fn dst_allowlist_can_be_re_enabled_to_accept_previously_blocked_tokens() {
     let res = c.try_submit_intent(
         &ctx.user,
         &String::from_str(&ctx.env, "ethereum"),
-        &String::from_str(&ctx.env, "0xabc"),
+        &String::from_str(&ctx.env, "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
         &SRC_AMT,
         &ctx.dst_token,
         &MIN_DST,
@@ -1037,7 +1049,7 @@ fn submit_intent_zero_amount_fails() {
     let res = ctx.client().try_submit_intent(
         &ctx.user,
         &String::from_str(&ctx.env, "ethereum"),
-        &String::from_str(&ctx.env, "0xabc"),
+        &String::from_str(&ctx.env, "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
         &0,
         &ctx.dst_token,
         &MIN_DST,
@@ -1788,12 +1800,6 @@ fn get_bond_token_returns_configured_token() {
 }
 
 #[test]
-fn get_min_bond_returns_enforced_minimum() {
-    let ctx = setup();
-    assert_eq!(ctx.client().get_min_bond(), MIN_BOND);
-}
-
-#[test]
 fn get_min_bond_multiplier_defaults_to_one() {
     let ctx = setup();
     assert_eq!(ctx.client().get_min_bond_multiplier(&ctx.dst_token), 10);
@@ -2099,7 +2105,7 @@ fn make_record(
 fn reputation_score_zero_fills_returns_zero() {
     let ctx = setup();
     let r = make_record(&ctx.env, &ctx.solver, 0, 0, 0);
-    assert_eq!(IntentSettlement::compute_reputation_score(&r), 0);
+    assert_eq!(IntentSettlement::compute_reputation_score(r), 0);
 }
 
 /// A solver that has only failures has score 0 regardless of volume.
@@ -2107,7 +2113,7 @@ fn reputation_score_zero_fills_returns_zero() {
 fn reputation_score_all_failures_returns_zero() {
     let ctx = setup();
     let r = make_record(&ctx.env, &ctx.solver, 0, 50, 0);
-    assert_eq!(IntentSettlement::compute_reputation_score(&r), 0);
+    assert_eq!(IntentSettlement::compute_reputation_score(r), 0);
 }
 
 /// A perfect solver with no volume scores ~9_000 (≈ 90% × 10_000 bps).
@@ -2128,7 +2134,7 @@ fn reputation_score_perfect_rate_high_volume_approaches_ten_thousand() {
     // volume = 100 × VOLUME_SCALE makes decay negligible.
     let high_vol: i128 = 100 * 1_000 * 100 * 10_000_000;
     let r = make_record(&ctx.env, &ctx.solver, 1_000, 0, high_vol);
-    let score = IntentSettlement::compute_reputation_score(&r);
+    let score = IntentSettlement::compute_reputation_score(r);
     // Must be strictly greater than 9_000 and less than 10_000.
     assert!(score > 9_000, "score {score} should be > 9_000");
     assert!(score < 10_000, "score {score} should be < 10_000");
@@ -2143,8 +2149,8 @@ fn reputation_score_partial_failures_lower_than_perfect() {
     let perfect = make_record(&ctx.env, &ctx.solver, 90, 0, vol);
     let mixed = make_record(&ctx.env, &ctx.solver, 90, 10, vol);
     assert!(
-        IntentSettlement::compute_reputation_score(&perfect)
-            > IntentSettlement::compute_reputation_score(&mixed)
+        IntentSettlement::compute_reputation_score(perfect)
+            > IntentSettlement::compute_reputation_score(mixed)
     );
 }
 
@@ -2330,7 +2336,7 @@ fn src_chain_allowlist_blocks_unlisted_chain_when_enabled() {
     let res = c.try_submit_intent(
         &ctx.user,
         &String::from_str(&ctx.env, "etherium"), // typo -- not on list
-        &String::from_str(&ctx.env, "0xabc"),
+        &String::from_str(&ctx.env, "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
         &SRC_AMT,
         &ctx.dst_token,
         &MIN_DST,
@@ -2366,7 +2372,7 @@ fn src_chain_allowlist_removal_blocks_previously_allowed_chain() {
     let res = c.try_submit_intent(
         &ctx.user,
         &String::from_str(&ctx.env, "ethereum"),
-        &String::from_str(&ctx.env, "0xabc"),
+        &String::from_str(&ctx.env, "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
         &SRC_AMT,
         &ctx.dst_token,
         &MIN_DST,
