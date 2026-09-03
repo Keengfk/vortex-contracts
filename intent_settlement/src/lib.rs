@@ -2097,7 +2097,7 @@ impl IntentSettlement {
         dst_client.transfer(&solver, &intent.user, &fill_amount);
 
         // Solver also pays the protocol fee on each fill.
-        let fee = fill_amount * PROTOCOL_FEE_BPS / 10_000;
+        let fee = fill_amount * protocol_fee_bps / 10_000;
         // ── Effects first (CEI) ──────────────────────────────────────────────
         // Mark the intent Filled and write every state change to storage
         // *before* any external token transfer executes. A hostile SEP-41

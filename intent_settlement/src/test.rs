@@ -1736,6 +1736,37 @@ fn solver_record_consistent_with_token_balances_after_register() {
     assert_eq!(ctx.bond().balance(&ctx.solver), 0);
 }
 
+// #263 — fill_intent now scopes its auth to (solver, intent_id, fill_amount)
+// via require_auth_for_args. A signed auth entry bound to a different
+// intent_id than the one actually being filled — the shape a delegating
+// invoker contract could otherwise exploit — must be rejected.
+#[test]
+fn fill_intent_delegated_auth_wrong_intent_id_rejected() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    ctx.register_solver();
+    let id = ctx.submit();
+    c.accept_intent(&ctx.solver, &id);
+
+    let wrong_id = BytesN::from_array(&ctx.env, &[0u8; 32]);
+    let fee = FILL * 5 / 10_000;
+    ctx.dst_admin().mint(&ctx.solver, &(FILL + fee));
+
+    ctx.env.mock_auths(&[MockAuth {
+        address: &ctx.solver,
+        invoke: &MockAuthInvoke {
+            contract: &ctx.contract_id,
+            fn_name: "fill_intent",
+            args: (ctx.solver.clone(), wrong_id, FILL).into_val(&ctx.env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    let res = c.try_fill_intent(&ctx.solver, &id, &FILL);
+    assert!(res.is_err());
+}
+
 // #26 — CEI ordering in fill_intent: state is committed before transfers.
 //
 // We verify two complementary properties:
@@ -2214,6 +2245,32 @@ fn fill_intent_fee_at_boundary_does_not_overflow() {
     // Should succeed (no overflow).
     c.fill_intent(&ctx.solver, &id, &boundary_fill, &false);
     assert!(c.get_intent(&id).unwrap().state == IntentState::Filled);
+}
+
+// #260 — fill_intent must charge the live, admin-configured protocol fee
+// rate, not the compile-time PROTOCOL_FEE_BPS constant.
+#[test]
+fn fill_intent_honors_set_config_protocol_fee() {
+    let ctx = setup();
+    let c = ctx.client();
+
+    // Set a non-default fee rate (1% = 100 bps) via set_config, keeping the
+    // other three parameters at their existing defaults.
+    let new_fee_bps: i128 = 100;
+    c.set_config(&MIN_BOND, &FILL_WINDOW, &INTENT_EXPIRY, &new_fee_bps);
+
+    ctx.register_solver();
+    let id = ctx.submit();
+    c.accept_intent(&ctx.solver, &id);
+
+    let fee = FILL * new_fee_bps / 10_000;
+    ctx.dst_admin().mint(&ctx.solver, &(FILL + fee));
+
+    c.fill_intent(&ctx.solver, &id, &FILL);
+
+    assert_eq!(ctx.dst().balance(&ctx.user), FILL);
+    assert_eq!(ctx.dst().balance(&ctx.fee_recipient), fee);
+    assert_eq!(ctx.dst().balance(&ctx.solver), 0);
 }
 
 // ─── Issue #32: tiny bond slash floor ────────────────────────────────────────────
@@ -2743,6 +2800,47 @@ fn valid_evm_token_lowercase_accepted() {
         &MIN_DST,
         &deadline,
     );
+}
+
+/// Well-formed EVM addresses on "avalanche" and "bsc" are accepted — these
+/// two chains were previously missing from the `is_evm` check (#261).
+#[test]
+fn valid_evm_token_avalanche_and_bsc_accepted() {
+    let ctx = setup();
+    for chain_str in ["avalanche", "bsc"] {
+        let deadline: Option<u64> = None;
+        ctx.client().submit_intent(
+            &ctx.user,
+            &String::from_str(&ctx.env, chain_str),
+            &String::from_str(&ctx.env, "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+            &SRC_AMT,
+            &ctx.dst_token,
+            &MIN_DST,
+            &deadline,
+        );
+    }
+}
+
+/// A malformed token address on "avalanche" or "bsc" must be rejected, just
+/// like the other five EVM chains (#261 regression test).
+#[test]
+fn malformed_evm_token_avalanche_and_bsc_rejected() {
+    let ctx = setup();
+    for chain_str in ["avalanche", "bsc"] {
+        let deadline: Option<u64> = None;
+        let res = ctx.client().try_submit_intent(
+            &ctx.user,
+            &String::from_str(&ctx.env, chain_str),
+            // No "0x" prefix — would previously fall through as "unknown
+            // chain: skip validation" and pass.
+            &String::from_str(&ctx.env, "A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+            &SRC_AMT,
+            &ctx.dst_token,
+            &MIN_DST,
+            &deadline,
+        );
+        assert_eq!(res, Err(Ok(Error::InvalidSrcToken.into())));
+    }
 }
 
 /// Missing "0x" prefix on an EVM chain is rejected with InvalidSrcToken.

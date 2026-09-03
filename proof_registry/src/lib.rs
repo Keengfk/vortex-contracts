@@ -205,6 +205,9 @@ impl ProofRegistry {
     /// accepted by `receive_message`.
     pub fn set_authorized_emitter(env: Env, chain_id: u32, emitter: BytesN<32>) {
         Self::require_admin(&env);
+        if chain_id > u16::MAX as u32 {
+            panic_with_error!(&env, Error::ChainIdOutOfRange);
+        }
         env.storage()
             .instance()
             .set(&ProofKey::AuthorizedEmitter(chain_id), &emitter);
