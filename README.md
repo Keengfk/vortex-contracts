@@ -40,7 +40,9 @@ Core protocol logic (`intent_settlement/src/lib.rs`):
 - `cancel_intent()` — user cancels an open intent
 - `expire_intent()` — permissionless: materializes an unfilled intent's expiry
 - `slash_solver()` — permissionless: slashes a solver that failed to fill
+- `batch_submit_intent()` / `batch_accept_intent()` / `batch_fill_intent()` / `batch_cancel_intent()` — process up to `MAX_BATCH_SIZE` intents in one transaction; a failure on any item reverts the whole batch (#199)
 - `register_solver()` / `deregister_solver()` / `withdraw_bond()` — solver bond management
+- `get_solver()` / `get_solver_count()` / `list_solvers(start, limit)` — read solver records; `list_solvers` paginates the registered-solver set so integrators don't have to replay events (#198)
 - `propose_fee_recipient()` / `accept_fee_recipient()` — timelocked fee-recipient handover (#115, #116)
 - `propose_admin_transfer()` / `accept_admin_transfer()` — timelocked admin-key handover (#115, #116)
 - `pause()` / `unpause()` — admin-only incident response
@@ -119,6 +121,9 @@ src_amount = human_amount × 10^decimals
 | Arbitrum | USDC | 6 | 250 USDC | `250_000_000` |
 | BSC | BNB | 18 | 2 BNB | `2_000_000_000_000_000_000` |
 | BSC | USDT | 18 | 50 USDT | `50_000_000_000_000_000_000` |
+| Solana | USDC (SPL) | 6 | 500 USDC | `500_000_000` |
+| Solana | wSOL | 9 | 3 SOL | `3_000_000_000` |
+| Solana | BONK | 5 | 1 000 000 BONK | `100_000_000_000` |
 
 The existing README usage example (`src_amount 1000000000000000000` for
 1 ETH on Ethereum) follows this convention.
@@ -128,11 +133,16 @@ The existing README usage example (`src_amount 1000000000000000000` for
 > stablecoins on EVM chains are 6 decimals except on BSC, where USDT and BUSD
 > are 18.
 
+> **Solana — decimals are per-mint, not per-chain.** SPL mints set their own
+> decimals: USDC/USDT are 6, wrapped SOL and most LSTs are 9, BONK is 5. Read
+> the mint account's `decimals`; don't assume. See
+> [docs/132-supported-chains.md §3.2 and §4.8](./docs/132-supported-chains.md).
+
 **On-chain bound:** `src_amount` is stored as `i128`. The contract enforces
 `src_amount <= MAX_AMOUNT` (`10^30`), which accommodates amounts up to
 one trillion 18-decimal tokens. Any value above this threshold causes
-`submit_intent` to return `Error::ZeroAmount` (the generic out-of-range
-guard) in the current implementation.
+`submit_intent` to return `Error::AmountTooLarge` (the dedicated out-of-range
+guard; `ZeroAmount` still covers non-positive values).
 
 **Stellar side (`min_dst_amount`):** Stellar USDC (Circle's SAC) uses
 **7 decimals** (Stellar's native precision). So 3500 USDC on Stellar is
@@ -155,23 +165,38 @@ stellar contract invoke --id <CONTRACT_ID> --source <SECRET_KEY> --network testn
 
 #### Intent Lifecycle
 
-The diagram below covers all six `IntentState` variants and the functions that
-drive each transition.
+The diagram below covers every `IntentState` variant and the functions that
+drive each transition, including the competitive bid window (issue #191) and the
+escrow / dispute-resolution flow (issue #188).
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Open : submit_intent()
+    [*] --> Open : submit_intent()\n[bid window disabled]
+    [*] --> Bidding : submit_intent()\n[bid window enabled]
+
+    Bidding --> Accepted : settle_bids()\n[best bid, bidder still eligible,\n now >= bid deadline]
+    Bidding --> Open : settle_bids()\n[no usable bid]
+    Open --> Bidding : (never — one-way)
 
     Open --> Accepted : accept_intent()\n[solver registered & active,\n deadline not reached]
     Open --> Cancelled : cancel_intent()\n[caller == intent.user]
     Open --> Expired : expire_intent()\n[now >= deadline]
 
     Accepted --> Filled : fill_intent()\n[fill_amount >= min_dst_amount,\n now < deadline]
-    Accepted --> Open : slash_solver()\n[now >= deadline]\n(10 % bond slashed,\nintent re-opened with fresh deadline)
+    Accepted --> PartiallyFilled : fill_intent()\n[partial fill]
+    Accepted --> Filling : begin_fill()\n[completing fill into escrow,\n starts dispute window]
+    Accepted --> Open : slash_solver()\n[now >= deadline]\n(bond slashed proportionally,\nintent re-opened with fresh deadline)
+
+    Filling --> Filled : release_fill()\n[now >= dispute_deadline,\n no dispute]
+    Filling --> Disputed : dispute_fill()\n[caller == intent.user,\n within dispute window]
+
+    Disputed --> Resolved : resolve_dispute()\n[arbiter; Upheld slashes solver,\n Dismissed does not — user paid either way]
+    Disputed --> Resolved : release_fill()\n[now >= arbiter timeout;\n full escrow to user, no slash]
 
     Filled --> [*]
     Cancelled --> [*]
     Expired --> [*]
+    Resolved --> [*]
 ```
 
 > **Note:** `accept_intent` also lazily sets state to `Expired` (and panics)
@@ -248,10 +273,15 @@ registered via `add_allowed_src_chain()` are accepted.
 | `"optimism"` | OP Mainnet | EVM L2 | `0x` + 40 hex chars |
 | `"avalanche"` | Avalanche C-Chain | EVM | `0x` + 40 hex chars |
 | `"bsc"` | BNB Smart Chain | EVM | `0x` + 40 hex chars |
-| `"solana"` | Solana Mainnet Beta | SVM | base58 mint address *(planned)* |
+| `"solana"` | Solana Mainnet Beta | SVM | base58 SPL mint, 32–44 chars, no `0x` |
+
+`submit_intent` format-validates `src_token` on-chain for the five EVM chains
+above (`ethereum`/`base`/`polygon`/`arbitrum`/`optimism`) and for `solana`
+(base58 alphabet, 32–44 chars). `avalanche` and `bsc` are accepted but their
+`src_token` is not yet format-checked on-chain.
 
 For the full token address reference (contract addresses, decimals per chain,
-and allowlist management commands) see
+Solana SPL mints, and allowlist management commands) see
 [docs/132-supported-chains.md](./docs/132-supported-chains.md).
 
 > **Decimal reminder:** EVM tokens use 18 decimals for native assets and
