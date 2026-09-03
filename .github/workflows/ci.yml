@@ -13,11 +13,15 @@ concurrency:
 
 jobs:
   fmt:
-    name: Formatting
+    name: Formatting (${{ matrix.crate }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: [intent_settlement, proof_registry]
     defaults:
       run:
-        working-directory: intent_settlement
+        working-directory: ${{ matrix.crate }}
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
@@ -28,17 +32,18 @@ jobs:
         run: cargo fmt --all -- --check
 
   contract:
-    name: Contract (${{ matrix.toolchain }})
+    name: Contract (${{ matrix.crate }} / ${{ matrix.toolchain }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
+        crate: [intent_settlement, proof_registry]
         # stable — tracks latest stable Rust
         # 1.78   — MSRV declared in README ("Rust 1.78+")
         toolchain: [stable, "1.78"]
     defaults:
       run:
-        working-directory: intent_settlement
+        working-directory: ${{ matrix.crate }}
     steps:
       - uses: actions/checkout@v4
 
@@ -50,12 +55,12 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: intent_settlement
+          workspaces: ${{ matrix.crate }}
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: intent_settlement
+          workspaces: ${{ matrix.crate }}
           # Separate cache per toolchain to avoid cross-contamination
           key: ${{ matrix.toolchain }}
 
@@ -74,11 +79,15 @@ jobs:
         run: cargo test
 
   wasm-size:
-    name: Wasm size budget
+    name: Wasm size budget (${{ matrix.crate }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: [intent_settlement, proof_registry]
     defaults:
       run:
-        working-directory: intent_settlement
+        working-directory: ${{ matrix.crate }}
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
@@ -126,7 +135,7 @@ jobs:
           MAX_BYTES=64500
           WASM=$(ls target/wasm32-unknown-unknown/release/*.optimized.wasm | head -n1)
           SIZE=$(wc -c < "$WASM")
-          echo "### Wasm size report" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Wasm size report (${{ matrix.crate }})" >> "$GITHUB_STEP_SUMMARY"
           echo "| File | Size (bytes) | Budget (bytes) | Status |" >> "$GITHUB_STEP_SUMMARY"
           echo "| ---- | -----------: | -------------: | ------ |" >> "$GITHUB_STEP_SUMMARY"
           if [ "$SIZE" -le "$MAX_BYTES" ]; then
@@ -185,18 +194,22 @@ jobs:
         run: PROPTEST_CASES=256 cargo test --features testutils -- bond_conservation
 
   audit:
-    name: Dependency audit
+    name: Dependency audit (${{ matrix.crate }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: [intent_settlement, proof_registry]
     defaults:
       run:
-        working-directory: intent_settlement
+        working-directory: ${{ matrix.crate }}
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: intent_settlement
+          workspaces: ${{ matrix.crate }}
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
       - name: Audit dependencies

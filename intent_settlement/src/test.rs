@@ -290,6 +290,157 @@ fn admin_can_transfer_admin() {
     assert_eq!(ctx.client().get_fee_recipient(), Some(another_recipient));
 }
 
+#[test]
+fn admin_can_cancel_pending_fee_recipient() {
+    let ctx = setup();
+    let new_recipient = Address::generate(&ctx.env);
+
+    ctx.client().propose_fee_recipient(&new_recipient);
+    assert!(ctx.client().get_pending_fee_recipient().is_some());
+
+    ctx.client().cancel_pending_fee_recipient();
+    assert_eq!(ctx.client().get_pending_fee_recipient(), None);
+
+    let res = ctx.client().try_accept_fee_recipient(&new_recipient);
+    assert_eq!(res, Err(Ok(Error::NoPendingFeeRecipient.into())));
+}
+
+#[test]
+fn cancel_pending_fee_recipient_without_proposal_fails() {
+    let ctx = setup();
+    let res = ctx.client().try_cancel_pending_fee_recipient();
+    assert_eq!(res, Err(Ok(Error::NoPendingFeeRecipient.into())));
+}
+
+#[test]
+fn admin_can_resubmit_after_canceling_fee_recipient() {
+    let ctx = setup();
+    let recipient1 = Address::generate(&ctx.env);
+    let recipient2 = Address::generate(&ctx.env);
+
+    ctx.client().propose_fee_recipient(&recipient1);
+    ctx.client().cancel_pending_fee_recipient();
+    assert_eq!(ctx.client().get_pending_fee_recipient(), None);
+
+    ctx.client().propose_fee_recipient(&recipient2);
+    let (pending, _eta) = ctx.client().get_pending_fee_recipient().unwrap();
+    assert_eq!(pending, recipient2);
+}
+
+#[test]
+fn admin_can_cancel_pending_admin_transfer() {
+    let ctx = setup();
+    let new_admin = Address::generate(&ctx.env);
+
+    ctx.client().propose_admin_transfer(&new_admin);
+    assert!(ctx.client().get_pending_admin().is_some());
+
+    ctx.client().cancel_pending_admin_transfer();
+    assert_eq!(ctx.client().get_pending_admin(), None);
+
+    let res = ctx.client().try_accept_admin_transfer(&new_admin);
+    assert_eq!(res, Err(Ok(Error::NoPendingAdminTransfer.into())));
+}
+
+#[test]
+fn cancel_pending_admin_transfer_without_proposal_fails() {
+    let ctx = setup();
+    let res = ctx.client().try_cancel_pending_admin_transfer();
+    assert_eq!(res, Err(Ok(Error::NoPendingAdminTransfer.into())));
+}
+
+#[test]
+fn admin_can_resubmit_after_canceling_admin_transfer() {
+    let ctx = setup();
+    let admin1 = Address::generate(&ctx.env);
+    let admin2 = Address::generate(&ctx.env);
+
+    ctx.client().propose_admin_transfer(&admin1);
+    ctx.client().cancel_pending_admin_transfer();
+    assert_eq!(ctx.client().get_pending_admin(), None);
+
+    ctx.client().propose_admin_transfer(&admin2);
+    let (pending, _eta) = ctx.client().get_pending_admin().unwrap();
+    assert_eq!(pending, admin2);
+}
+
+#[test]
+fn admin_can_cancel_pending_dst_token_add() {
+    let ctx = setup();
+    let token = Address::generate(&ctx.env);
+
+    ctx.client().propose_add_dst_token(&token);
+    assert!(ctx.client().get_pending_dst_token_add(&token).is_some());
+
+    ctx.client().cancel_pending_dst_token_add(&token);
+    assert_eq!(ctx.client().get_pending_dst_token_add(&token), None);
+
+    let res = ctx.client().try_execute_add_dst_token(&token);
+    assert_eq!(res, Err(Ok(Error::NoPendingDstTokenChange.into())));
+}
+
+#[test]
+fn cancel_pending_dst_token_add_without_proposal_fails() {
+    let ctx = setup();
+    let token = Address::generate(&ctx.env);
+    let res = ctx.client().try_cancel_pending_dst_token_add(&token);
+    assert_eq!(res, Err(Ok(Error::NoPendingDstTokenChange.into())));
+}
+
+#[test]
+fn admin_can_resubmit_after_canceling_dst_token_add() {
+    let ctx = setup();
+    let token1 = Address::generate(&ctx.env);
+    let token2 = Address::generate(&ctx.env);
+
+    ctx.client().propose_add_dst_token(&token1);
+    ctx.client().cancel_pending_dst_token_add(&token1);
+    assert_eq!(ctx.client().get_pending_dst_token_add(&token1), None);
+
+    ctx.client().propose_add_dst_token(&token2);
+    let _eta = ctx.client().get_pending_dst_token_add(&token2).unwrap();
+}
+
+#[test]
+fn admin_can_cancel_pending_dst_token_remove() {
+    let ctx = setup();
+    let token = Address::generate(&ctx.env);
+
+    ctx.allow_dst_token(&token);
+
+    ctx.client().propose_remove_dst_token(&token);
+    assert!(ctx.client().get_pending_dst_token_remove(&token).is_some());
+
+    ctx.client().cancel_pending_dst_token_remove(&token);
+    assert_eq!(ctx.client().get_pending_dst_token_remove(&token), None);
+
+    let res = ctx.client().try_execute_remove_dst_token(&token);
+    assert_eq!(res, Err(Ok(Error::NoPendingDstTokenChange.into())));
+}
+
+#[test]
+fn cancel_pending_dst_token_remove_without_proposal_fails() {
+    let ctx = setup();
+    let token = Address::generate(&ctx.env);
+    let res = ctx.client().try_cancel_pending_dst_token_remove(&token);
+    assert_eq!(res, Err(Ok(Error::NoPendingDstTokenChange.into())));
+}
+
+#[test]
+fn admin_can_resubmit_after_canceling_dst_token_remove() {
+    let ctx = setup();
+    let token = Address::generate(&ctx.env);
+
+    ctx.allow_dst_token(&token);
+
+    ctx.client().propose_remove_dst_token(&token);
+    ctx.client().cancel_pending_dst_token_remove(&token);
+    assert_eq!(ctx.client().get_pending_dst_token_remove(&token), None);
+
+    ctx.client().propose_remove_dst_token(&token);
+    let _eta = ctx.client().get_pending_dst_token_remove(&token).unwrap();
+}
+
 // ─── Pause ──────────────────────────────────────────────────────────────────────
 
 #[test]
