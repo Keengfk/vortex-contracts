@@ -3404,10 +3404,62 @@ impl IntentSettlement {
 
     // ── Fill Window Extension ─────────────────────────────────────────────────
 
-    /// Solver requests a grace-period extension on an Accepted intent.
-    /// Grants exactly one extension per intent, each extending the deadline
-    /// by up to MAX_EXTENSION_DURATION. Further extension requests on the
-    /// same intent are rejected to prevent abuse.
+    /// Per-intent cumulative fill-window extension budget for `solver`, in
+    /// seconds, gated by the solver's reputation tier (#200).
+    ///
+    /// The tier is derived locally from the solver's own `SolverRecord`
+    /// (`fills_completed` plus `compute_reputation_score`) rather than from a
+    /// cross-contract call into `solver_registry`, so this ships before the
+    /// registry does; the return value is all `request_extension` consumes,
+    /// so swapping in a real tier lookup later is not an ABI break.
+    ///
+    /// Tiers mirror the fill-window perk table in
+    /// `docs/solver-registry-design.md` (+10% / +20% / +30% / +50% on top of
+    /// the base `MAX_EXTENSION_DURATION`). An unranked solver — no record, no
+    /// fills, or a zero reputation score — gets exactly `MAX_EXTENSION_DURATION`,
+    /// i.e. the historical one-shot behaviour, so nobody who is not yet tiered
+    /// sees a change. Every result is clamped to `MAX_TOTAL_EXTENSION`, the
+    /// tier-independent anti-abuse ceiling.
+    fn extension_cap_secs(env: &Env, solver: &Address) -> u64 {
+        let base = MAX_EXTENSION_DURATION;
+
+        let record: Option<SolverRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Solver(solver.clone()));
+
+        let cap = match record {
+            None => base,
+            Some(r) => {
+                let score = Self::compute_reputation_score(&r);
+                let fills = r.fills_completed;
+                // (min fills, min reputation bps) → extension multiplier %
+                if fills >= 1_000 && score >= 9_000 {
+                    base * 150 / 100 // Platinum: +50%
+                } else if fills >= 200 && score >= 8_500 {
+                    base * 130 / 100 // Gold: +30%
+                } else if fills >= 50 && score >= 7_000 {
+                    base * 120 / 100 // Silver: +20%
+                } else if fills >= 10 && score >= 5_000 {
+                    base * 110 / 100 // Bronze: +10%
+                } else {
+                    base // Unranked: unchanged one-shot behaviour
+                }
+            }
+        };
+
+        cap.min(MAX_TOTAL_EXTENSION)
+    }
+
+    /// Solver requests a grace-period extension on an Accepted intent (#200).
+    ///
+    /// Each call pushes the deadline out by `MAX_EXTENSION_DURATION`. Multiple
+    /// extensions are allowed as long as the running total for the intent stays
+    /// within the solver's reputation-tier budget (`extension_cap_secs`); an
+    /// unranked solver's budget equals a single `MAX_EXTENSION_DURATION`, so the
+    /// historical one-extension-per-intent rule is preserved for them. The
+    /// per-intent total can never exceed `MAX_TOTAL_EXTENSION` regardless of
+    /// tier — that is the anti-abuse backstop.
     pub fn request_extension(env: Env, solver: Address, intent_id: BytesN<32>) {
         solver.require_auth();
         Self::bump_instance_ttl(&env);
@@ -3437,15 +3489,26 @@ impl IntentSettlement {
             panic_with_error!(&env, Error::ExtensionAlreadyGranted);
         }
 
-        let now = env.ledger().timestamp();
+        // Cumulative extension budget already consumed on this intent.
+        let used: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ExtensionGranted(intent_id.clone()))
+            .unwrap_or(0);
 
-        // Extend the deadline by the full extension duration
-        intent.deadline = now + MAX_EXTENSION_DURATION;
+        let cap = Self::extension_cap_secs(&env, &solver);
+        let new_used = used
+            .checked_add(MAX_EXTENSION_DURATION)
+            .unwrap_or(u64::MAX);
+        if new_used > cap {
+            panic_with_error!(&env, Error::ExtensionCapExceeded);
+        }
 
-        // Record that this intent has used its one extension
+        // Extend the deadline by one extension quantum and record the new total.
+        intent.deadline += MAX_EXTENSION_DURATION;
         env.storage()
             .persistent()
-            .set(&DataKey::ExtensionGranted(intent_id.clone()), &true);
+            .set(&DataKey::ExtensionGranted(intent_id.clone()), &new_used);
 
         Self::save_intent(&env, &intent_id, &intent);
 
