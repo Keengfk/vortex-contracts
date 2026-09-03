@@ -70,6 +70,10 @@ const DISPUTE_WINDOW: u64 = 3600; // 1 hour: time for user to notice and contest
 const ARBITER_WINDOW: u64 = 86400; // 24 hours: time for arbiter to resolve
 const DISPUTE_BOND: i128 = 1 * 10_000_000; // 1 USDC: anti-griefing bond from user
 
+/// Upper bound on the number of intent IDs `list_open_intents` returns per
+/// call (issue #249), bounding the resource cost of paginated reads.
+const MAX_PAGE_SIZE: u32 = 100;
+
 /// Delay enforced between proposing and executing a sensitive admin change
 /// (admin transfer, fee recipient handover, dst_token allowlist changes).
 /// Gives users and solvers a window to notice and react before the change
@@ -294,6 +298,13 @@ pub enum DataKey {
     /// **Instance storage.** Cumulative `dst_token` volume (`i128`) across
     /// all successfully filled intents.  Incremented by `fill_intent`.
     TotalVolume,
+
+    /// **Instance storage.** Cumulative protocol fee revenue (`i128`)
+    /// collected across all fills (issue #248). Incremented by `fill_intent`
+    /// with the same `fee` value transferred to `FeeRecipient`, so it can
+    /// never drift from real transferred amounts. Absent until the first
+    /// fill after this field was introduced; `unwrap_or(0)` handles that.
+    TotalFeesCollected,
 
     /// **Instance storage.** Count of currently registered solvers (`u32`).
     /// Incremented by `register_solver` on first registration, decremented
@@ -1829,6 +1840,12 @@ impl IntentSettlement {
             .instance()
             .set(&DataKey::OpenIntents, &(open + 1));
 
+        // #249: only truly Open intents (not Bidding, which isn't directly
+        // fillable) are enumerable via list_open_intents.
+        if intent.state == IntentState::Open {
+            Self::add_to_open_intent_list(&env, &intent_id);
+        }
+
         env.events().publish(
             (Symbol::new(&env, "intent_submitted"), user),
             (intent_id.clone(), min_dst_amount, expiry),
@@ -1957,6 +1974,7 @@ impl IntentSettlement {
         env.storage()
             .instance()
             .set(&DataKey::OpenIntents, &open.saturating_sub(1));
+        Self::remove_from_open_intent_list(&env, &intent_id);
 
         Self::save_intent(&env, &intent_id, &intent);
 
@@ -2140,6 +2158,7 @@ impl IntentSettlement {
             env.storage()
                 .instance()
                 .set(&DataKey::OpenIntents, &(open + 1));
+            Self::add_to_open_intent_list(&env, &intent_id);
         }
 
         env.storage()
@@ -2570,6 +2589,7 @@ impl IntentSettlement {
         env.storage()
             .instance()
             .set(&DataKey::OpenIntents, &(open + 1));
+        Self::add_to_open_intent_list(&env, &intent_id);
 
         // Persist both records BEFORE any token transfer so that a re-entrant
         // or back-to-back call on the same intent_id is rejected by the
