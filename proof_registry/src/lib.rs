@@ -51,6 +51,16 @@ use soroban_sdk::{
     Bytes, BytesN, Env, String, Symbol,
 };
 
+/// Issue #254: how long (in seconds) a `ProofRecord` remains usable to gate a
+/// `fill_intent` call after `receive_message` stores it. Chosen to comfortably
+/// exceed `intent_settlement`'s 300-second `FILL_WINDOW` plus realistic
+/// VAA-relay latency (1–20 minutes across the bridge protocols compared in
+/// `docs/bridge-protocol-comparison.md`), so a proof arriving even somewhat
+/// late is never spuriously rejected as stale. This is distinct from Soroban
+/// storage-TTL archival (issue #51) — this is business-logic staleness, not
+/// ledger-entry expiry.
+pub const PROOF_VALIDITY_WINDOW: u64 = 3600;
+
 #[cfg(test)]
 mod test;
 
@@ -461,6 +471,29 @@ impl ProofRegistry {
     /// Returns `true` iff a verified proof exists for `intent_id`.
     pub fn has_proof(env: Env, intent_id: BytesN<32>) -> bool {
         env.storage().persistent().has(&ProofKey::Proof(intent_id))
+    }
+
+    /// Return `intent_id`'s `ProofRecord` only if it exists and is still
+    /// fresh (`now - received_at <= PROOF_VALIDITY_WINDOW`). Panics with
+    /// `Error::ProofNotFound` if no proof was received, or
+    /// `Error::ProofStale` if one exists but has aged out (issue #254).
+    /// This is the entry point `fill_intent`'s proof check (issue #5) is
+    /// intended to call — `get_proof`/`has_proof` remain raw, freshness-blind
+    /// reads for other callers.
+    pub fn get_fresh_proof(env: Env, intent_id: BytesN<32>) -> ProofRecord {
+        let record: ProofRecord = env
+            .storage()
+            .persistent()
+            .get(&ProofKey::Proof(intent_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ProofNotFound));
+        let now = env.ledger().timestamp();
+        // Boundary: exactly at the validity window is still fresh (inclusive),
+        // matching this codebase's documented inclusive/exclusive convention
+        // (issue #26) — validity holds through the boundary second itself.
+        if now - record.received_at > PROOF_VALIDITY_WINDOW {
+            panic_with_error!(&env, Error::ProofStale);
+        }
+        record
     }
 
     // ── Test Back-Door ────────────────────────────────────────────────────────

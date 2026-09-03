@@ -1347,6 +1347,58 @@ fn fill_by_wrong_solver_fails() {
     assert_eq!(res, Err(Ok(Error::Unauthorized.into())));
 }
 
+#[test]
+fn is_intent_fillable_matches_fill_intent_outcome() {
+    let ctx = setup();
+    ctx.register_solver();
+    let id = ctx.submit();
+    ctx.client().accept_intent(&ctx.solver, &id);
+
+    // Genuinely fillable: matches a real fill_intent success.
+    assert!(ctx.client().is_intent_fillable(&id, &ctx.solver));
+    ctx.dst_admin().mint(&ctx.solver, &FILL);
+    ctx.client().fill_intent(&ctx.solver, &id, &FILL);
+}
+
+#[test]
+fn is_intent_fillable_false_for_wrong_solver() {
+    let ctx = setup();
+    ctx.register_solver();
+    let id = ctx.submit();
+    ctx.client().accept_intent(&ctx.solver, &id);
+
+    let other = Address::generate(&ctx.env);
+    ctx.bond_admin().mint(&other, &BOND);
+    ctx.client().register_solver(&other, &BOND);
+
+    assert!(!ctx.client().is_intent_fillable(&id, &other));
+    ctx.dst_admin().mint(&other, &FILL);
+    let res = ctx.client().try_fill_intent(&other, &id, &FILL);
+    assert_eq!(res, Err(Ok(Error::Unauthorized.into())));
+}
+
+#[test]
+fn is_intent_fillable_false_after_deadline() {
+    let ctx = setup();
+    ctx.register_solver();
+    let id = ctx.submit();
+    ctx.client().accept_intent(&ctx.solver, &id);
+
+    ctx.pass_time(FILL_WINDOW + 1);
+    assert!(!ctx.client().is_intent_fillable(&id, &ctx.solver));
+
+    ctx.dst_admin().mint(&ctx.solver, &FILL);
+    let res = ctx.client().try_fill_intent(&ctx.solver, &id, &FILL);
+    assert_eq!(res, Err(Ok(Error::FillWindowExpired.into())));
+}
+
+#[test]
+fn is_intent_fillable_false_for_nonexistent_intent() {
+    let ctx = setup();
+    let bogus_id = BytesN::from_array(&ctx.env, &[9u8; 32]);
+    assert!(!ctx.client().is_intent_fillable(&bogus_id, &ctx.solver));
+}
+
 // ─── Cancellation ───────────────────────────────────────────────────────────────
 
 #[test]

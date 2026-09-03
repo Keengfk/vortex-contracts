@@ -118,6 +118,10 @@ stellar contract invoke --id <CONTRACT_ID> --source <SOLVER_SECRET_KEY> --networ
 stellar contract invoke --id <CONTRACT_ID> --source <SOLVER_SECRET_KEY> --network testnet -- \
   accept_intent --solver <SOLVER_ADDRESS> --intent_id <INTENT_ID>
 
+# Read-only: solver self-checks that fill_intent would succeed before spending a transaction
+stellar contract invoke --id <CONTRACT_ID> --source <ANY_SECRET_KEY> --network testnet -- \
+  is_intent_fillable --intent_id <INTENT_ID> --solver <SOLVER_ADDRESS>
+
 # Solver delivers the output and closes out the intent
 stellar contract invoke --id <CONTRACT_ID> --source <SOLVER_SECRET_KEY> --network testnet -- \
   fill_intent --solver <SOLVER_ADDRESS> --intent_id <INTENT_ID> --fill_amount 35000000000
