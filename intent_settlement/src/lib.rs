@@ -553,6 +553,38 @@ pub struct SolverRecord {
     pub bond_tokens: Vec<Address>,
 }
 
+/// Reputation fields preserved across a `deregister_solver` / `register_solver`
+/// cycle for the same solver address (#272).
+///
+/// When `deregister_solver` runs it writes this snapshot to
+/// `DataKey::SolverReputation(address)` *before* deleting the `SolverRecord`.
+/// When `register_solver` runs for the same address it reads this snapshot (if
+/// present) and carries the fields forward into the new `SolverRecord`, then
+/// removes the snapshot.
+///
+/// Only the fields that matter for cooldown enforcement and reputation scoring
+/// are preserved — `bond_amount`, `active_intents`, `registered_at`, and
+/// `is_active` are intentionally reset (the solver is starting a new bonding
+/// period; they must re-post bond and are active again from the moment of
+/// re-registration).
+#[contracttype]
+#[derive(Clone)]
+pub struct ReputationSnapshot {
+    /// Timestamp of the most recent slash event, carried forward so that the
+    /// `SLASH_COOLDOWN` guard in `accept_intent` remains effective even after
+    /// a deregister/re-register cycle.
+    pub last_slash_time: u64,
+    /// Cumulative successful fills; preserved so `compute_reputation_score`
+    /// reflects the solver's true track record.
+    pub fills_completed: u32,
+    /// Cumulative failed fills (missed windows); preserved to prevent solvers
+    /// from wiping a bad fill ratio by cycling through deregister/re-register.
+    pub fills_failed: u32,
+    /// Cumulative dst-token volume delivered across all fills; preserved so
+    /// the volume-based bonus in `compute_reputation_score` cannot be reset.
+    pub total_volume: i128,
+}
+
 // ─── Errors ───────────────────────────────────────────────────────────────────
 
 #[contracterror]
@@ -1283,6 +1315,8 @@ impl IntentSettlement {
         env.storage()
             .persistent()
             .set(&DataKey::MinBondMultiplier(token.clone()), &multiplier);
+        // #271: bump TTL so the multiplier is not silently archived back to 1.0×.
+        Self::bump_min_bond_multiplier_ttl(&env, &token);
         env.events().publish(
             (Symbol::new(&env, "bond_multiplier_set"),),
             (token, multiplier),
@@ -1933,6 +1967,9 @@ impl IntentSettlement {
         env.storage()
             .persistent()
             .set(&DataKey::UserIntents(user.clone()), &user_intents);
+        // #271: bump TTL so list_intents_by_user never silently returns an
+        // incomplete list due to archival.
+        Self::bump_user_intents_ttl(&env, &user);
 
         let total: u64 = env
             .storage()
@@ -2192,22 +2229,18 @@ impl IntentSettlement {
         // Solver also pays the protocol fee on each fill.
         let fee = fill_amount * protocol_fee_bps / 10_000;
         // ── Effects first (CEI) ──────────────────────────────────────────────
-        // Mark the intent Filled and write every state change to storage
-        // *before* any external token transfer executes. A hostile SEP-41
-        // token that attempts to re-enter fill_intent or slash_solver during
-        // the transfer would see the intent already Filled and be rejected.
-        // Solver delivers the full requested output to the user.
-        let dst_client = token::Client::new(&env, &intent.dst_token);
-        dst_client.transfer(&solver, &intent.user, &fill_amount);
+        // Accumulate the fill, update intent state, and write all storage changes
+        // *before* any external token transfer executes.  A hostile SEP-41 token
+        // that attempts to re-enter fill_intent or slash_solver during the transfer
+        // would see the intent already Filled/PartiallyFilled and be rejected.
 
-        // Solver also pays the protocol fee (priced into their quote). Taking the
-        // fee from the solver — rather than clawing it back from the user — keeps
-        // the user's received amount at or above `min_dst_amount`, and keeps every
-        // token transfer authorized by the solver who signed this call.
-        //
+        // Compute protocol fee with explicit checked arithmetic (#269 / #31).
+        // Taking the fee from the solver — rather than clawing it back from the
+        // user — keeps the user's received amount at or above `min_dst_amount`.
         // Explicit checked_mul/checked_div makes the overflow-safety property
         // visible in code, rather than relying solely on the Cargo.toml
-        // overflow-checks = true release-profile setting (issue #31).
+        // overflow-checks = true release-profile setting.
+        let fee_bps = Self::get_tiered_fee_bps(&env);
         let fee = fill_amount
             .checked_mul(fee_bps)
             .unwrap_or_else(|| panic_with_error!(&env, Error::FeeOverflow))
