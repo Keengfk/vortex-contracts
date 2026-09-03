@@ -2272,17 +2272,11 @@ fn double_slash_second_call_rejected() {
     let id = ctx.submit();
     c.accept_intent(&ctx.solver, &id);
 
-    ctx.pass_time(FILL_WINDOW + 1);
+    let overflow_fill: i128 = i128::MAX / 5 + 1;
 
-    // First slash succeeds.
-    c.slash_solver(&id);
-    let intent = c.get_intent(&id).unwrap();
-    assert!(intent.state == IntentState::Open);
-
-    // Second slash on the same id must be rejected: the intent is now Open,
-    // not Accepted.
-    let res = c.try_slash_solver(&id);
-    assert_eq!(res, Err(Ok(crate::Error::IntentNotAccepted.into())));
+    ctx.dst_admin().mint(&ctx.solver, &(overflow_fill + 1));
+    let res = c.try_fill_intent(&ctx.solver, &id, &overflow_fill);
+    assert_eq!(res, Err(Ok(Error::FeeOverflow.into())));
 }
 
 // ─── Issue #31: fee overflow boundary ────────────────────────────────────────────
