@@ -370,7 +370,7 @@ pub enum DataKey {
 // ─── Data Structs ─────────────────────────────────────────────────────────────
 
 /// Admin-configurable protocol parameters.  Stored as a single instance-storage
-/// entry so all four values are read/written atomically.
+/// entry so all values are read/written atomically.
 #[contracttype]
 #[derive(Clone)]
 pub struct ProtocolConfig {
@@ -382,6 +382,8 @@ pub struct ProtocolConfig {
     pub intent_expiry: u64,
     /// Protocol fee in basis points charged on each fill (0.01% per bps).
     pub protocol_fee_bps: i128,
+    /// Maximum number of intents a single solver may accept simultaneously (issue #230).
+    pub max_active_intents_per_solver: u32,
 }
 
 /// A user's cross-chain swap intent
@@ -716,6 +718,7 @@ impl IntentSettlement {
         env.storage().instance().set(&DataKey::TotalVolume, &0i128);
         env.storage().instance().set(&DataKey::TotalSolvers, &0u32);
         env.storage().instance().set(&DataKey::OpenIntents, &0u64);
+        env.storage().instance().set(&DataKey::TotalBonded, &0i128);
         // Seed Config with defaults so the contract is immediately usable
         // without a follow-up admin call.
         env.storage().instance().set(
@@ -725,6 +728,7 @@ impl IntentSettlement {
                 fill_window: DEFAULT_FILL_WINDOW,
                 intent_expiry: DEFAULT_INTENT_EXPIRY,
                 protocol_fee_bps: DEFAULT_PROTOCOL_FEE_BPS,
+                max_active_intents_per_solver: DEFAULT_MAX_ACTIVE_INTENTS_PER_SOLVER,
             },
         );
         // Fresh deploys are already at the current schema — `migrate` is a
@@ -953,19 +957,21 @@ impl IntentSettlement {
         Self::load_config(&env)
     }
 
-    /// Admin-only: update the four configurable protocol parameters atomically.
+    /// Admin-only: update the configurable protocol parameters atomically.
     ///
     /// Bounds (any violation returns `InvalidConfig`):
-    /// * `protocol_fee_bps`  ≤ 1 000 (10%)
-    /// * `fill_window`       ≥ 60 s
-    /// * `intent_expiry`     ≥ 300 s and > fill_window
-    /// * `min_bond`          ≥ 1 token unit (10_000_000 for 7-decimal USDC)
+    /// * `protocol_fee_bps`                ≤ 1 000 (10%)
+    /// * `fill_window`                     ≥ 60 s
+    /// * `intent_expiry`                   ≥ 300 s and > fill_window
+    /// * `min_bond`                        ≥ 1 token unit (10_000_000 for 7-decimal USDC)
+    /// * `max_active_intents_per_solver`   ≥ 1
     pub fn set_config(
         env: Env,
         min_bond: i128,
         fill_window: u64,
         intent_expiry: u64,
         protocol_fee_bps: i128,
+        max_active_intents_per_solver: u32,
     ) {
         Self::require_admin(&env);
 
@@ -981,19 +987,23 @@ impl IntentSettlement {
         if min_bond < MIN_BOND_FLOOR {
             panic_with_error!(&env, Error::InvalidConfig);
         }
+        if max_active_intents_per_solver == 0 {
+            panic_with_error!(&env, Error::InvalidConfig);
+        }
 
         let cfg = ProtocolConfig {
             min_bond,
             fill_window,
             intent_expiry,
             protocol_fee_bps,
+            max_active_intents_per_solver,
         };
         env.storage().instance().set(&DataKey::Config, &cfg);
         Self::bump_instance_ttl(&env);
 
         env.events().publish(
             (Symbol::new(&env, "config_updated"),),
-            (min_bond, fill_window, intent_expiry, protocol_fee_bps),
+            (min_bond, fill_window, intent_expiry, protocol_fee_bps, max_active_intents_per_solver),
         );
     }
 
@@ -1453,6 +1463,16 @@ impl IntentSettlement {
             .set(&DataKey::Solver(solver.clone()), &record);
         Self::bump_solver_ttl(&env, &solver);
 
+        // Increment TotalBonded by the amount being added (issue #231)
+        let total_bonded: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalBonded)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalBonded, &(total_bonded + bond_amount));
+
         if is_new_solver {
             let total: u32 = env
                 .storage()
@@ -1899,6 +1919,12 @@ impl IntentSettlement {
             panic_with_error!(&env, Error::IntentNotOpen);
         }
 
+        // Issue #230: Check max-active-intents cap before accepting
+        let cfg = Self::load_config(&env);
+        if solver_record.active_intents >= cfg.max_active_intents_per_solver {
+            panic_with_error!(&env, Error::MaxActiveIntentsCapReached);
+        }
+
         intent.solver = Some(solver.clone());
         intent.state = IntentState::Accepted;
         intent.bond_token = bond_token.clone();
@@ -2274,6 +2300,16 @@ impl IntentSettlement {
         solver_record.fills_failed += 1;
         solver_record.last_slash_time = now;
         solver_record.active_intents = solver_record.active_intents.saturating_sub(1);
+
+        // Decrement TotalBonded by the slashed amount (issue #231)
+        let total_bonded: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalBonded)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalBonded, &(total_bonded - slash_amount));
 
         let cfg = Self::load_config(&env);
         // A solver whose bond no longer covers the minimum for the token that
@@ -3196,6 +3232,32 @@ impl IntentSettlement {
         env.storage().persistent().get(&DataKey::Intent(intent_id))
     }
 
+    /// Issue #232: Get an intent's deadline-adjusted state without mutating storage.
+    /// Returns `Expired` for an Open/PartiallyFilled intent whose deadline has passed,
+    /// giving callers a true picture of the intent's logical state without requiring
+    /// them to independently track deadlines and compare against wall-clock time.
+    ///
+    /// For all other states (Accepted, Filled, Cancelled, Slashed, Bidding) this
+    /// returns the stored state as-is. Boundary semantics match expire_intent:
+    /// deadline is INCLUSIVE (now >= intent.deadline means expired).
+    pub fn get_effective_intent_state(env: Env, intent_id: BytesN<32>) -> Option<IntentState> {
+        let mut intent: IntentRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Intent(intent_id))?;
+
+        let now = env.ledger().timestamp();
+        // Only Open/PartiallyFilled intents can be logically expired; other states
+        // are already terminal or intermediate with different semantics.
+        if (intent.state == IntentState::Open || intent.state == IntentState::PartiallyFilled)
+            && now >= intent.deadline
+        {
+            intent.state = IntentState::Expired;
+        }
+
+        Some(intent.state)
+    }
+
     /// Fetch a solver's full record by address, or None if never registered.
     pub fn get_solver(env: Env, solver: Address) -> Option<SolverRecord> {
         env.storage().persistent().get(&DataKey::Solver(solver))
@@ -3212,9 +3274,9 @@ impl IntentSettlement {
     }
 
     /// Whether `solver` currently meets accept_intent's requirements
-    /// (registered, active, bonded above MIN_BOND). Lets off-chain solver
-    /// bots self-check eligibility without independently reimplementing
-    /// the same logic accept_intent enforces.
+    /// (registered, active, bonded above MIN_BOND, below max_active_intents cap).
+    /// Lets off-chain solver bots self-check eligibility without independently
+    /// reimplementing the same logic accept_intent enforces.
     pub fn is_solver_eligible(env: Env, solver: Address) -> bool {
         let cfg = Self::load_config(&env);
         match env
@@ -3222,9 +3284,18 @@ impl IntentSettlement {
             .persistent()
             .get::<_, SolverRecord>(&DataKey::Solver(solver))
         {
-            Some(record) => record.is_active && record.bond_amount >= cfg.min_bond,
+            Some(record) => {
+                record.is_active
+                    && record.bond_amount >= cfg.min_bond
+                    && record.active_intents < cfg.max_active_intents_per_solver
+            }
             None => false,
         }
+    }
+
+    /// Get the current max-active-intents cap per solver (issue #230).
+    pub fn get_max_active_intents_per_solver(env: Env) -> u32 {
+        Self::load_config(&env).max_active_intents_per_solver
     }
 
     /// Returns the current fee recipient address, or `None` before initialization.
@@ -3348,7 +3419,7 @@ impl IntentSettlement {
 
     /// Aggregate health snapshot combining `is_paused`, `get_stats`, and
     /// `get_solver_count` into a single call, for dashboard/monitoring
-    /// integrations that would otherwise need three separate round-trips.
+    /// integrations that would otherwise need multiple separate round-trips.
     pub fn get_protocol_health(env: Env) -> ProtocolHealth {
         let paused: bool = env
             .storage()
@@ -3370,12 +3441,18 @@ impl IntentSettlement {
             .instance()
             .get(&DataKey::TotalSolvers)
             .unwrap_or(0);
+        let total_bonded: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalBonded)
+            .unwrap_or(0);
 
         ProtocolHealth {
             paused,
             total_intents,
             total_volume,
             total_solvers,
+            total_bonded,
         }
     }
 
@@ -3713,12 +3790,13 @@ impl IntentSettlement {
     }
 
     fn get_adjusted_min_bond(env: &Env, dst_token: &Address) -> i128 {
+        let base_bond = Self::load_config(env).min_bond;
         let multiplier = env
             .storage()
             .persistent()
             .get::<_, i128>(&DataKey::MinBondMultiplier(dst_token.clone()))
             .unwrap_or(10);
-        (MIN_BOND * multiplier) / 10
+        (base_bond * multiplier) / 10
     }
 
     /// #197: resolve `solver`'s registry tier for perk calculation.
@@ -3767,6 +3845,7 @@ impl IntentSettlement {
                 fill_window: DEFAULT_FILL_WINDOW,
                 intent_expiry: DEFAULT_INTENT_EXPIRY,
                 protocol_fee_bps: DEFAULT_PROTOCOL_FEE_BPS,
+                max_active_intents_per_solver: DEFAULT_MAX_ACTIVE_INTENTS_PER_SOLVER,
             })
     }
 
