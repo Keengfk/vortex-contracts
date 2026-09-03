@@ -261,6 +261,12 @@ pub enum DataKey {
 
     BondToken,          // USDC address for bonds
     Intent(BytesN<32>), // intent_id -> IntentRecord
+
+    /// **Persistent storage.** Bounded on-chain fill-history log for a given
+    /// intent (issue #244): `Vec<(solver, amount, timestamp)>`, oldest first,
+    /// capped at `MAX_FILL_HISTORY` entries with FIFO eviction of the oldest
+    /// entry once the cap is reached. Appended to by `fill_intent`.
+    IntentFillHistory(BytesN<32>),
     Solver(Address),    // address -> SolverRecord
 
     /// **Instance storage.** All currently-registered solver addresses
@@ -1761,6 +1767,23 @@ impl IntentSettlement {
         // This runs even when the src_chain allowlist is disabled so obviously
         // malformed tokens are always caught at submission time.
         Self::validate_src_token(&env, &src_chain, &src_token);
+
+        // #252 — decimals-aware sanity bound on min_dst_amount. Runs
+        // unconditionally (not just when the dst allowlist is enabled) since
+        // this is a magnitude sanity check, not an allowlist gate. The
+        // decimals() probe mirrors propose_add_dst_token's precedent: if
+        // dst_token doesn't implement SEP-41, the call traps and the whole
+        // submission reverts, which is the desired behavior here too.
+        let dst_token_client = token::Client::new(&env, &dst_token);
+        let dst_decimals = dst_token_client.decimals();
+        let dst_bound = 10i128
+            .checked_pow(dst_decimals)
+            .and_then(|unit| unit.checked_mul(MAX_WHOLE_UNITS));
+        // `None` covers dst_decimals being so large the bound itself
+        // overflows i128 — treated the same as exceeding the bound: reject.
+        if !dst_bound.is_some_and(|bound| min_dst_amount <= bound) {
+            panic_with_error!(&env, Error::ImplausibleDstAmount);
+        }
 
         let now = env.ledger().timestamp();
         let cfg = Self::load_config(&env);

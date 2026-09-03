@@ -182,6 +182,19 @@ one trillion 18-decimal tokens. Any value above this threshold causes
 `submit_intent` to return `Error::AmountTooLarge` (the dedicated out-of-range
 guard; `ZeroAmount` still covers non-positive values).
 
+**Decimals-aware `min_dst_amount` guard (#252):** in addition to the flat
+`MAX_AMOUNT` bound, `submit_intent` queries `dst_token`'s own `decimals()`
+and rejects a `min_dst_amount` that implies more than `MAX_WHOLE_UNITS`
+(one trillion) whole `dst_token` units at that precision, raising
+`Error::ImplausibleDstAmount`. This is a ceiling-only heuristic — it exists
+to catch a `min_dst_amount` scaled for the wrong decimals class (e.g. an
+18-decimal-scaled amount submitted for a 7-decimal token), not to enforce a
+dust floor, since a legitimate micro-intent on a low-decimal token is
+indistinguishable on-chain from a genuine mistake without off-chain price
+context. A `dst_token` whose `decimals()` call itself fails (not a real
+SEP-41 token) causes `submit_intent` to trap and revert, the same as
+`propose_add_dst_token`'s existing interface probe.
+
 **Stellar side (`min_dst_amount`):** Stellar USDC (Circle's SAC) uses
 **7 decimals** (Stellar's native precision). So 3500 USDC on Stellar is
 `35_000_000_000` (3500 × 10^7).
