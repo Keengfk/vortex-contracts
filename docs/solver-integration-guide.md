@@ -198,9 +198,9 @@ The `IntentRecord` fields your bot needs for quoting:
 
 | Field            | Meaning                                           |
 |------------------|---------------------------------------------------|
-| `src_chain`      | Source chain (`"ethereum"`, `"base"`, etc.)       |
-| `src_token`      | Token contract address on the source chain        |
-| `src_amount`     | Amount to bridge (in source token's smallest unit)|
+| `src_chain`      | Source chain (`"ethereum"`, `"base"`, `"solana"`, …) |
+| `src_token`      | Token address on the source chain (see per-chain formats below) |
+| `src_amount`     | Amount to bridge, in the source token's smallest unit |
 | `dst_token`      | SAC/SEP-41 address you must deliver on Stellar    |
 | `min_dst_amount` | Minimum amount the user will accept               |
 | `deadline`       | Unix timestamp; intent is worthless after this    |
@@ -210,6 +210,28 @@ Reject the intent immediately if:
 - `state != Open`
 - `deadline - now < FILL_WINDOW` (not enough time to accept + fill)
 - Your quoted cost exceeds `min_dst_amount + fee` (unprofitable)
+
+#### Interpreting `src_token` / `src_amount` per source chain
+
+`src_amount` is always `human_amount × 10^decimals` in the source token's
+smallest unit — but `decimals` and the `src_token` string differ by chain:
+
+| `src_chain` | `src_token` format | How to get `decimals` |
+|---|---|---|
+| EVM (`ethereum`, `base`, `polygon`, `arbitrum`, `optimism`, `avalanche`, `bsc`) | `0x` + 40 hex chars | `decimals()` view on the ERC-20; usually 18 (native) / 6 (stablecoins), **but 18 for USDT/USDC on BSC** |
+| `solana` | base58 SPL **mint address**, 32–44 chars, no `0x` | `decimals` field of the mint account (`getMint` / `getTokenSupply`). **Not uniform:** USDC/USDT = 6, wrapped SOL and most LSTs = 9, BONK = 5 |
+
+For a Solana-sourced intent your bot must:
+1. Treat `src_token` as an SPL mint address — resolve it against your Solana
+   RPC / token list, not an EVM registry.
+2. Fetch that mint's `decimals` (do **not** assume 6) to convert `src_amount`
+   back to a human amount for quoting.
+3. Price and perform the source-chain leg on Solana (transfer the SPL token
+   from the user's escrow), exactly as you would the EVM leg — the Stellar
+   contract does not verify it; your bond is the guarantee (see Step 2).
+
+See [docs/132-supported-chains.md](./132-supported-chains.md) §3.2 and §4.8 for
+the base58 rules, sample mints, and decimals.
 
 ---
 

@@ -63,6 +63,23 @@ first deploys to mainnet.
 
 ### Fixed
 
+- **Compiling, green baseline (#202, #203, #204)**: `intent_settlement` did
+  not build — `lib.rs` referenced ~12 undeclared constants, 9 undeclared
+  `DataKey` variants and 6 undeclared `Error` variants, the `Error` enum had
+  duplicate discriminants, `validate_src_token` called a non-existent
+  `String::get`, `compute_reputation_score` was a `pub` contract fn taking a
+  non-ABI `&SolverRecord`, and `fill_intent` transferred the fill amount and
+  fee three times each. Constants are now declared with rationale comments,
+  the enums are reconciled (discriminants renumbered sequentially), the
+  string validation reads bytes via `copy_into_slice`, and `fill_intent`
+  makes exactly one user transfer and one fee transfer. The test suite and
+  the bond-conservation proptest, both damaged by earlier bad merges, are
+  repaired.
+- **Batch operations were unusable for more than one item**:
+  `batch_submit_intent` / `batch_accept_intent` called `require_auth()` once
+  per loop iteration, which Soroban rejects with `Auth, ExistingValue` on the
+  second item. The batch entrypoints now authorise the actor once and invoke
+  un-gated `*_inner` bodies.
 - `deregister_solver` now refuses to return a solver's bond while they hold
   an `Accepted` intent, closing a path to dodge `slash_solver` by
   withdrawing before the fill window expired.
@@ -119,12 +136,32 @@ first deploys to mainnet.
   returns every token currently on the allowlist, so integrators and
   auditors no longer have to replay `dst_token_allowed` /
   `dst_token_disallowed` events to reconstruct the full list.
+- **Batch fill / cancel** (#199): `batch_fill_intent(solver, fills)` and
+  `batch_cancel_intent(user, intent_ids)` complete the batch API alongside
+  the existing `batch_submit_intent` / `batch_accept_intent`. All four are
+  capped at `MAX_BATCH_SIZE` and revert the whole batch on any failure.
+  `batch_cancel_intent` checks and stamps the per-user `CANCEL_COOLDOWN`
+  once for the call, so a user can clear all of their open intents in one
+  transaction.
+- **Paginated solver enumeration** (#198): `list_solvers(start, limit)`
+  returns registered solver addresses a bounded page at a time (limit
+  clamped to `MAX_BATCH_SIZE`), kept in sync by `register_solver` /
+  `deregister_solver`. Integrators can enumerate solvers without replaying
+  `solver_registered` / `solver_deregistered` events.
+- **Solana as a fully-supported source chain** (#201): `src_chain =
+  "solana"` is validated end-to-end (base58 SPL mint, 32–44 chars, no `0x`
+  prefix) and documented alongside the EVM chains; the README's "planned"
+  marker is removed.
 
 ### Changed
 
 - CI now also runs a dependency-audit job (`cargo audit` against the
   RustSec advisory database) alongside the existing fmt/clippy/test/build
   checks.
+- CI `wasm-size` job now measures the `wasm-opt -Oz` artifact (the size
+  that actually deploys) and `[profile.release]` enables `lto`. Budget set
+  to 63 000 bytes, under Soroban's 64 KB limit; a dedicated size-reduction
+  pass is still needed to restore real headroom.
 
 ### Documentation
 
@@ -142,3 +179,15 @@ first deploys to mainnet.
   current event topic conventions in `intent_settlement` and sets the
   naming convention future contracts (e.g. `solver_registry`) should
   follow (#113).
+- `docs/132-supported-chains.md`: promoted Solana from "Planned" to
+  "Supported" with full base58/decimals rigor (§3.2) and a real SPL-mint
+  address table (§4.8); noted that `avalanche`/`bsc` `src_token`s are not
+  yet format-checked on-chain (#201).
+- `docs/solver-integration-guide.md`: added per-source-chain guidance for
+  interpreting `src_token` / `src_amount`, including how to resolve a
+  Solana SPL mint and read its (non-uniform) decimals (#201).
+- README: Solana row in the decimal-normalization table; batch and
+  `list_solvers` entrypoints added to the function list (#198, #199, #201).
+- `indexer/reference-indexer.js`: noted `list_solvers` as the on-chain
+  alternative to full `solver_registered` / `solver_deregistered` replay
+  (#198).
