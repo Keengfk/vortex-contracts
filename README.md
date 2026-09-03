@@ -165,23 +165,38 @@ stellar contract invoke --id <CONTRACT_ID> --source <SECRET_KEY> --network testn
 
 #### Intent Lifecycle
 
-The diagram below covers all six `IntentState` variants and the functions that
-drive each transition.
+The diagram below covers every `IntentState` variant and the functions that
+drive each transition, including the competitive bid window (issue #191) and the
+escrow / dispute-resolution flow (issue #188).
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Open : submit_intent()
+    [*] --> Open : submit_intent()\n[bid window disabled]
+    [*] --> Bidding : submit_intent()\n[bid window enabled]
+
+    Bidding --> Accepted : settle_bids()\n[best bid, bidder still eligible,\n now >= bid deadline]
+    Bidding --> Open : settle_bids()\n[no usable bid]
+    Open --> Bidding : (never — one-way)
 
     Open --> Accepted : accept_intent()\n[solver registered & active,\n deadline not reached]
     Open --> Cancelled : cancel_intent()\n[caller == intent.user]
     Open --> Expired : expire_intent()\n[now >= deadline]
 
     Accepted --> Filled : fill_intent()\n[fill_amount >= min_dst_amount,\n now < deadline]
-    Accepted --> Open : slash_solver()\n[now >= deadline]\n(10 % bond slashed,\nintent re-opened with fresh deadline)
+    Accepted --> PartiallyFilled : fill_intent()\n[partial fill]
+    Accepted --> Filling : begin_fill()\n[completing fill into escrow,\n starts dispute window]
+    Accepted --> Open : slash_solver()\n[now >= deadline]\n(bond slashed proportionally,\nintent re-opened with fresh deadline)
+
+    Filling --> Filled : release_fill()\n[now >= dispute_deadline,\n no dispute]
+    Filling --> Disputed : dispute_fill()\n[caller == intent.user,\n within dispute window]
+
+    Disputed --> Resolved : resolve_dispute()\n[arbiter; Upheld slashes solver,\n Dismissed does not — user paid either way]
+    Disputed --> Resolved : release_fill()\n[now >= arbiter timeout;\n full escrow to user, no slash]
 
     Filled --> [*]
     Cancelled --> [*]
     Expired --> [*]
+    Resolved --> [*]
 ```
 
 > **Note:** `accept_intent` also lazily sets state to `Expired` (and panics)
