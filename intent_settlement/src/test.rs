@@ -3098,3 +3098,271 @@ fn unsupported_src_chain_rejects_gated_fill() {
     let res = ctx.client().try_fill_intent(&ctx.solver, &id, &FILL, &true);
     assert_eq!(res, Err(Ok(Error::SrcChainNotSupported.into())));
 }
+
+// ════════════════════════════════════════════════════════════════════════════════
+// #197 — solver_registry tier perks in accept_intent / slash_solver
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// Minimal stand-in for `solver_registry`: just the one method
+/// `intent_settlement` calls (`get_tier`) plus a test setter. Exercises the
+/// real cross-contract call path.
+mod mock_registry {
+    use soroban_sdk::{contract, contractimpl, contracttype, Address, Env};
+
+    #[contracttype]
+    pub enum K {
+        Tier(Address),
+    }
+
+    #[contract]
+    pub struct MockRegistry;
+
+    #[contractimpl]
+    impl MockRegistry {
+        pub fn set_tier(env: Env, solver: Address, tier: u32) {
+            env.storage().persistent().set(&K::Tier(solver), &tier);
+        }
+        pub fn get_tier(env: Env, solver: Address) -> u32 {
+            env.storage()
+                .persistent()
+                .get(&K::Tier(solver))
+                .unwrap_or(0)
+        }
+    }
+}
+use mock_registry::{MockRegistry, MockRegistryClient};
+
+/// Expected effective fill window per tier with the default 300 s base:
+/// +0 / +10 / +20 / +30 / +50 %.
+const TIER_WINDOW: [u64; 5] = [300, 330, 360, 390, 450];
+/// Expected slash amount per tier for a `BOND`-sized bond (1000 USDC, 7 dp):
+/// 10 / 10 / 8 / 6 / 5 % of BOND.
+const TIER_SLASH: [i128; 5] = [
+    BOND / 10,
+    BOND / 10,
+    BOND * 8 / 100,
+    BOND * 6 / 100,
+    BOND / 20,
+];
+
+/// Deploy a mock registry, wire it into the settlement contract, return its id.
+fn wire_registry(ctx: &Ctx) -> Address {
+    let reg_id = ctx.env.register_contract(None, MockRegistry);
+    ctx.client().set_solver_registry(&Some(reg_id.clone()));
+    reg_id
+}
+
+#[test]
+fn set_solver_registry_roundtrips_and_clears() {
+    let ctx = setup();
+    let c = ctx.client();
+    assert_eq!(c.get_solver_registry(), None);
+
+    let reg_id = ctx.env.register_contract(None, MockRegistry);
+    c.set_solver_registry(&Some(reg_id.clone()));
+    assert_eq!(c.get_solver_registry(), Some(reg_id));
+
+    c.set_solver_registry(&None);
+    assert_eq!(c.get_solver_registry(), None);
+}
+
+#[test]
+fn set_solver_registry_requires_admin() {
+    let ctx = setup();
+    let reg_id = ctx.env.register_contract(None, MockRegistry);
+    ctx.client().set_solver_registry(&Some(reg_id));
+    let authed_by_admin = ctx.env.auths().iter().any(|(addr, _)| *addr == ctx.admin);
+    assert!(
+        authed_by_admin,
+        "set_solver_registry must require admin auth"
+    );
+}
+
+#[test]
+fn accept_intent_grants_fill_window_bonus_for_every_tier() {
+    for tier in 0u32..=4 {
+        let ctx = setup();
+        let c = ctx.client();
+        let reg_id = wire_registry(&ctx);
+        MockRegistryClient::new(&ctx.env, &reg_id).set_tier(&ctx.solver, &tier);
+
+        ctx.register_solver();
+        let id = ctx.submit();
+        let now = ctx.env.ledger().timestamp();
+        c.accept_intent(&ctx.solver, &id);
+
+        let intent = c.get_intent(&id).unwrap();
+        assert_eq!(
+            intent.deadline,
+            now + TIER_WINDOW[tier as usize],
+            "tier {tier} fill window"
+        );
+        assert_eq!(
+            c.get_intent(&id).unwrap().solver_tier,
+            tier,
+            "tier {tier} snapshot"
+        );
+    }
+}
+
+#[test]
+fn slash_solver_uses_reduced_rate_for_every_tier() {
+    for tier in 0u32..=4 {
+        let ctx = setup();
+        let c = ctx.client();
+        let reg_id = wire_registry(&ctx);
+        MockRegistryClient::new(&ctx.env, &reg_id).set_tier(&ctx.solver, &tier);
+
+        ctx.register_solver();
+        let id = ctx.submit();
+        c.accept_intent(&ctx.solver, &id);
+        ctx.pass_time(INTENT_EXPIRY); // past every tier's fill window
+        c.slash_solver(&id);
+
+        let solver = c.get_solver(&ctx.solver).unwrap();
+        assert_eq!(
+            solver.bond_amount,
+            BOND - TIER_SLASH[tier as usize],
+            "tier {tier} slash amount"
+        );
+        assert_eq!(
+            ctx.bond().balance(&ctx.fee_recipient),
+            TIER_SLASH[tier as usize],
+            "tier {tier} slash routed to fee recipient"
+        );
+    }
+}
+
+#[test]
+fn registry_unset_behaves_exactly_as_unranked() {
+    let ctx = setup();
+    let c = ctx.client();
+    assert_eq!(c.get_solver_registry(), None);
+
+    ctx.register_solver();
+    let id = ctx.submit();
+    let now = ctx.env.ledger().timestamp();
+    c.accept_intent(&ctx.solver, &id);
+    assert_eq!(c.get_intent(&id).unwrap().deadline, now + FILL_WINDOW);
+    assert_eq!(c.get_intent(&id).unwrap().solver_tier, 0);
+
+    ctx.pass_time(INTENT_EXPIRY);
+    c.slash_solver(&id);
+    assert_eq!(
+        c.get_solver(&ctx.solver).unwrap().bond_amount,
+        BOND - BOND / 10
+    );
+}
+
+#[test]
+fn registry_set_but_solver_untiered_is_unranked() {
+    let ctx = setup();
+    let c = ctx.client();
+    wire_registry(&ctx); // registry deployed, but no tier set for ctx.solver
+
+    ctx.register_solver();
+    let id = ctx.submit();
+    let now = ctx.env.ledger().timestamp();
+    c.accept_intent(&ctx.solver, &id);
+    assert_eq!(c.get_intent(&id).unwrap().deadline, now + FILL_WINDOW);
+}
+
+#[test]
+fn registry_pointing_at_a_non_registry_contract_degrades_to_unranked() {
+    let ctx = setup();
+    let c = ctx.client();
+    // Point the registry slot at the settlement contract itself: it has no
+    // `get_tier`, so the cross-contract call traps and `solver_tier` must fall back.
+    c.set_solver_registry(&Some(ctx.contract_id.clone()));
+
+    ctx.register_solver();
+    let id = ctx.submit();
+    let now = ctx.env.ledger().timestamp();
+    c.accept_intent(&ctx.solver, &id); // must NOT panic
+    assert_eq!(c.get_intent(&id).unwrap().deadline, now + FILL_WINDOW);
+    assert_eq!(c.get_intent(&id).unwrap().solver_tier, 0);
+
+    ctx.pass_time(INTENT_EXPIRY);
+    c.slash_solver(&id);
+    assert_eq!(
+        c.get_solver(&ctx.solver).unwrap().bond_amount,
+        BOND - BOND / 10
+    );
+}
+
+#[test]
+fn tier_is_snapshotted_at_accept_promotion_midflight_does_not_soften_slash() {
+    let ctx = setup();
+    let c = ctx.client();
+    let reg_id = wire_registry(&ctx);
+    let reg = MockRegistryClient::new(&ctx.env, &reg_id);
+    reg.set_tier(&ctx.solver, &1); // Bronze: 10% slash
+
+    ctx.register_solver();
+    let id = ctx.submit();
+    c.accept_intent(&ctx.solver, &id);
+    assert_eq!(c.get_intent(&id).unwrap().solver_tier, 1);
+
+    // Promote to Platinum AFTER accepting.
+    reg.set_tier(&ctx.solver, &4);
+
+    ctx.pass_time(INTENT_EXPIRY);
+    c.slash_solver(&id);
+    // Still slashed at Bronze's 10%, not Platinum's 5%.
+    assert_eq!(
+        c.get_solver(&ctx.solver).unwrap().bond_amount,
+        BOND - TIER_SLASH[1]
+    );
+}
+
+#[test]
+fn tier_is_snapshotted_at_accept_demotion_midflight_does_not_harden_slash() {
+    let ctx = setup();
+    let c = ctx.client();
+    let reg_id = wire_registry(&ctx);
+    let reg = MockRegistryClient::new(&ctx.env, &reg_id);
+    reg.set_tier(&ctx.solver, &4); // Platinum: 5% slash, +50% window
+
+    ctx.register_solver();
+    let id = ctx.submit();
+    let now = ctx.env.ledger().timestamp();
+    c.accept_intent(&ctx.solver, &id);
+    assert_eq!(c.get_intent(&id).unwrap().deadline, now + TIER_WINDOW[4]);
+
+    // Demote to Unranked AFTER accepting.
+    reg.set_tier(&ctx.solver, &0);
+
+    ctx.pass_time(INTENT_EXPIRY);
+    c.slash_solver(&id);
+    // Still slashed at Platinum's 5%, not Unranked's 10%.
+    assert_eq!(
+        c.get_solver(&ctx.solver).unwrap().bond_amount,
+        BOND - TIER_SLASH[4]
+    );
+}
+
+#[test]
+fn partial_fill_reopen_clears_the_tier_snapshot() {
+    let ctx = setup();
+    let c = ctx.client();
+    let reg_id = wire_registry(&ctx);
+    MockRegistryClient::new(&ctx.env, &reg_id).set_tier(&ctx.solver, &3);
+
+    ctx.register_solver();
+    let id = ctx.submit();
+    c.accept_intent(&ctx.solver, &id);
+    assert_eq!(c.get_intent(&id).unwrap().solver_tier, 3);
+
+    let partial = MIN_DST / 2;
+    let fee = partial * 5 / 10_000;
+    ctx.dst_admin().mint(&ctx.solver, &(partial + fee));
+    c.fill_intent(&ctx.solver, &id, &partial);
+
+    let intent = c.get_intent(&id).unwrap();
+    assert_eq!(intent.state, IntentState::PartiallyFilled);
+    assert_eq!(
+        c.get_intent(&id).unwrap().solver_tier,
+        0,
+        "snapshot cleared on re-open"
+    );
+}

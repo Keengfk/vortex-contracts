@@ -49,6 +49,7 @@ Core protocol logic (`intent_settlement/src/lib.rs`):
 - `propose_add_dst_token()` / `execute_add_dst_token()` / `propose_remove_dst_token()` / `execute_remove_dst_token()` / `set_dst_allowlist_enabled()` — timelocked dst_token allowlist changes (#115, #116, #118)
 - `list_allowed_dst_tokens()` — enumerate the full current dst_token allowlist (#117)
 - `add_allowed_src_chain()` / `remove_allowed_src_chain()` / `set_src_chain_allowlist_enabled()` — optional src_chain allowlist (#34)
+- `set_solver_registry()` / `get_solver_registry()` — optional `solver_registry` link; when set, `accept_intent` grants tier fill-window bonuses and `slash_solver` applies tier slash rates. Unset ⇒ every solver is Unranked (pre-integration behaviour) (#197)
 - `rescue_tokens()` — admin-only recovery of non-bond tokens accidentally sent to the contract (#35)
 - `propose_upgrade()` / `execute_upgrade()` / `get_pending_upgrade()` / `migrate()` — timelocked in-place contract upgrade + one-time storage-migration hook (#194)
 - `set_fee_discount_tiers()` / `get_fee_schedule()` — volume-tier protocol-fee discounts for solvers (#192)
@@ -289,9 +290,19 @@ the exact condition that triggers it.
 
 ---
 
-### `solver_registry` (planned)
+### `solver_registry`
 
-Tiered solver staking with reputation scores. See the roadmap below.
+Canonical store for solver **tiers** (Unranked → Platinum) and the per-tier
+perk schedule. `intent_settlement` calls `get_tier(solver)` from
+`accept_intent` / `slash_solver` to grant fill-window bonuses and reduced slash
+rates (#197). Tiers are currently admin-set (`set_tier`); score-gated automatic
+promotion, staking, and migration remain future work (#186). See
+[`docs/solver-registry-design.md`](./docs/solver-registry-design.md).
+
+- `initialize(admin)`
+- `set_tier(solver, tier)` / `clear_tier(solver)` — admin-only
+- `get_tier(solver) -> u32` — defaults to `0` (Unranked)
+- `get_fill_window_bonus_bps(tier)` / `get_slash_bps(tier)` — the perk schedule
 
 ---
 
@@ -523,7 +534,7 @@ def compute_intent_id(user_address: str, src_chain: str, src_amount: int, timest
 - [x] **Contract test suite** — `soroban_sdk` testutils coverage for the full intent
       lifecycle, solver bonding/slashing, admin controls, pause, and storage TTL
       management
-- [ ] **Solver registry contract** — tiered staking, reputation NFT, dispute resolution
+- [~] **Solver registry contract** — tier lookup + perk schedule shipped and wired into `accept_intent` / `slash_solver` (#197); score-gated promotion, staking, reputation NFT, dispute resolution still to do (#186)
 - [ ] **Cross-chain proof verification** — verify source-chain tx on-chain via Stellar oracle / messaging infra
 
 ---

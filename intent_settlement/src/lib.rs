@@ -8,7 +8,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, token, xdr::ToXdr,
-    Address, Bytes, BytesN, Env, String, Symbol, Vec,
+    Address, Bytes, BytesN, Env, IntoVal, String, Symbol, Vec,
 };
 
 /// Cross-contract client for the `ProofRegistry` contract (issue #190).
@@ -180,6 +180,27 @@ const MAX_BATCH_SIZE: u32 = 20;
 /// magnitude as `FILL_WINDOW` so a single extension can at most roughly double
 /// the solver's delivery window.
 const MAX_EXTENSION_DURATION: u64 = 300; // 5 minutes
+
+// ─── Solver-registry tier perks (#197) ──────────────────────────────────────
+//
+// Index = tier number (0 Unranked … 4 Platinum). These MUST stay in lock-step
+// with `solver_registry`'s tier table and `docs/solver-registry-design.md`
+// §3/§6/§7. They are held here, rather than fetched per call, so
+// `accept_intent` / `slash_solver` make at most one cross-contract call each
+// (just `get_tier`) on their hot paths. A change to these values is a
+// protocol-parameter change.
+
+/// Fill-window extension bonus per tier, in basis points (10_000 = +100%).
+/// Unranked +0%, Bronze +10%, Silver +20%, Gold +30%, Platinum +50%.
+const TIER_FILL_WINDOW_BONUS_BPS: [u64; 5] = [0, 1_000, 2_000, 3_000, 5_000];
+
+/// Slash percentage per tier, in basis points of the bond (10_000 = 100%).
+/// Unranked/Bronze 10%, Silver 8%, Gold 6%, Platinum 5% — and 5% (500 bps) is
+/// the floor for every tier.
+const TIER_SLASH_BPS: [i128; 5] = [1_000, 1_000, 800, 600, 500];
+
+/// Lowest slash rate any tier may receive, in basis points (Platinum's 5%).
+const MIN_SLASH_BPS: i128 = 500;
 
 // ─── Storage Keys ─────────────────────────────────────────────────────────────
 
@@ -412,6 +433,13 @@ pub struct IntentRecord {
     /// intent transitions to `Filled` as soon as `total_filled` satisfies
     /// the user's `min_dst_amount` requirement.
     pub total_filled: i128,
+
+    /// #197: the `solver_registry` tier the assigned solver held when they
+    /// called `accept_intent` — snapshotted so `slash_solver` applies the
+    /// slash rate that was in force when the obligation was taken on, not the
+    /// solver's tier now. `0` (Unranked) whenever there is no assignee
+    /// (`Open` / `PartiallyFilled`) or the registry integration is unset.
+    pub solver_tier: u32,
 }
 
 #[contracttype]
@@ -424,10 +452,9 @@ pub enum IntentState {
     Cancelled,       // user cancelled before fill
     Expired,         // deadline passed, no fill
     Slashed,         // solver failed to fill after accepting
-    /// Bid-window mode: intent has been submitted and is collecting competing
-    /// solver bids.  No solver has exclusive fill rights yet.  Once the
-    /// `BID_WINDOW` elapses the best bid is settled and the intent transitions
-    /// to `Accepted`.
+    /// Reserved for a future competitive bid-collection mode (not currently
+    /// produced by any entrypoint — `submit_intent` always opens intents in
+    /// `Open`).
     Bidding,
     /// Issue #188: solver has called `begin_fill`; the output tokens are held
     /// in contract escrow and the user has until `dispute_deadline` to contest
@@ -1877,7 +1904,9 @@ impl IntentSettlement {
         intent.bond_token = bond_token.clone();
         // Extend deadline to fill window from now
         let cfg = Self::load_config(&env);
-        intent.deadline = now + cfg.fill_window;
+        let tier = Self::solver_tier(&env, &solver);
+        intent.solver_tier = tier;
+        intent.deadline = now + Self::tier_fill_window(tier, cfg.fill_window);
 
         solver_record.active_intents += 1;
         env.storage()
@@ -2064,6 +2093,7 @@ impl IntentSettlement {
             // increment open_intents again.
             intent.state = IntentState::PartiallyFilled;
             intent.solver = None;
+            intent.solver_tier = 0; // #197: no assignee → no tier snapshot
             intent.deadline = now + INTENT_EXPIRY;
             solver_record.active_intents = solver_record.active_intents.saturating_sub(1);
 
@@ -2263,6 +2293,7 @@ impl IntentSettlement {
             IntentState::Open
         };
         intent.solver = None;
+        intent.solver_tier = 0; // #197: cleared with the solver assignment
         intent.deadline = now + cfg.intent_expiry;
 
         let open: u64 = env
@@ -3688,6 +3719,41 @@ impl IntentSettlement {
             .get::<_, i128>(&DataKey::MinBondMultiplier(dst_token.clone()))
             .unwrap_or(10);
         (MIN_BOND * multiplier) / 10
+    }
+
+    /// #197: resolve `solver`'s registry tier for perk calculation.
+    ///
+    /// Makes a single cross-contract call — `solver_registry.get_tier(solver)`
+    /// — via `try_invoke_contract` (rather than a generated `#[contractclient]`,
+    /// to keep the settlement wasm small). Returns `0` (Unranked) — the
+    /// pre-integration behaviour — whenever the registry address is unset, or
+    /// the call reverts, or the return value doesn't decode as a `u32`. The
+    /// result is clamped to a known tier so the perk tables index safely.
+    fn solver_tier(env: &Env, solver: &Address) -> u32 {
+        let Some(registry) = env
+            .storage()
+            .instance()
+            .get::<_, Address>(&DataKey::SolverRegistry)
+        else {
+            return 0;
+        };
+        let args: Vec<soroban_sdk::Val> = (solver.clone(),).into_val(env);
+        let result: Result<Result<u32, _>, Result<soroban_sdk::Error, _>> =
+            env.try_invoke_contract(&registry, &Symbol::new(env, "get_tier"), args);
+        match result {
+            Ok(Ok(tier)) => tier.min(TIER_SLASH_BPS.len() as u32 - 1),
+            _ => 0,
+        }
+    }
+
+    /// Fill-window seconds a solver on `tier` gets when accepting: the base
+    /// `fill_window` plus the tier's `TIER_FILL_WINDOW_BONUS_BPS` extension.
+    fn tier_fill_window(tier: u32, base_fill_window: u64) -> u64 {
+        let bonus_bps = TIER_FILL_WINDOW_BONUS_BPS
+            .get(tier as usize)
+            .copied()
+            .unwrap_or(0);
+        base_fill_window.saturating_mul(10_000 + bonus_bps) / 10_000
     }
 
     /// Load the protocol config from storage, falling back to defaults for
