@@ -9,6 +9,58 @@ first deploys to mainnet.
 
 ## [Unreleased]
 
+### Changed
+
+- **Storage layout — `SolverRecord` / `IntentRecord` (issue #187, #188).**
+  `SolverRecord` gains a `bond_tokens: Vec<Address>` field enumerating every
+  approved token a solver holds a bond in; `bond_amount` is retained as the
+  mirror of the *default* token's balance for backward compatibility, with
+  non-default balances living under the new `DataKey::SolverBond(solver, token)`
+  persistent key. `IntentRecord` gains `bond_token`, `dispute_deadline`,
+  `dispute_raised_at`, and `resolution`. New `DataKey` variants:
+  `BidWindowEnabled`, `BestBid`, `Arbiter`, `AllowedBondToken`, `SolverBond`,
+  `MinBond`. Contracts upgrading from a pre-#187 build read old `SolverRecord`
+  values with `bond_tokens` defaulting to empty and the legacy `bond_amount`
+  intact; the first `register_solver*` call re-materialises `bond_tokens`.
+- **`slash_solver` is now proportional (issue #193).** The flat 10 %-of-bond
+  slash is replaced by `min(unfilled_output, bond) / 10`, capped at 10 % of the
+  bond and floored at 1 stroop (issue #32). The `solver_slashed` event payload
+  is unchanged.
+- **`is_bid_window_enabled` no longer reads `DataKey::DstAllowlistEnabled`
+  (issue #191).** It now reads a dedicated `DataKey::BidWindowEnabled`, closing
+  a storage-key collision where `set_dst_allowlist_enabled` also toggled
+  bid-window mode. `set_dst_allowlist_enabled` and `set_bid_window_enabled` are
+  fully independent.
+- **`fill_intent` de-duplicated.** A bad merge had left the output/fee transfer
+  block written three times; it now transfers once, after all state is
+  committed (checks-effects-interactions).
+
+### Added
+
+- **Competitive bid window (issue #191).** `bid_intent(solver, intent_id,
+  quoted_dst_amount)` records the strictly-highest quote for an intent in
+  `Bidding` state (ties keep the incumbent); `settle_bids(intent_id)` is
+  permissionless and either promotes the winner to `Accepted` with a fresh fill
+  window or re-opens the intent as `Open` when no usable bid exists. Toggle via
+  `set_bid_window_enabled`; view via `is_bid_window_enabled` and `get_best_bid`.
+- **Dispute-resolution flow (issue #188, docs/dispute-resolution-design.md).**
+  New states `Filling`, `Disputed`, `Resolved` and enum `DisputeResolution`.
+  `begin_fill` escrows a completing fill in the contract and opens a
+  `DISPUTE_WINDOW`; `dispute_fill` lets the user contest it; `resolve_dispute`
+  (arbiter-only — `set_arbiter` / `get_arbiter`, defaults to admin) rules
+  `Upheld` (proportional slash) or `Dismissed` (fee taken, no slash);
+  `release_fill` is the permissionless clean-release / arbiter-timeout path. The
+  user receives the escrowed tokens in every outcome.
+- **Multi-bond-token support (issue #187, docs/60-multi-bond-token-design.md).**
+  `add_allowed_bond_token` / `remove_allowed_bond_token` /
+  `set_bond_token_min` / `get_bond_token_min`, plus token-aware
+  `register_solver_with_token`, `withdraw_bond_token`, `accept_intent_with_bond`
+  and the `get_solver_bond` / `get_solver_bonds` views. Bonds, minimums, and
+  slashes are all accounted per token; the slash for an intent is taken from —
+  and paid out in — the token the solver bonded when accepting it. Solvers may
+  hold bonds in up to `MAX_BOND_TOKENS` (8) distinct tokens;
+  `deregister_solver` refunds every one.
+
 ### Fixed
 
 - **Compiling, green baseline (#202, #203, #204)**: `intent_settlement` did
@@ -40,6 +92,10 @@ first deploys to mainnet.
 
 ### Added
 
+- **#240** (`proof_registry`): Contract upgrade mechanism (`upgrade` entrypoint
+  and `migrate()` guard) matching the pattern in `intent_settlement`. Allows 
+  `proof_registry` to evolve without data loss or re-initialization. Migration 
+  guard prevents double-execution on the same version.
 - **Storage TTL management**: persistent `Intent`/`Solver` entries and the
   contract instance now have their TTL extended on every write, closing a
   gap where none of Soroban's state-archival requirements were handled.

@@ -51,6 +51,43 @@ Core protocol logic (`intent_settlement/src/lib.rs`):
 - `add_allowed_src_chain()` / `remove_allowed_src_chain()` / `set_src_chain_allowlist_enabled()` — optional src_chain allowlist (#34)
 - `set_solver_registry()` / `get_solver_registry()` — optional `solver_registry` link; when set, `accept_intent` grants tier fill-window bonuses and `slash_solver` applies tier slash rates. Unset ⇒ every solver is Unranked (pre-integration behaviour) (#197)
 - `rescue_tokens()` — admin-only recovery of non-bond tokens accidentally sent to the contract (#35)
+- `propose_upgrade()` / `execute_upgrade()` / `get_pending_upgrade()` / `migrate()` — timelocked in-place contract upgrade + one-time storage-migration hook (#194)
+- `set_fee_discount_tiers()` / `get_fee_schedule()` — volume-tier protocol-fee discounts for solvers (#192)
+
+#### Protocol fee & volume-tier discounts (#192)
+
+`fill_intent` charges a protocol fee, paid by the solver, on each fill:
+
+```
+fee = fill_amount * effective_fee_bps / 10_000
+```
+
+The base rate is `ProtocolConfig.protocol_fee_bps` (default **5 bps = 0.05%**,
+admin-tunable via `set_config`, hard-capped at 1 000 bps / 10%).
+
+High-volume solvers can earn a discount on that base rate. The admin sets a
+**data-driven discount schedule** — an ordered list of
+`(min_volume, discount_bps)` tiers, ascending by `min_volume`:
+
+```bash
+# 1M dst-token cumulative volume ⇒ 20% off the fee; 10M ⇒ 50% off.
+stellar contract invoke --id <CONTRACT_ID> --source <ADMIN_SECRET_KEY> --network testnet -- \
+  set_fee_discount_tiers --tiers '[[10000000000,2000],[100000000000,5000]]'
+```
+
+- `discount_bps` is a fraction **of the fee**, in hundredths of a percent
+  (`2000` = 20% off, `10000` = fee waived entirely).
+- A solver pays the base rate reduced by the highest tier whose `min_volume`
+  their cumulative `SolverRecord.total_volume` has reached (`>=`, inclusive).
+- The effective rate is always clamped to `0 ..= base` — a discount can never
+  make the fee negative or larger than the un-discounted rate.
+- With **no schedule set (the default)** every solver pays the flat base rate,
+  so this is fully backward-compatible.
+- `set_fee_discount_tiers` rejects (`InvalidFeeTiers`) a schedule that isn't
+  strictly ascending by `min_volume` or has any `discount_bps > 10 000`. Pass
+  an empty list to clear all discounts.
+- Solver bots can call `get_fee_schedule(solver)` to read `(tiers,
+  effective_fee_bps)` and price a fill before submitting.
 
 #### Usage examples
 
@@ -166,23 +203,38 @@ stellar contract invoke --id <CONTRACT_ID> --source <SECRET_KEY> --network testn
 
 #### Intent Lifecycle
 
-The diagram below covers all six `IntentState` variants and the functions that
-drive each transition.
+The diagram below covers every `IntentState` variant and the functions that
+drive each transition, including the competitive bid window (issue #191) and the
+escrow / dispute-resolution flow (issue #188).
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Open : submit_intent()
+    [*] --> Open : submit_intent()\n[bid window disabled]
+    [*] --> Bidding : submit_intent()\n[bid window enabled]
+
+    Bidding --> Accepted : settle_bids()\n[best bid, bidder still eligible,\n now >= bid deadline]
+    Bidding --> Open : settle_bids()\n[no usable bid]
+    Open --> Bidding : (never — one-way)
 
     Open --> Accepted : accept_intent()\n[solver registered & active,\n deadline not reached]
     Open --> Cancelled : cancel_intent()\n[caller == intent.user]
     Open --> Expired : expire_intent()\n[now >= deadline]
 
     Accepted --> Filled : fill_intent()\n[fill_amount >= min_dst_amount,\n now < deadline]
-    Accepted --> Open : slash_solver()\n[now >= deadline]\n(10 % bond slashed,\nintent re-opened with fresh deadline)
+    Accepted --> PartiallyFilled : fill_intent()\n[partial fill]
+    Accepted --> Filling : begin_fill()\n[completing fill into escrow,\n starts dispute window]
+    Accepted --> Open : slash_solver()\n[now >= deadline]\n(bond slashed proportionally,\nintent re-opened with fresh deadline)
+
+    Filling --> Filled : release_fill()\n[now >= dispute_deadline,\n no dispute]
+    Filling --> Disputed : dispute_fill()\n[caller == intent.user,\n within dispute window]
+
+    Disputed --> Resolved : resolve_dispute()\n[arbiter; Upheld slashes solver,\n Dismissed does not — user paid either way]
+    Disputed --> Resolved : release_fill()\n[now >= arbiter timeout;\n full escrow to user, no slash]
 
     Filled --> [*]
     Cancelled --> [*]
     Expired --> [*]
+    Resolved --> [*]
 ```
 
 > **Note:** `accept_intent` also lazily sets state to `Expired` (and panics)
@@ -220,9 +272,21 @@ the exact condition that triggers it.
 | 19 | `DeadlineNotReached` | `expire_intent` | `now < intent.deadline` |
 | 20 | `InsufficientBond` | `withdraw_bond` | Requested withdrawal `amount > solver_record.bond_amount` |
 | 21 | `DstTokenNotAllowed` | `submit_intent` | `DstAllowlistEnabled` is `true` and `dst_token` is not in the `AllowedDstToken` list |
-| 25 | `TimelockNotElapsed` | `accept_fee_recipient`, `accept_admin_transfer`, `execute_add_dst_token`, `execute_remove_dst_token` | Called before the `#115` timelock delay since the matching `propose_*` call has elapsed |
-| 26 | `NoPendingAdminTransfer` | `accept_admin_transfer` | No prior `propose_admin_transfer` on record |
-| 27 | `NoPendingDstTokenChange` | `execute_add_dst_token`, `execute_remove_dst_token` | No matching pending proposal for the given token |
+| 22 | `IntentAlreadyExists` | `submit_intent` | Hash collision: an intent with this `intent_id` was already submitted |
+| 23 | `FeeOverflow` | `fill_intent` | Fee arithmetic overflowed (fill amount astronomically large) |
+| 24 | `InvalidTokenInterface` | `add_allowed_dst_token` | Token address does not implement SEP-41 |
+| 25 | `NoPendingFeeRecipient` | `accept_fee_recipient` | No prior `propose_fee_recipient` on record |
+| 26 | `SrcChainNotAllowed` | `submit_intent` | `SrcChainAllowlistEnabled` is `true` and `src_chain` is not in the allowlist |
+| 27 | `RescueProtectedToken` | `rescue_tokens` | Token is the bond token or an active intent's dst_token |
+| 28 | `InvalidSrcToken` | `submit_intent` | `src_token` format does not match the declared `src_chain`'s conventions |
+| 29 | `BatchSizeExceeded` | `batch_submit_intent`, `batch_accept_intent` | Batch size exceeds `MAX_BATCH_SIZE` |
+| 30 | `ExtensionAlreadyGranted` | `request_extension` | Intent has already used its one-time extension |
+| 31 | `InvalidConfig` | `set_config` | Invalid protocol configuration parameters |
+| 32 | `TimelockNotElapsed` | `accept_fee_recipient`, `accept_admin_transfer`, `execute_add_dst_token`, `execute_remove_dst_token` | Called before the `#115` timelock delay since the matching `propose_*` call has elapsed |
+| 33 | `NoPendingAdminTransfer` | `accept_admin_transfer` | No prior `propose_admin_transfer` on record |
+| 34 | `NoPendingDstTokenChange` | `execute_add_dst_token`, `execute_remove_dst_token` | No matching pending proposal for the given token |
+| 35 | `CancelCooldownNotExpired` | `cancel_intent` | Cannot cancel an Accepted intent whose solver was recently slashed (cooldown active) |
+| 36 | `AmountTooLarge` | `submit_intent` | Numeric input (e.g. `src_amount`) is too large to safely handle |
 
 ---
 
