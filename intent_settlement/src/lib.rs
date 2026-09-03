@@ -3581,6 +3581,50 @@ impl IntentSettlement {
         Self::stamp_cancel_cooldown(&env, &user, now);
     }
 
+    /// Fill multiple intents in a single transaction.
+    ///
+    /// Each element of `fills` is `(intent_id, fill_amount)`.  All fills are
+    /// processed atomically — if any individual fill fails the entire batch
+    /// reverts.
+    ///
+    /// Bounded by [`MAX_BATCH_SIZE`] to prevent resource exhaustion.
+    /// See `docs/149-resource-cost-per-entrypoint.md` for the per-item
+    /// write-entry analysis that justifies the chosen limit.
+    pub fn batch_fill_intent(
+        env: Env,
+        solver: Address,
+        fills: soroban_sdk::Vec<(BytesN<32>, i128)>,
+    ) {
+        if fills.len() > MAX_BATCH_SIZE as usize {
+            panic_with_error!(&env, Error::ZeroAmount); // No dedicated error; reuse nearest
+        }
+
+        for (intent_id, fill_amount) in fills {
+            Self::fill_intent(env.clone(), solver.clone(), intent_id, fill_amount);
+        }
+    }
+
+    /// Cancel multiple Open intents belonging to `user` in a single
+    /// transaction.
+    ///
+    /// All cancellations are processed atomically — if any individual cancel
+    /// fails the entire batch reverts.
+    ///
+    /// Bounded by [`MAX_BATCH_SIZE`] to prevent resource exhaustion.
+    pub fn batch_cancel_intent(
+        env: Env,
+        user: Address,
+        intent_ids: soroban_sdk::Vec<BytesN<32>>,
+    ) {
+        if intent_ids.len() > MAX_BATCH_SIZE as usize {
+            panic_with_error!(&env, Error::ZeroAmount); // No dedicated error; reuse nearest
+        }
+
+        for intent_id in intent_ids {
+            Self::cancel_intent(env.clone(), user.clone(), intent_id);
+        }
+    }
+
     // ── Fill Window Extension ─────────────────────────────────────────────────
 
     /// Per-intent cumulative fill-window extension budget for `solver`, in

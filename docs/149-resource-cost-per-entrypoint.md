@@ -129,7 +129,7 @@ split cuts more. It is deferred until the wasm-size budget has room for the
 extra `#[contracttype]` codegen (the contract currently sits ~120 bytes under
 the 65,536-byte limit).
 
-## 5. Follow-up
+## 6. Follow-up
 
 - A CI job that regenerates this table on every change is intentionally out
   of scope here (separate DevOps issue); for now, rerun the harness manually
