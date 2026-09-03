@@ -17,13 +17,18 @@
 
 #![cfg(test)]
 
+// The crate is `#![no_std]`; the proptest harness pulls in `std`, so bring
+// `std::vec::Vec` into scope explicitly for the fixture's owned collections.
+extern crate std;
+use std::vec::Vec;
+
 use proptest::prelude::*;
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
     token, Address, Env, String,
 };
 
-use crate::{IntentSettlement, IntentSettlementClient, FILL_WINDOW, MIN_BOND};
+use crate::{IntentSettlement, IntentSettlementClient, FILL_WINDOW, MIN_BOND, SLASH_COOLDOWN};
 
 // ─── Tunables ────────────────────────────────────────────────────────────────────
 
@@ -89,6 +94,9 @@ impl Fixture {
         token::StellarAssetClient::new(&self.env, &self.bond_token)
     }
 
+    // Kept for symmetry with the unit-test fixture; this proptest models only
+    // the bond-moving calls, so no dst-token minting happens here.
+    #[allow(dead_code)]
     fn dst_admin(&self) -> token::StellarAssetClient<'_> {
         token::StellarAssetClient::new(&self.env, &self.dst_token)
     }
@@ -117,8 +125,7 @@ impl Fixture {
         let contract_bal = self.contract_bond_balance();
         let sum = self.sum_bond_amounts();
         assert_eq!(
-            contract_bal,
-            sum,
+            contract_bal, sum,
             "Bond conservation violated: contract holds {contract_bal} but Σ bond_amounts = {sum}"
         );
     }
@@ -237,7 +244,10 @@ fn execute_step(f: &mut Fixture, step: &Step) {
             }
 
             // Submit a fresh intent and immediately accept + slash it.
-            f.pass_time(1); // ensure unique timestamp → unique intent_id
+            // Advance past SLASH_COOLDOWN first so a solver slashed in an
+            // earlier step is eligible to accept again (accept_intent enforces
+            // the post-slash cooldown).
+            f.pass_time(SLASH_COOLDOWN + 1);
             let intent_id = c.submit_intent(
                 &f.user,
                 &String::from_str(&f.env, "ethereum"),

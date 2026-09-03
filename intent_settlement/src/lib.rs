@@ -65,6 +65,56 @@ const PERSISTENT_TTL_EXTEND_TO: u32 = DAY_IN_LEDGERS * 30;
 const INSTANCE_TTL_THRESHOLD: u32 = DAY_IN_LEDGERS * 30;
 const INSTANCE_TTL_EXTEND_TO: u32 = DAY_IN_LEDGERS * 60;
 
+// ─── Default protocol parameters (#202) ──────────────────────────────────────
+//
+// `initialize` seeds `DataKey::Config` with these, and `load_config` falls
+// back to them for deployments that pre-date the configurable-params upgrade.
+// They are defined as aliases of the historical compile-time constants above
+// so moving to a stored `ProtocolConfig` changes no observable behaviour — a
+// freshly initialized contract behaves exactly as it did when the parameters
+// were hard-coded.
+const DEFAULT_MIN_BOND: i128 = MIN_BOND; // 50 USDC
+const DEFAULT_FILL_WINDOW: u64 = FILL_WINDOW; // 300 s
+const DEFAULT_INTENT_EXPIRY: u64 = INTENT_EXPIRY; // 1800 s
+const DEFAULT_PROTOCOL_FEE_BPS: i128 = PROTOCOL_FEE_BPS; // 5 bps (0.05%)
+
+// ─── `set_config` bounds (#202) ──────────────────────────────────────────────
+//
+// Guard rails enforced by `set_config` so an admin cannot move a parameter to
+// an economically unsafe value. Values match the bounds already documented in
+// `set_config`'s own doc comment.
+const MAX_PROTOCOL_FEE_BPS: i128 = 1_000; // 10% — hard ceiling on the protocol fee
+const MIN_FILL_WINDOW_SECS: u64 = 60; // a solver needs at least a minute to deliver a fill
+const MIN_INTENT_EXPIRY_SECS: u64 = 300; // an intent must stay live for at least five minutes
+const MIN_BOND_FLOOR: i128 = 10_000_000; // 1 USDC (7 decimals) — absolute floor for `min_bond`
+
+// ─── Cooldowns (#202) ────────────────────────────────────────────────────────
+
+/// Seconds a solver must wait after being slashed before `accept_intent` will
+/// let it take on a new intent. Long enough to blunt a griefing loop where a
+/// solver repeatedly accepts and abandons intents, short enough that an honest
+/// solver that hit one bad fill window recovers within the hour.
+const SLASH_COOLDOWN: u64 = 3_600; // 1 hour
+
+/// Minimum gap the same user must leave between `cancel_intent` calls. Deters
+/// cancel spam (e.g. submit → cancel loops used to grief solvers mid-quote)
+/// without getting in the way of a user correcting a single mistaken intent.
+const CANCEL_COOLDOWN: u64 = 60; // 1 minute
+
+// ─── Batch + extension limits (#202) ─────────────────────────────────────────
+
+/// Upper bound on the number of items any `batch_*` entrypoint processes in a
+/// single call. Keeps the worst-case resource cost (and therefore fee) of one
+/// transaction bounded regardless of caller input. 20 covers realistic solver
+/// batching while staying well inside Soroban's per-transaction limits.
+const MAX_BATCH_SIZE: u32 = 20;
+
+/// Longest additional time `request_extension` can add to an Accepted intent's
+/// deadline. One extension is allowed per intent; this is the same order of
+/// magnitude as `FILL_WINDOW` so a single extension can at most roughly double
+/// the solver's delivery window.
+const MAX_EXTENSION_DURATION: u64 = 300; // 5 minutes
+
 // ─── Storage Keys ─────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -86,9 +136,46 @@ pub enum DataKey {
     /// timestamp at which `accept_fee_recipient` may execute it (issue #30,
     /// timelock added by #115): `(Address, u64)`.
     PendingFeeRecipient,
+
+    /// **Instance storage.** Proposed-but-not-yet-accepted new admin plus the
+    /// ledger timestamp at which `accept_admin_transfer` may execute it
+    /// (#115/#116): `(Address, u64)`. Cleared once the handover completes.
+    PendingAdmin,
+
+    /// **Instance storage.** The stored `ProtocolConfig` (min bond, fill
+    /// window, intent expiry, protocol fee bps). Seeded by `initialize` and
+    /// replaced atomically by `set_config`. `load_config` falls back to the
+    /// `DEFAULT_*` constants when this key is absent (pre-upgrade safety).
+    Config,
+
     BondToken,          // USDC address for bonds
     Intent(BytesN<32>), // intent_id -> IntentRecord
     Solver(Address),    // address -> SolverRecord
+
+    /// **Instance storage.** All currently-registered solver addresses
+    /// (`Vec<Address>`), kept in sync by `register_solver` (append if absent)
+    /// and `deregister_solver` (remove). Backs the paginated `list_solvers`
+    /// view (#198) so integrators and dashboards can enumerate solvers without
+    /// replaying every `solver_registered` / `solver_deregistered` event.
+    /// Mirror of the `AllowedDstTokenList` pattern used for the dst_token
+    /// allowlist (#117).
+    ///
+    /// **Trade-off (#198):** like `OpenIntents`, this counter-style structure
+    /// lives in the instance entry that is already loaded on every call, so
+    /// `register_solver` / `deregister_solver` pay only one extra Vec
+    /// read+write — negligible next to the persistent `SolverRecord` I/O they
+    /// already do, and neither is a hot path (unlike `accept_intent` /
+    /// `fill_intent`, which never touch this key). The cost that *does* scale
+    /// is the size of this single entry: it grows O(n) with the
+    /// registered-solver count, and the instance entry is deserialized on
+    /// every contract call. That is comfortably fine into the low thousands of
+    /// solvers; well beyond that, the enumeration should move to a chunked or
+    /// paged persistent layout so the per-call instance load stays flat. The
+    /// alternative — no on-chain enumeration — forces every integrator to
+    /// replay the full `solver_registered` / `solver_deregistered` event
+    /// history, which is O(events) and needs an archival node.
+    SolverList,
+
     TotalIntents,
 
     /// **Instance storage.** Count of intents currently in `Open` or
@@ -135,9 +222,44 @@ pub enum DataKey {
     /// `submit_intent`, letting an admin pre-populate the list before
     /// switching enforcement on.
     DstAllowlistEnabled,
-    UserNonce(Address),       // per-user submit counter to widen intent_id preimage
+
+    /// **Instance storage.** Enumerable mirror of the `AllowedDstToken`
+    /// presence flags (`Vec<Address>`), maintained by
+    /// `add_to_dst_token_list` / `remove_from_dst_token_list`. Backs
+    /// `list_allowed_dst_tokens` (#117).
+    AllowedDstTokenList,
+
+    /// **Persistent storage.** Per-`dst_token` bond multiplier (`i128`, where
+    /// `10` = 1.0×). Set by `set_min_bond_multiplier`; consulted by
+    /// `get_adjusted_min_bond` in `accept_intent`. Absent ⇒ 1.0×.
+    MinBondMultiplier(Address),
+
+    /// **Persistent storage.** All intent ids ever submitted by a given user
+    /// (`Vec<BytesN<32>>`), appended by `submit_intent`. Backs
+    /// `list_intents_by_user`.
+    UserIntents(Address),
+
+    /// **Persistent storage.** Ledger timestamp of a user's most recent
+    /// `cancel_intent` (`u64`). Enforces `CANCEL_COOLDOWN` between cancels.
+    CancelCooldown(Address),
+
+    /// **Persistent storage.** Presence flag (`true`) recording that an intent
+    /// has already used its single permitted `request_extension`.
+    ExtensionGranted(BytesN<32>),
+
+    UserNonce(Address),      // per-user submit counter to widen intent_id preimage
     AllowedSrcChain(String), // src_chain name -> present if allowed
     SrcChainAllowlistEnabled,
+
+    /// **Instance storage.** Pending `propose_add_dst_token` proposal: maps a
+    /// candidate `dst_token` to the ledger timestamp (`u64`) at which
+    /// `execute_add_dst_token` may apply it (#118).
+    PendingDstTokenAdd(Address),
+
+    /// **Instance storage.** Pending `propose_remove_dst_token` proposal: maps
+    /// a `dst_token` to the ledger timestamp (`u64`) at which
+    /// `execute_remove_dst_token` may apply it (#118).
+    PendingDstTokenRemove(Address),
 
     /// **Instance storage.** The `Address` authorized to call `pause` in
     /// addition to `Admin` (issue #120). Lets an operator hand a hot key to
@@ -400,14 +522,19 @@ pub enum Error {
 
     /// Duplicate `intent_id` detected in `submit_intent` (hash collision guard).
     IntentAlreadyExists = 22,
-    /// #30: no pending fee-recipient proposal to accept
-    NoPendingFeeRecipient = 22,
     /// #31: fee arithmetic overflowed (fill_amount is astronomically large)
     FeeOverflow = 23,
-    /// #33: the address passed to add_allowed_dst_token doesn't implement SEP-41
+    /// #33: the address passed to `propose_add_dst_token` doesn't implement SEP-41
     InvalidTokenInterface = 24,
-    SrcChainNotAllowed = 22,
-    RescueProtectedToken = 23,
+    /// #30: `accept_fee_recipient` was called with no pending fee-recipient
+    /// proposal in storage.
+    NoPendingFeeRecipient = 25,
+    /// #34: `submit_intent` was called with a `src_chain` that is not on the
+    /// allowlist while `SrcChainAllowlistEnabled` is `true`.
+    SrcChainNotAllowed = 26,
+    /// #35: `rescue_tokens` was called for the bond token, which the rescue
+    /// path is not allowed to move.
+    RescueProtectedToken = 27,
     /// #127: `submit_intent` was called with a `src_token` whose format does
     /// not match the conventions of the declared `src_chain`.
     ///
@@ -525,9 +652,10 @@ impl IntentSettlement {
         admin.require_auth();
 
         let eta = env.ledger().timestamp() + ADMIN_TIMELOCK_DELAY;
-        env.storage()
-            .instance()
-            .set(&DataKey::PendingFeeRecipient, &(new_fee_recipient.clone(), eta));
+        env.storage().instance().set(
+            &DataKey::PendingFeeRecipient,
+            &(new_fee_recipient.clone(), eta),
+        );
 
         env.events().publish(
             (Symbol::new(&env, "fee_recipient_proposed"),),
@@ -709,10 +837,8 @@ impl IntentSettlement {
             .instance()
             .set(&DataKey::PendingDstTokenAdd(token.clone()), &eta);
 
-        env.events().publish(
-            (Symbol::new(&env, "dst_token_add_proposed"),),
-            (token, eta),
-        );
+        env.events()
+            .publish((Symbol::new(&env, "dst_token_add_proposed"),), (token, eta));
     }
 
     /// Apply a previously proposed `propose_add_dst_token` once its timelock
@@ -860,7 +986,7 @@ impl IntentSettlement {
 
     // ── Source Chain Allowlist ────────────────────────────────────────────────
 
-        /// Admin-only: add a chain name to the src_chain allowlist.
+    /// Admin-only: add a chain name to the src_chain allowlist.
     ///
     /// Issue #34: submit_intent accepted src_chain as free-text with zero
     /// validation, so a typo ("etherium") or unsupported name would create an
@@ -1111,6 +1237,7 @@ impl IntentSettlement {
             env.storage()
                 .instance()
                 .set(&DataKey::TotalSolvers, &(total + 1));
+            Self::add_to_solver_list(&env, &solver);
         }
 
         // ── Interaction: pull bond in ────────────────────────────────────────
@@ -1161,6 +1288,7 @@ impl IntentSettlement {
         env.storage()
             .instance()
             .set(&DataKey::TotalSolvers, &total.saturating_sub(1));
+        Self::remove_from_solver_list(&env, &solver);
 
         // ── Interaction: return bond ─────────────────────────────────────────
         if record.bond_amount > 0 {
@@ -1224,8 +1352,10 @@ impl IntentSettlement {
         // Issue #108: include the post-withdrawal remaining balance so indexers
         // can maintain a solver's bond ledger without a separate get_solver call.
         // data: (amount: i128, remaining: i128)
-        env.events()
-            .publish((Symbol::new(&env, "bond_withdrawn"), solver), (amount, remaining));
+        env.events().publish(
+            (Symbol::new(&env, "bond_withdrawn"), solver),
+            (amount, remaining),
+        );
     }
 
     // ── Intent Lifecycle ──────────────────────────────────────────────────────
@@ -1250,6 +1380,34 @@ impl IntentSettlement {
         // limit the scope of delegated authorisation — noted as a future hardening
         // opportunity if composable intent submission is added.
         user.require_auth();
+        Self::submit_intent_inner(
+            env,
+            user,
+            src_chain,
+            src_token,
+            src_amount,
+            dst_token,
+            min_dst_amount,
+            deadline,
+        )
+    }
+
+    /// Body of `submit_intent` without the `user.require_auth()` gate. Called
+    /// directly by `submit_intent` (after auth) and by `batch_submit_intent`,
+    /// which authorises the user once for the whole batch — `require_auth()`
+    /// can only be called once per address per contract invocation, so the
+    /// per-item calls must not repeat it.
+    #[allow(clippy::too_many_arguments)]
+    fn submit_intent_inner(
+        env: Env,
+        user: Address,
+        src_chain: String,
+        src_token: String,
+        src_amount: i128,
+        dst_token: Address,
+        min_dst_amount: i128,
+        deadline: Option<u64>,
+    ) -> BytesN<32> {
         Self::require_not_paused(&env);
         Self::bump_instance_ttl(&env);
 
@@ -1397,6 +1555,13 @@ impl IntentSettlement {
         // malicious invoker contract from accepting an unintended intent on the
         // solver's behalf; noted as a future hardening opportunity.
         solver.require_auth();
+        Self::accept_intent_inner(env, solver, intent_id);
+    }
+
+    /// Body of `accept_intent` without the `solver.require_auth()` gate. Shared
+    /// with `batch_accept_intent`, which authorises the solver once per batch
+    /// (`require_auth()` is one-shot per address per invocation).
+    fn accept_intent_inner(env: Env, solver: Address, intent_id: BytesN<32>) {
         Self::require_not_paused(&env);
         Self::bump_instance_ttl(&env);
 
@@ -1411,7 +1576,8 @@ impl IntentSettlement {
         }
 
         let now = env.ledger().timestamp();
-        if solver_record.last_slash_time > 0 && now < solver_record.last_slash_time + SLASH_COOLDOWN {
+        if solver_record.last_slash_time > 0 && now < solver_record.last_slash_time + SLASH_COOLDOWN
+        {
             panic_with_error!(&env, Error::SolverInactive);
         }
 
@@ -1526,6 +1692,15 @@ impl IntentSettlement {
         // the scope if a delegated-execution pattern is ever introduced — noted
         // as the strongest candidate for future hardening.
         solver.require_auth();
+        Self::fill_intent_inner(env, solver, intent_id, fill_amount);
+    }
+
+    /// Body of `fill_intent` without the `solver.require_auth()` gate. Shared
+    /// with `batch_fill_intent`, which authorises the solver once per batch
+    /// (`require_auth()` is one-shot per address per invocation). The solver's
+    /// signature over the batch call still covers the individual dst-token
+    /// transfers each fill performs.
+    fn fill_intent_inner(env: Env, solver: Address, intent_id: BytesN<32>, fill_amount: i128) {
         Self::require_not_paused(&env);
         Self::bump_instance_ttl(&env);
 
@@ -1593,14 +1768,13 @@ impl IntentSettlement {
             .unwrap_or_else(|| panic_with_error!(&env, Error::FeeOverflow))
             .checked_div(10_000)
             .unwrap_or_else(|| panic_with_error!(&env, Error::FeeOverflow));
-        if fee > 0 {
-            let fee_recipient: Address = env
-                .storage()
-                .instance()
-                .get(&DataKey::FeeRecipient)
-                .unwrap();
-            dst_client.transfer(&solver, &fee_recipient, &fee);
-        }
+
+        // ── Effects first (CEI) ──────────────────────────────────────────────
+        // Every state change below is written to storage *before* the token
+        // transfers at the end of this function. A hostile SEP-41 token that
+        // tries to re-enter `fill_intent` / `slash_solver` during a transfer
+        // sees the already-committed state (intent Filled, or re-opened with
+        // no assigned solver) and is rejected by the guards above.
 
         // Accumulate the fill.
         intent.total_filled += fill_amount;
@@ -1665,16 +1839,12 @@ impl IntentSettlement {
             .set(&DataKey::Intent(intent_id.clone()), &intent);
         Self::bump_intent_ttl(&env, &intent_id);
 
-        // ── Interactions: token transfers ────────────────────────────────────
-        // Solver delivers the full requested output to the user.
+        // ── Interactions: token transfers (state already committed above) ────
+        // Solver delivers this fill's output to the user, then separately pays
+        // the protocol fee. Each transfer happens exactly once.
         let dst_client = token::Client::new(&env, &intent.dst_token);
         dst_client.transfer(&solver, &intent.user, &fill_amount);
 
-        // Solver also pays the protocol fee (priced into their quote). Taking the
-        // fee from the solver — rather than clawing it back from the user — keeps
-        // the user's received amount at or above `min_dst_amount`, and keeps every
-        // token transfer authorized by the solver who signed this call.
-        let fee = fill_amount * PROTOCOL_FEE_BPS / 10_000;
         if fee > 0 {
             let fee_recipient: Address = env
                 .storage()
@@ -1690,7 +1860,8 @@ impl IntentSettlement {
         );
     }
 
-    /// User can cancel an Open intent (not yet accepted)
+    /// User can cancel an Open (or PartiallyFilled) intent that no solver
+    /// currently holds. Rate-limited per user by `CANCEL_COOLDOWN`.
     pub fn cancel_intent(env: Env, user: Address, intent_id: BytesN<32>) {
         // Auth audit: require_auth() is correct. Only the intent owner may
         // cancel. An additional ownership check (`intent.user != user`) follows
@@ -1701,41 +1872,61 @@ impl IntentSettlement {
         Self::bump_instance_ttl(&env);
 
         let now = env.ledger().timestamp();
+        Self::check_cancel_cooldown(&env, &user, now);
+        Self::cancel_intent_core(&env, &user, &intent_id);
+        Self::stamp_cancel_cooldown(&env, &user, now);
+    }
 
-        // Check cancellation cooldown for spam-deterrence
+    /// Spam-deterrence gate shared by `cancel_intent` and `batch_cancel_intent`:
+    /// panics if `user` cancelled within the last `CANCEL_COOLDOWN` seconds.
+    fn check_cancel_cooldown(env: &Env, user: &Address, now: u64) {
         if let Some(last_cancel_time) = env
             .storage()
             .persistent()
             .get::<_, u64>(&DataKey::CancelCooldown(user.clone()))
         {
             if now < last_cancel_time + CANCEL_COOLDOWN {
-                panic_with_error!(&env, Error::CancelCooldownNotExpired);
+                panic_with_error!(env, Error::CancelCooldownNotExpired);
             }
         }
+    }
 
+    /// Records `now` as `user`'s most recent cancel, starting a fresh cooldown.
+    /// A `batch_cancel_intent` call stamps this once for the whole batch, so a
+    /// batch counts as a single cancel action for rate-limiting.
+    fn stamp_cancel_cooldown(env: &Env, user: &Address, now: u64) {
+        env.storage()
+            .persistent()
+            .set(&DataKey::CancelCooldown(user.clone()), &now);
+    }
+
+    /// The actual cancellation: ownership + state checks, flip to `Cancelled`,
+    /// decrement `OpenIntents`, emit `intent_cancelled`. No cooldown handling —
+    /// callers gate that around one or more invocations.
+    fn cancel_intent_core(env: &Env, user: &Address, intent_id: &BytesN<32>) {
         let mut intent: IntentRecord = env
             .storage()
             .persistent()
             .get(&DataKey::Intent(intent_id.clone()))
-            .unwrap_or_else(|| panic_with_error!(&env, Error::IntentNotFound));
+            .unwrap_or_else(|| panic_with_error!(env, Error::IntentNotFound));
 
-        if intent.user != user {
-            panic_with_error!(&env, Error::Unauthorized);
+        if intent.user != *user {
+            panic_with_error!(env, Error::Unauthorized);
         }
 
         if intent.state == IntentState::Accepted {
-            panic_with_error!(&env, Error::CannotCancelAccepted);
+            panic_with_error!(env, Error::CannotCancelAccepted);
         }
 
         if intent.state != IntentState::Open && intent.state != IntentState::PartiallyFilled {
-            panic_with_error!(&env, Error::IntentNotOpen);
+            panic_with_error!(env, Error::IntentNotOpen);
         }
 
         intent.state = IntentState::Cancelled;
         env.storage()
             .persistent()
             .set(&DataKey::Intent(intent_id.clone()), &intent);
-        Self::bump_intent_ttl(&env, &intent_id);
+        Self::bump_intent_ttl(env, intent_id);
 
         // Decrement open_intents: intent is no longer open.
         let open: u64 = env
@@ -1746,13 +1937,11 @@ impl IntentSettlement {
         env.storage()
             .instance()
             .set(&DataKey::OpenIntents, &open.saturating_sub(1));
-        // Update cancellation cooldown
-        env.storage()
-            .persistent()
-            .set(&DataKey::CancelCooldown(user.clone()), &now);
 
-        env.events()
-            .publish((Symbol::new(&env, "intent_cancelled"), user), intent_id);
+        env.events().publish(
+            (Symbol::new(env, "intent_cancelled"), user.clone()),
+            intent_id.clone(),
+        );
     }
 
     /// Permissionless: slash a solver that accepted but didn't fill within FILL_WINDOW
@@ -1903,23 +2092,43 @@ impl IntentSettlement {
     }
 
     // ── Batch Operations ──────────────────────────────────────────────────────
+    //
+    // Each `batch_*` entrypoint is a thin loop over the `*_inner` body of the
+    // corresponding single-item entrypoint. They exist purely to amortise
+    // per-transaction overhead for solvers and users that operate on many
+    // intents at once.
+    //
+    // Auth: the actor (`user` / `solver`) is authorised exactly once, at the
+    // top of the batch call. `Address::require_auth()` may only be invoked once
+    // per address per contract invocation — calling the public single-item
+    // entrypoints in a loop would hit `Auth, ExistingValue` on the second
+    // iteration — so the loop bodies call the un-gated `*_inner` functions.
+    //
+    // Atomicity: a batch is one Soroban transaction, so a failure on any item
+    // reverts every earlier item in the same call — there is no partial
+    // success. Callers that want per-item isolation must send separate
+    // transactions.
+    //
+    // Resource bound: every batch is capped at `MAX_BATCH_SIZE` items, checked
+    // up front so an over-sized batch panics with `BatchTooLarge` before any
+    // auth, state change, or token movement.
 
-    /// Submit multiple intents in a single transaction.
-    /// Processes all intents in the batch; a failure partway through will
-    /// revert the entire batch (Soroban transaction atomicity).
-    /// Bounded by MAX_BATCH_SIZE to prevent resource exhaustion.
+    /// Submit multiple intents in a single transaction. Returns the new intent
+    /// ids in input order. Reverts the whole batch on any failure; capped at
+    /// `MAX_BATCH_SIZE`.
     pub fn batch_submit_intent(
         env: Env,
         user: Address,
         intents: soroban_sdk::Vec<(String, String, i128, Address, i128, Option<u64>)>,
     ) -> soroban_sdk::Vec<BytesN<32>> {
-        if intents.len() > MAX_BATCH_SIZE as usize {
-            panic_with_error!(&env, Error::ZeroAmount); // No dedicated error; reuse nearest
+        if intents.len() > MAX_BATCH_SIZE {
+            panic_with_error!(&env, Error::BatchTooLarge);
         }
+        user.require_auth();
 
         let mut result = soroban_sdk::Vec::new(&env);
         for (src_chain, src_token, src_amount, dst_token, min_dst_amount, deadline) in intents {
-            let intent_id = Self::submit_intent(
+            let intent_id = Self::submit_intent_inner(
                 env.clone(),
                 user.clone(),
                 src_chain,
@@ -1934,22 +2143,70 @@ impl IntentSettlement {
         result
     }
 
-    /// Accept multiple intents in a single transaction.
-    /// Processes all intents in the batch; a failure partway through will
-    /// revert the entire batch (Soroban transaction atomicity).
-    /// Bounded by MAX_BATCH_SIZE to prevent resource exhaustion.
+    /// Accept multiple intents in a single transaction. Reverts the whole
+    /// batch on any failure; capped at `MAX_BATCH_SIZE`.
     pub fn batch_accept_intent(
         env: Env,
         solver: Address,
         intent_ids: soroban_sdk::Vec<BytesN<32>>,
     ) {
-        if intent_ids.len() > MAX_BATCH_SIZE as usize {
-            panic_with_error!(&env, Error::ZeroAmount); // No dedicated error; reuse nearest
+        if intent_ids.len() > MAX_BATCH_SIZE {
+            panic_with_error!(&env, Error::BatchTooLarge);
         }
+        solver.require_auth();
 
         for intent_id in intent_ids {
-            Self::accept_intent(env.clone(), solver.clone(), intent_id);
+            Self::accept_intent_inner(env.clone(), solver.clone(), intent_id);
         }
+    }
+
+    /// Fill multiple intents in a single transaction (#199).
+    ///
+    /// `fills` is a list of `(intent_id, fill_amount)` pairs. Each pair is
+    /// handed to the `fill_intent` body unchanged, so mixed outcomes within one
+    /// batch are fine: some pairs may complete their intent (`Filled`) while
+    /// others only advance it (`PartiallyFilled` and re-opened). Every intent
+    /// must be currently `Accepted` by `solver`, and `solver` must be funded
+    /// for the sum of all `fill_amount`s plus fees, or the whole batch reverts.
+    /// Capped at `MAX_BATCH_SIZE`.
+    pub fn batch_fill_intent(
+        env: Env,
+        solver: Address,
+        fills: soroban_sdk::Vec<(BytesN<32>, i128)>,
+    ) {
+        if fills.len() > MAX_BATCH_SIZE {
+            panic_with_error!(&env, Error::BatchTooLarge);
+        }
+        solver.require_auth();
+
+        for (intent_id, fill_amount) in fills {
+            Self::fill_intent_inner(env.clone(), solver.clone(), intent_id, fill_amount);
+        }
+    }
+
+    /// Cancel multiple intents in a single transaction (#199).
+    ///
+    /// Every id must belong to `user` and be in a cancellable state
+    /// (`Open` / `PartiallyFilled`), or the whole batch reverts. The per-user
+    /// `CANCEL_COOLDOWN` is checked once for the whole call and stamped once at
+    /// the end, so one batch counts as a single cancel action for
+    /// rate-limiting — a user can clear all of their open intents in one
+    /// transaction without tripping the anti-spam gate on themselves. Capped
+    /// at `MAX_BATCH_SIZE`.
+    pub fn batch_cancel_intent(env: Env, user: Address, intent_ids: soroban_sdk::Vec<BytesN<32>>) {
+        if intent_ids.len() > MAX_BATCH_SIZE {
+            panic_with_error!(&env, Error::BatchTooLarge);
+        }
+
+        user.require_auth();
+        Self::bump_instance_ttl(&env);
+
+        let now = env.ledger().timestamp();
+        Self::check_cancel_cooldown(&env, &user, now);
+        for intent_id in intent_ids {
+            Self::cancel_intent_core(&env, &user, &intent_id);
+        }
+        Self::stamp_cancel_cooldown(&env, &user, now);
     }
 
     // ── Fill Window Extension ─────────────────────────────────────────────────
@@ -1984,7 +2241,7 @@ impl IntentSettlement {
             .persistent()
             .has(&DataKey::ExtensionGranted(intent_id.clone()))
         {
-            panic_with_error!(&env, Error::ZeroAmount); // No dedicated error; reuse nearest
+            panic_with_error!(&env, Error::ExtensionAlreadyGranted);
         }
 
         let now = env.ledger().timestamp();
@@ -2042,10 +2299,7 @@ impl IntentSettlement {
     /// Callers that only need the numeric value and already hold the
     /// SolverRecord can call `compute_reputation_score` directly.
     pub fn get_reputation_score(env: Env, solver: Address) -> Option<u32> {
-        let record: SolverRecord = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Solver(solver))?;
+        let record: SolverRecord = env.storage().persistent().get(&DataKey::Solver(solver))?;
         Some(Self::compute_reputation_score(&record))
     }
 
@@ -2075,6 +2329,13 @@ impl IntentSettlement {
     /// may execute it.
     pub fn get_pending_fee_recipient(env: Env) -> Option<(Address, u64)> {
         env.storage().instance().get(&DataKey::PendingFeeRecipient)
+    }
+
+    /// Pending admin-transfer proposal, if any: `(new_admin, eta)` where `eta`
+    /// is the ledger timestamp at which `accept_admin_transfer` may execute it
+    /// (#115/#116).
+    pub fn get_pending_admin(env: Env) -> Option<(Address, u64)> {
+        env.storage().instance().get(&DataKey::PendingAdmin)
     }
 
     /// Returns the bond token address (USDC SAC), or `None` before initialization.
@@ -2143,12 +2404,43 @@ impl IntentSettlement {
             .unwrap_or_else(|| Vec::new(&env))
     }
 
-    /// Total number of solvers ever registered.
+    /// Number of currently-registered solvers.
     pub fn get_solver_count(env: Env) -> u32 {
         env.storage()
             .instance()
             .get(&DataKey::TotalSolvers)
             .unwrap_or(0)
+    }
+
+    /// Enumerate registered solver addresses, paginated (#198).
+    ///
+    /// `start` is a 0-based offset into the registration-ordered list and
+    /// `limit` is clamped to `MAX_BATCH_SIZE` so a single call stays
+    /// resource-bounded as the solver set grows. Returns an empty `Vec` once
+    /// `start` is past the end. Pair with `get_solver` to fetch each record, or
+    /// `get_solver_count` to size the pagination loop.
+    ///
+    /// This is the on-chain alternative to reconstructing the solver set from
+    /// `solver_registered` / `solver_deregistered` event replay. It mirrors the
+    /// `list_allowed_dst_tokens` enumerable-list pattern (#117); see the
+    /// `DataKey::SolverList` doc comment for the storage-cost trade-off.
+    pub fn list_solvers(env: Env, start: u32, limit: u32) -> Vec<Address> {
+        let all: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::SolverList)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let capped_limit = limit.min(MAX_BATCH_SIZE);
+        let mut page = Vec::new(&env);
+        if start >= all.len() || capped_limit == 0 {
+            return page;
+        }
+        let end = start.saturating_add(capped_limit).min(all.len());
+        for i in start..end {
+            page.push_back(all.get(i).unwrap());
+        }
+        page
     }
 
     /// Aggregate health snapshot combining `is_paused`, `get_stats`, and
@@ -2206,7 +2498,11 @@ impl IntentSettlement {
     ///   all failures → 0
     ///   perfect rate, no volume → 9 000  (90% × 10 000)
     ///   perfect rate, high vol  → approaches 10 000
-    pub fn compute_reputation_score(record: &SolverRecord) -> u32 {
+    ///
+    /// Not a contract entrypoint: it takes `&SolverRecord` by reference, which
+    /// is not a valid Soroban ABI parameter, so it is `pub(crate)` (callable
+    /// from tests and from `get_reputation_score`) rather than `pub`.
+    pub(crate) fn compute_reputation_score(record: &SolverRecord) -> u32 {
         let total_fills = record.fills_completed as u64 + record.fills_failed as u64;
         if total_fills == 0 {
             return 0;
@@ -2222,8 +2518,7 @@ impl IntentSettlement {
         // decay_bps = VOLUME_SCALE / (VOLUME_SCALE + vol + 1) × 10_000
         // ∈ (0, 10_000].  High volume → low decay_bps.
         let vol = record.total_volume.max(0);
-        let decay_bps = ((VOLUME_SCALE as u64) * 10_000)
-            / ((VOLUME_SCALE + vol + 1) as u64);
+        let decay_bps = ((VOLUME_SCALE as u64) * 10_000) / ((VOLUME_SCALE + vol + 1) as u64);
 
         // volume_multiplier_bps ∈ [9_000, 10_000)
         // At zero volume: decay_bps = ~10_000, multiplier = 9_000
@@ -2249,85 +2544,89 @@ impl IntentSettlement {
     /// src_chain allowlist is disabled, obviously malformed tokens are rejected
     /// early.
     fn validate_src_token(env: &Env, src_chain: &String, src_token: &String) {
-        let token_len = src_token.len();
-        let chain_len = src_chain.len();
+        // `soroban_sdk::String` is not byte-indexable; copy both values into
+        // fixed ASCII buffers so the format checks can work on raw bytes.
+        // Any `src_chain` longer than the longest name we recognise, or any
+        // `src_token` longer than the longest address format we accept, cannot
+        // be a match — treat over-long inputs as an unknown chain (chain) or a
+        // rejected token (token) without touching the buffers.
+        const MAX_CHAIN_LEN: usize = 16;
+        const MAX_TOKEN_LEN: usize = 64;
 
-        // Compare `src_chain` byte-by-byte against a known ASCII literal.
-        let chain_is = |literal: &[u8]| -> bool {
-            if chain_len as usize != literal.len() {
-                return false;
-            }
-            let mut i = 0u32;
-            while i < chain_len {
-                if src_chain.get(i) != literal[i as usize] as u32 {
-                    return false;
-                }
-                i += 1;
-            }
-            true
+        let chain_len = src_chain.len() as usize;
+        let token_len = src_token.len() as usize;
+
+        let mut chain_buf = [0u8; MAX_CHAIN_LEN];
+        let chain_bytes: &[u8] = if chain_len <= MAX_CHAIN_LEN {
+            src_chain.copy_into_slice(&mut chain_buf[..chain_len]);
+            &chain_buf[..chain_len]
+        } else {
+            &chain_buf[..0]
         };
+
+        let chain_is = |literal: &[u8]| -> bool { chain_bytes == literal };
 
         let is_evm = chain_is(b"ethereum")
             || chain_is(b"base")
             || chain_is(b"polygon")
             || chain_is(b"arbitrum")
             || chain_is(b"optimism");
+        let is_solana = chain_is(b"solana");
+
+        if !is_evm && !is_solana {
+            // Unknown chain: skip validation — forward-compatible with future
+            // chains, and keeps the src_chain allowlist as the sole gate.
+            return;
+        }
+
+        if token_len > MAX_TOKEN_LEN {
+            panic_with_error!(env, Error::InvalidSrcToken);
+        }
+        let mut token_buf = [0u8; MAX_TOKEN_LEN];
+        src_token.copy_into_slice(&mut token_buf[..token_len]);
+        let token = &token_buf[..token_len];
 
         if is_evm {
             // EVM token address: exactly "0x" + 40 hex chars = 42 characters.
-            if token_len != 42 {
-                panic_with_error!(env, Error::InvalidSrcToken);
-            }
-            // Must start with "0x".
-            if src_token.get(0) != b'0' as u32 || src_token.get(1) != b'x' as u32 {
+            if token_len != 42 || token[0] != b'0' || token[1] != b'x' {
                 panic_with_error!(env, Error::InvalidSrcToken);
             }
             // Remaining 40 characters must all be hex digits [0-9a-fA-F].
-            let mut i = 2u32;
-            while i < 42 {
-                let ch = src_token.get(i);
-                let is_hex = (ch >= b'0' as u32 && ch <= b'9' as u32)
-                    || (ch >= b'a' as u32 && ch <= b'f' as u32)
-                    || (ch >= b'A' as u32 && ch <= b'F' as u32);
+            for &ch in &token[2..] {
+                let is_hex = ch.is_ascii_digit()
+                    || (b'a'..=b'f').contains(&ch)
+                    || (b'A'..=b'F').contains(&ch);
                 if !is_hex {
                     panic_with_error!(env, Error::InvalidSrcToken);
                 }
-                i += 1;
             }
             return;
         }
 
-        if chain_is(b"solana") {
-            // Solana token (SPL mint): base58-encoded public key, 32–44 chars,
-            // no "0x" prefix.
-            if token_len < 32 || token_len > 44 {
+        // Solana token (SPL mint): base58-encoded 32-byte public key. Mint
+        // addresses are 32–44 characters (a 32-byte value is at most 44 base58
+        // digits, at least 32) with no "0x" prefix. Alphabet is Bitcoin base58
+        // — 123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz — which
+        // excludes 0, I, O and l. Verified against the published SPL mints in
+        // `docs/132-supported-chains.md` §4.8 (e.g. USDC
+        // `EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v`, 44 chars).
+        if !(32..=44).contains(&token_len) {
+            panic_with_error!(env, Error::InvalidSrcToken);
+        }
+        if token_len >= 2 && token[0] == b'0' && token[1] == b'x' {
+            panic_with_error!(env, Error::InvalidSrcToken);
+        }
+        for &ch in token {
+            let is_b58 = (b'1'..=b'9').contains(&ch)
+                || (b'A'..=b'H').contains(&ch)
+                || (b'J'..=b'N').contains(&ch)
+                || (b'P'..=b'Z').contains(&ch)
+                || (b'a'..=b'k').contains(&ch)
+                || (b'm'..=b'z').contains(&ch);
+            if !is_b58 {
                 panic_with_error!(env, Error::InvalidSrcToken);
-            }
-            if token_len >= 2
-                && src_token.get(0) == b'0' as u32
-                && src_token.get(1) == b'x' as u32
-            {
-                panic_with_error!(env, Error::InvalidSrcToken);
-            }
-            // Validate base58 alphabet:
-            // 123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz
-            // (excludes: '0', 'I', 'O', 'l')
-            let mut i = 0u32;
-            while i < token_len {
-                let ch = src_token.get(i);
-                let is_b58 = (ch >= b'1' as u32 && ch <= b'9' as u32)
-                    || (ch >= b'A' as u32 && ch <= b'H' as u32)
-                    || (ch >= b'J' as u32 && ch <= b'N' as u32)
-                    || (ch >= b'P' as u32 && ch <= b'Z' as u32)
-                    || (ch >= b'a' as u32 && ch <= b'k' as u32)
-                    || (ch >= b'm' as u32 && ch <= b'z' as u32);
-                if !is_b58 {
-                    panic_with_error!(env, Error::InvalidSrcToken);
-                }
-                i += 1;
             }
         }
-        // Unknown chain: skip validation — forward-compatible with future chains.
     }
 
     // ── Proof gating (issue #190) ────────────────────────────────────────────
@@ -2470,6 +2769,45 @@ impl IntentSettlement {
             .set(&DataKey::AllowedDstTokenList, &new_list);
     }
 
+    /// Append `solver` to the enumerable solver list (#198) if not already
+    /// present. Called from `register_solver` only on a first registration, so
+    /// a solver that deregisters and re-registers gets exactly one entry — the
+    /// same "already present" guard the dst_token list uses.
+    fn add_to_solver_list(env: &Env, solver: &Address) {
+        let mut list: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::SolverList)
+            .unwrap_or_else(|| Vec::new(env));
+        for i in 0..list.len() {
+            if list.get(i).unwrap() == *solver {
+                return;
+            }
+        }
+        list.push_back(solver.clone());
+        env.storage().instance().set(&DataKey::SolverList, &list);
+    }
+
+    /// Remove `solver` from the enumerable solver list (#198), if present.
+    /// Called from `deregister_solver`.
+    fn remove_from_solver_list(env: &Env, solver: &Address) {
+        let list: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::SolverList)
+            .unwrap_or_else(|| Vec::new(env));
+        let mut new_list: Vec<Address> = Vec::new(env);
+        for i in 0..list.len() {
+            let item = list.get(i).unwrap();
+            if item != *solver {
+                new_list.push_back(item);
+            }
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::SolverList, &new_list);
+    }
+
     fn get_adjusted_min_bond(env: &Env, dst_token: &Address) -> i128 {
         let multiplier = env
             .storage()
@@ -2520,14 +2858,15 @@ impl IntentSettlement {
         // first-accept-wins flow working while the bidding feature is gated.
     }
 
-    /// Returns the effective fee in basis points for a given `fill_amount`,
-    /// consulting the stored `ProtocolConfig` for the per-contract rate.
+    /// Returns the effective protocol fee in basis points from the stored
+    /// `ProtocolConfig`.
     ///
-    /// Future work (tiered-fee feature): this function can be extended to
-    /// accept a solver address and apply volume-tier discounts based on the
-    /// solver's historical `total_volume`.  For now it returns the flat
-    /// `protocol_fee_bps` from config so all existing call-sites get a single
-    /// source of truth for fee calculation.
+    /// Future work (tiered-fee feature): this can be extended to take a solver
+    /// address and apply volume-tier discounts from the solver's historical
+    /// `total_volume`. It is retained as the single intended lookup point for
+    /// that logic; `#[allow(dead_code)]` because `fill_intent` still reads the
+    /// flat `PROTOCOL_FEE_BPS` constant directly today.
+    #[allow(dead_code)]
     fn get_tiered_fee_bps(env: &Env) -> i128 {
         Self::load_config(env).protocol_fee_bps
     }
