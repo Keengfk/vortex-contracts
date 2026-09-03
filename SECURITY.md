@@ -28,16 +28,38 @@ It is intended for auditors and integrators.
 
 #### 1. Solver self-reporting
 
-The contract has **no on-chain proof** that a solver actually sent tokens on the
-source chain. `fill_intent` trusts the solver to transfer `dst_token` to the
-user on Stellar; the economic incentive not to default is the bond slash
-(`slash_solver` takes 10 % of the bond permissionlessly once the fill window
-expires).
+By default the contract has **no on-chain proof** that a solver actually sent
+tokens on the source chain. `fill_intent` trusts the solver to transfer
+`dst_token` to the user on Stellar; the economic incentive not to default is the
+bond slash (`slash_solver` takes 10 % of the bond permissionlessly once the fill
+window expires).
 
-**Implication:** A solver with a large enough bond can accept an intent, fail to
-fill, absorb the 10 % slash, and profit if the spread on the source-chain trade
-is more valuable than 10 % of their bond.  The bond size is the primary
-economic deterrent.
+**Implication:** A solver can still accept an intent, fail to fill, absorb the
+slash, and profit if the source-chain spread outweighs it. The proportional
+formula removes the old asymmetry where a large bond made a small-intent default
+disproportionately expensive (or a small bond made a large-intent default
+cheap); the bond size remains the primary economic deterrent.
+
+**Optional cryptographic gate (issue #190).** An admin can call
+`set_proof_registry` to point `intent_settlement` at a deployed `ProofRegistry`
+(Wormhole-backed). A solver may then call
+`fill_intent(solver, intent_id, fill_amount, require_proof = true)`, which
+cross-checks a verified source-chain deposit record before any token moves:
+
+- no proof for the intent → `ProofNotFound`;
+- proof's Wormhole `src_chain_id` ≠ mapped `intent.src_chain` → `ProofChainMismatch`;
+- `proof.src_amount < intent.src_amount` → `ProofAmountInsufficient`;
+- registry not configured → `ProofRegistryNotSet`.
+
+Every failure path reverts before touching state, so the intent stays
+`Accepted` and `slash_solver` remains the backstop (see
+`docs/129-proof-mismatch-fallback.md`). This is **opt-in and defaults off**:
+`require_proof = false` — the value every existing caller passes — reads no
+registry and preserves the self-reported-fill behaviour above byte-for-byte,
+mirroring how `DstAllowlistEnabled` defaults off. When the gate is used, trust
+for that fill becomes *cryptographic (Guardian quorum) + economic (bond)* rather
+than economic alone; residual risk is Guardian collusion, shared with all
+Wormhole users.
 
 #### 2. Admin key custody
 
@@ -179,16 +201,28 @@ unilaterally by the admin without other protocol preconditions being met first
 
 ### Known Limitations
 
-- **No cross-chain proof.** The contract cannot verify the source-chain
-  transaction. Trust is economic, not cryptographic.
+- **Cross-chain proof is opt-in.** By default the contract does not verify the
+  source-chain transaction and trust is economic, not cryptographic. Issue #190
+  adds an admin-enabled `ProofRegistry` gate (`fill_intent(..., require_proof =
+  true)`) that makes a verified Wormhole deposit a precondition for the fill;
+  until an operator configures it and solvers opt in, the economic-only model
+  above still applies.
 - **Single admin key.** There is no multi-sig or timelock on admin operations.
   Protocol operators should secure the admin key with a hardware wallet or
   multi-sig wrapper before mainnet.
-- **Bond slash is fixed at 10 %.** A solver with a very large bond can default
-  cheaply.  A dynamic slash proportional to intent size is on the roadmap.
+- **Bond slash is proportional to intent size (issue #193).** `slash_solver`
+  slashes `min(unfilled_output, bond) / 10` — an amount scaled to the intent the
+  solver failed to fill — capped at 10 % of the bond (so a well-matched bond is
+  never punished harder than the old flat rate) and floored at 1 stroop (issue
+  #32). Cross-token value comparison between the bond token and the destination
+  token is still out of scope and assumes same-token comparability or an
+  admin-set per-token minimum; a price-oracle-based comparison remains on the
+  roadmap.
 - **Intent re-open after slash.** After `slash_solver` the intent is reset to
-  `Open` with a fresh `INTENT_EXPIRY` deadline.  There is currently no cap on
-  how many times an intent can cycle through `Open → Accepted → Slashed`.
+  `Open` (or `PartiallyFilled`) with a fresh deadline. This is now bounded:
+  `ProtocolConfig.max_slash_cycles` caps how many times an intent can cycle
+  through `Open → Accepted → Slashed` before it transitions to the terminal
+  `Abandoned` state instead of re-opening.
 - **No allowlist by default.** Until an admin calls `set_dst_allowlist_enabled(true)`,
   any token address — including malicious contracts — can be used as `dst_token`.
 
