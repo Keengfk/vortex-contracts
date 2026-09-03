@@ -1448,11 +1448,19 @@ impl IntentSettlement {
 
     /// Admin-only: recover SEP-41 tokens accidentally sent to the contract.
     ///
-    /// Issue #35 — trust model: rescue is restricted to tokens that are
+    /// Issue #35 / Issue #265 — trust model: rescue is restricted to tokens that are
     /// neither the bond_token nor any token currently referenced by an active
     /// (Accepted) intent as its dst_token. This prevents the rescue path from
     /// being misused to drain live solver collateral or in-flight intent
     /// output from under active protocol participants.
+    ///
+    /// Audit Note (Issue #265): `BondToken` is set once during contract
+    /// `initialize` and is immutable (no admin function exists to mutate it).
+    /// Forward-compatibility for Issue #2 (multi-bond-token design / docs/60):
+    /// When Issue #2 introduces per-token bond sets (`DataKey::AllowedBondToken`),
+    /// this single-address guard MUST be updated to query `AllowedBondToken(token)`
+    /// or iterate the approved bond token set, preventing accidental draining of
+    /// newly added bond tokens.
     ///
     /// If you need to move bond_token you must wait until all active intents
     /// have settled (filled, slashed, or cancelled), then handle any
@@ -2708,11 +2716,25 @@ impl IntentSettlement {
                 .get(&DataKey::FeeRecipient)
                 .unwrap();
             let client = token::Client::new(&env, &bond_token);
-            client.transfer(
-                &env.current_contract_address(),
-                &fee_recipient,
-                &slash_amount,
-            );
+            if fee_recipient_share > 0 {
+                let fee_recipient: Address = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::FeeRecipient)
+                    .unwrap();
+                client.transfer(
+                    &env.current_contract_address(),
+                    &fee_recipient,
+                    &fee_recipient_share,
+                );
+            }
+            if caller_rebate > 0 {
+                client.transfer(
+                    &env.current_contract_address(),
+                    &caller,
+                    &caller_rebate,
+                );
+            }
         }
 
         env.events().publish(
