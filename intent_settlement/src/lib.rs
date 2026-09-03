@@ -82,6 +82,14 @@ const ADMIN_TIMELOCK_DELAY: u64 = 172_800; // 48 hours
 // That is a comfortable safety margin while rejecting only fat-fingered inputs.
 pub const MAX_AMOUNT: i128 = 1_000_000_000_000_000_000_000_000_000_000i128; // 10^30
 
+const MAX_BATCH_SIZE: u32 = 100;
+const MAX_EXTENSION_DURATION: u64 = 600; // 10 minutes
+
+const DEFAULT_MIN_BOND: i128 = MIN_BOND;
+const DEFAULT_FILL_WINDOW: u64 = FILL_WINDOW;
+const DEFAULT_INTENT_EXPIRY: u64 = INTENT_EXPIRY;
+const DEFAULT_PROTOCOL_FEE_BPS: i128 = PROTOCOL_FEE_BPS;
+
 // Soroban archives ledger entries that go too long without being touched.
 // Persistent Intent/Solver records get their TTL bumped on every write so
 // they don't need to be manually restored before later calls can read them.
@@ -1114,6 +1122,8 @@ impl IntentSettlement {
         env.storage()
             .instance()
             .set(&DataKey::SrcChainAllowlistEnabled, &enabled);
+        env.events()
+            .publish((Symbol::new(&env, "src_chain_allowlist_enabled"),), enabled);
     }
 
     /// Whether src_chain validation is currently active.
@@ -1189,7 +1199,7 @@ impl IntentSettlement {
     pub fn pause(env: Env, caller: Address) {
         Self::require_admin_or_pauser(&env, &caller);
         env.storage().instance().set(&DataKey::Paused, &true);
-        env.events().publish((Symbol::new(&env, "paused"),), true);
+        env.events().publish((Symbol::new(&env, "paused"),), ());
     }
 
     /// Admin-only: lift a pause and restore normal operation.
@@ -1201,7 +1211,7 @@ impl IntentSettlement {
     pub fn unpause(env: Env) {
         Self::require_admin(&env);
         env.storage().instance().set(&DataKey::Paused, &false);
-        env.events().publish((Symbol::new(&env, "paused"),), false);
+        env.events().publish((Symbol::new(&env, "unpaused"),), ());
     }
 
     /// Whether submit_intent/accept_intent/fill_intent and solver bond

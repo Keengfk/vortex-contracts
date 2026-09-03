@@ -92,6 +92,10 @@ first deploys to mainnet.
 
 ### Added
 
+- **#240** (`proof_registry`): Contract upgrade mechanism (`upgrade` entrypoint
+  and `migrate()` guard) matching the pattern in `intent_settlement`. Allows 
+  `proof_registry` to evolve without data loss or re-initialization. Migration 
+  guard prevents double-execution on the same version.
 - **Storage TTL management**: persistent `Intent`/`Solver` entries and the
   contract instance now have their TTL extended on every write, closing a
   gap where none of Soroban's state-archival requirements were handled.
