@@ -536,6 +536,20 @@ pub enum DataKey {
     /// exactly like `DstAllowlistEnabled`.
     ProofRegistry,
 
+    /// **Instance storage.** Per-token running liability counter (`i128`) for
+    /// all protocol obligations in `token` NOT already covered by `TotalBonded`
+    /// or `BackstopPool`:
+    ///   - bond token: open user dispute bonds currently held in escrow
+    ///     (incremented by `dispute_fill` / `open_dispute`, decremented by
+    ///     `resolve_dispute` or the arbiter-timeout path in `release_fill`).
+    ///   - dst tokens: fill amounts currently held in contract escrow
+    ///     (incremented by `begin_fill`, decremented by `release_fill` and
+    ///     `resolve_dispute`).
+    ///
+    /// Used by `check_solvency` for an O(1) liability read without scanning
+    /// every intent. `unwrap_or(0)` is the correct fallback when absent.
+    Liabilities(Address),
+
     /// **Instance storage.** Optional policy contract address (issue #378).
     /// When set, `submit_intent` calls `check_intent(user, dst_token, amount)
     /// -> bool` before proceeding. Absent by default — zero overhead when not
