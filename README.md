@@ -621,5 +621,7 @@ Current ecosystem tooling examples:
 
 ## Handsoff notes
 
+<!-- handsoff-issue-400 -->
+- #400: [High] Add an interface-version handshake between cooperating contracts
 <!-- handsoff-issue-404 -->
 - #404: [High] Add on-chain rate-of-change guardrails to protocol parameters

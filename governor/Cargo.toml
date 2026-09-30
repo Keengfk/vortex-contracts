@@ -1,0 +1,18 @@
+[package]
+name = "governor"
+version = "0.1.0"
+edition = "2021"
+description = "Stake-weighted Governor for protocol parameter changes"
+license = "Apache-2.0"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+soroban-sdk = { workspace = true }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+
+[features]
+testutils = ["soroban-sdk/testutils"]
