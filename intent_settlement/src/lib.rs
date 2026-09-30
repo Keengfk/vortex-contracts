@@ -372,6 +372,24 @@ pub enum DataKey {
     /// **Persistent storage.** All outbound intent ids submitted by a given user.
     /// Vec<BytesN<32>>, appended by `submit_outbound_intent`. (#355)
     UserOutboundIntents(Address),
+
+    /// Issue #363: Solver operator (session) key grants: (solver, operator) → Operator struct
+    SolverOperator(Address, Address),
+
+    /// Issue #364: Delegated staking shares: (solver, delegator) → share balance
+    DelegatedStake(Address, Address),
+
+    /// Issue #364: Total delegated shares for a solver (for share accounting)
+    SolverDelegatedShares(Address),
+
+    /// Issue #365: Commit-reveal sealed bids: (intent_id, solver) → CommittedBid
+    CommittedBid(BytesN<32>, Address),
+
+    /// Issue #365: Bid reveal window configuration per intent
+    BidRevealWindow(BytesN<32>),
+
+    /// Issue #366: Configuration flag for batch mode (atomic vs best-effort)
+    BatchModeConfig,
 }
 
 // ─── Data Structs ─────────────────────────────────────────────────────────────
@@ -649,6 +667,53 @@ pub struct ReputationSnapshot {
     pub total_volume: i128,
 }
 
+/// Issue #363: Solver operator key with scoped permissions
+#[contracttype]
+#[derive(Clone)]
+pub struct Operator {
+    pub address: Address,
+    /// Bitmask of allowed operations: bit 0=accept, 1=fill, 2=bid, 3=request_extension
+    pub scopes: u32,
+    /// Maximum notional amount per intent for this operator
+    pub max_per_intent: i128,
+    /// Expiry timestamp for this operator grant
+    pub expires_at: u64,
+}
+
+/// Issue #364: Delegated stake tracking per solver
+#[contracttype]
+#[derive(Clone)]
+pub struct SolverDelegation {
+    pub solver: Address,
+    pub total_delegated: i128,
+    pub total_shares: i128,
+    /// Commission rate in basis points
+    pub commission_bps: u32,
+    /// Timelock for commission increases
+    pub commission_locked_until: u64,
+}
+
+/// Issue #365: Committed bid for sealed-bid auction
+#[contracttype]
+#[derive(Clone)]
+pub struct CommittedBid {
+    pub solver: Address,
+    /// SHA256(solver || intent_id || amount || salt)
+    pub commitment_hash: BytesN<32>,
+    pub committed_at: u64,
+    /// Small bond to penalize uncommitted/unrevealed bids
+    pub bid_bond: i128,
+}
+
+/// Issue #365: Revealed bid with proof
+#[contracttype]
+#[derive(Clone)]
+pub struct RevealedBid {
+    pub amount: i128,
+    /// Random salt used in commitment
+    pub salt: BytesN<32>,
+}
+
 // ─── Errors ───────────────────────────────────────────────────────────────────
 
 #[contracterror]
@@ -821,95 +886,117 @@ pub enum Error {
     /// gaming the referral programme by naming their own address.
     SelfReferral = 35,
 
+    /// Issue #363: Operator key has expired or has insufficient permissions/balance
+    OperatorNotAuthorized = 36,
+    /// Issue #363: Attempted operation exceeds operator's per-intent limit
+    OperatorLimitExceeded = 37,
+
+    /// Issue #364: Delegated stake amount is too small or invalid
+    InvalidDelegateAmount = 38,
+    /// Issue #364: Delegator has insufficient delegated shares to undelegate
+    InsufficientDelegatedShares = 39,
+    /// Issue #364: Unbonding delay has not elapsed for undelegation
+    UnbondingInProgress = 40,
+
+    /// Issue #365: Bid commitment is invalid or has expired
+    InvalidBidCommitment = 41,
+    /// Issue #365: Bid reveal does not match committed hash
+    BidRevealMismatch = 42,
+    /// Issue #365: Reveal window has closed
+    RevealWindowClosed = 43,
+
+    /// Issue #366: Best-effort batch operation with per-item results
+    BatchProcessingError = 44,
+
     /// Issue #360: `accept_intent` or `batch_accept_intent` was called for an intent
     /// with an `exclusive_solver` that is not the calling solver, and the
     /// exclusivity window has not yet expired.
-    ExclusivityViolation = 36,
+    ExclusivityViolation = 45,
 
     /// Issue #359: `accept_intent` was called with a decay configuration where
     /// `start_dst_amount < min_dst_amount` or decay times are invalid.
-    InvalidDecayConfig = 37,
+    InvalidDecayConfig = 46,
 
     /// Issue #361: `submit_intent_signed` was called with a signature that failed
     /// ed25519 verification or a nonce that was already consumed.
-    SignatureInvalid = 38,
+    SignatureInvalid = 47,
 
     /// Issue #361: `submit_intent_signed` was called with an expiry timestamp
     /// that is already in the past.
-    SignatureExpired = 39,
+    SignatureExpired = 48,
 
     /// Issue #362: `submit_intent` was called but the user's deposit transfer
     /// failed (insufficient balance or token allowance).
-    DepositFailed = 40,
+    DepositFailed = 49,
 
     /// Issue #362: `withdraw_deposit` was called for an intent that is not in
     /// a terminal state (Filled, Cancelled, Expired, Slashed, Resolved).
-    IntentNotTerminal = 41,
+    IntentNotTerminal = 50,
 
     // ── Missing variants (issue #340) – declared but raised in settlement ────
 
     /// Dispute window has expired; no longer possible to contest a fill.
-    DisputeWindowExpired = 42,
+    DisputeWindowExpired = 51,
     /// Dispute window has not yet opened; too early to contest.
-    DisputeWindowStillOpen = 43,
+    DisputeWindowStillOpen = 52,
     /// Dispute window has closed; no longer possible to open a dispute.
-    DisputeWindowClosed = 44,
+    DisputeWindowClosed = 53,
     /// No dispute is currently open for this intent.
-    NoDisputeOpen = 45,
+    NoDisputeOpen = 54,
     /// No fill escrow exists to release.
-    NoFillEscrowed = 46,
+    NoFillEscrowed = 55,
     /// Arbiter timeout has not yet elapsed; slash not yet available.
-    TimelockNotElapsed = 47,
+    TimelockNotElapsed = 56,
     /// Bid window has closed; no longer accepting bids.
-    BidWindowClosed = 48,
+    BidWindowClosed = 57,
     /// Bid window has not yet opened.
-    BidWindowStillOpen = 49,
+    BidWindowStillOpen = 58,
     /// Intent is not in bidding state.
-    IntentNotBidding = 50,
+    IntentNotBidding = 59,
     /// Submitted bid is not higher than current best bid.
-    BidNotHigher = 51,
+    BidNotHigher = 60,
     /// Intent is not in filling state for this operation.
-    IntentNotFilling = 52,
+    IntentNotFilling = 61,
     /// Amount exceeds maximum allowed value.
-    AmountTooLarge = 53,
+    AmountTooLarge = 62,
     /// Intent is not in disputed state for this operation.
-    IntentNotDisputed = 54,
+    IntentNotDisputed = 63,
     /// Invalid protocol configuration.
-    InvalidConfig = 55,
+    InvalidConfig = 64,
     /// Arbiter window has expired; dispute resolution window closed.
-    ArbiterWindowExpired = 56,
+    ArbiterWindowExpired = 65,
     /// Backstop pool is empty; cannot claim from it.
-    BackstopPoolEmpty = 57,
+    BackstopPoolEmpty = 66,
     /// Backstop funds have already been claimed.
-    BackstopAlreadyClaimed = 58,
+    BackstopAlreadyClaimed = 67,
     /// Batch size exceeds maximum allowed.
-    BatchTooLarge = 59,
+    BatchTooLarge = 68,
     /// Too many bond tokens configured.
-    TooManyBondTokens = 60,
+    TooManyBondTokens = 69,
     /// Solver's route configuration has too many entries.
-    TooManyRouteEntries = 61,
+    TooManyRouteEntries = 70,
     /// Destination amount is implausibly large.
-    ImplausibleDstAmount = 62,
+    ImplausibleDstAmount = 71,
     /// Cancel cooldown period has not yet elapsed.
-    CancelCooldownNotExpired = 63,
+    CancelCooldownNotExpired = 72,
     /// Intent has already used its one permitted extension.
-    ExtensionAlreadyGranted = 64,
+    ExtensionAlreadyGranted = 73,
     /// Extension cap has been exceeded.
-    ExtensionCapExceeded = 65,
+    ExtensionCapExceeded = 74,
     /// Pending admin transfer proposal not found.
-    NoPendingAdminTransfer = 66,
+    NoPendingAdminTransfer = 75,
     /// Contract has already been migrated to this version.
-    AlreadyMigrated = 67,
+    AlreadyMigrated = 76,
     /// Maximum active intents per solver has been reached.
-    MaxActiveIntentsCapReached = 68,
+    MaxActiveIntentsCapReached = 77,
     /// No pending upgrade proposal found.
-    NoPendingUpgrade = 69,
+    NoPendingUpgrade = 78,
     /// No pending destination token change found.
-    NoPendingDstTokenChange = 70,
+    NoPendingDstTokenChange = 79,
     /// Caller is not the designated arbiter.
-    NotArbiter = 71,
+    NotArbiter = 80,
     /// Intent is not in accepted state for fill operations.
-    IntentNotAcceptedForFill = 72,
+    IntentNotAcceptedForFill = 81,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
