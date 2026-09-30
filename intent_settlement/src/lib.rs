@@ -22,6 +22,12 @@ mod test;
 mod proptest_bond;
 
 #[cfg(test)]
+mod proptest_fill;
+
+#[cfg(test)]
+mod proptest_state_machine;
+
+#[cfg(test)]
 mod bench;
 
 // ─── Constants ────────────────────────────────────────────────────────────────

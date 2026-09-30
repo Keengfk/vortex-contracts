@@ -205,9 +205,22 @@ jobs:
         run: cargo build --target wasm32-unknown-unknown --release
 
   proptest:
-    name: Bond-conservation proptest
+    name: Property-based tests (${{ matrix.label }})
     runs-on: ubuntu-latest
     # Needs: contents: read (checkout only). Inherits workflow-level minimum.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # PR / push-to-main: 256 cases — fast, well under 5 minutes.
+          - label: "256 cases (PR)"
+            cases: 256
+            nightly_only: false
+          # Nightly deeper run: 2048 cases. Gated to schedule events by the
+          # `if` on each step so this leg is a no-op during normal PR/push CI.
+          - label: "2048 cases (nightly)"
+            cases: 2048
+            nightly_only: true
     defaults:
       run:
         working-directory: intent_settlement
@@ -221,10 +234,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: intent_settlement
-      - name: Bond conservation proptest
-        # PROPTEST_CASES controls how many random sequences are generated per
-        # test; 256 balances coverage against CI runtime.
-        run: PROPTEST_CASES=256 cargo test --features testutils -- bond_conservation
+          key: proptest-${{ matrix.cases }}
+      # Each step runs on every trigger for the 256-case leg (nightly_only=false),
+      # and only on `schedule` events for the 2048-case leg (nightly_only=true).
+      - name: Bond-conservation proptest
+        if: ${{ !matrix.nightly_only || github.event_name == 'schedule' }}
+        run: PROPTEST_CASES=${{ matrix.cases }} cargo test --features testutils -- bond_conservation
+      - name: Fill-conservation proptest
+        if: ${{ !matrix.nightly_only || github.event_name == 'schedule' }}
+        run: PROPTEST_CASES=${{ matrix.cases }} cargo test --features testutils -- fill_conservation
+      # Stateful state-machine harness (I1–I6 invariants, reference model,
+      # multi-actor, time jumps, and the three seeded regression bugs).
+      - name: Stateful state-machine proptest
+        if: ${{ !matrix.nightly_only || github.event_name == 'schedule' }}
+        run: PROPTEST_CASES=${{ matrix.cases }} cargo test --features testutils -- proptest_state_machine
 
   audit:
     name: Dependency audit (${{ matrix.crate }})
