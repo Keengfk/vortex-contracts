@@ -1,0 +1,20 @@
+[package]
+name = "spec-check"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "spec_check"
+path = "src/lib.rs"
+
+[[test]]
+name = "spec_compat"
+path = "tests/spec_compat.rs"
+
+[dependencies]
+soroban-spec = "20"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
