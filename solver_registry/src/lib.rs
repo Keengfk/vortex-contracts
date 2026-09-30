@@ -28,6 +28,9 @@ use soroban_sdk::{
 #[cfg(test)]
 mod test;
 
+#[cfg(test)]
+mod bench;
+
 // ─── Units & tier defaults ───────────────────────────────────────────────────
 
 /// Smallest unit of the 7-decimal USDC bond token (1 USDC = 10_000_000).
