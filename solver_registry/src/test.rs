@@ -8,9 +8,20 @@
 //! slash, the zero-fills edge case, and threshold tuning bounds.
 
 use crate::{Error, SolverRecord, SolverRegistry, SolverRegistryClient, USDC};
+use core::sync::atomic::{AtomicU32, Ordering};
 use soroban_sdk::{
-    testutils::Address as _, token, Address, BytesN, Env,
+    testutils::Address as _, token, Address, BytesN, Env, Symbol,
 };
+
+/// A fresh `intent_id` per call, so tests that don't exercise idempotency
+/// (#390) never collide on a `Recorded` key.
+fn next_intent(env: &Env) -> BytesN<32> {
+    static COUNTER: AtomicU32 = AtomicU32::new(1);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut bytes = [0u8; 32];
+    bytes[..4].copy_from_slice(&n.to_be_bytes());
+    BytesN::from_array(env, &bytes)
+}
 
 const FLOOR: i128 = 50 * USDC; // tier-0 (Unranked) bond floor
 
@@ -257,8 +268,12 @@ fn record_fill_updates_volume_and_score() {
     let ctx = setup();
     ctx.register(FLOOR);
     // No writer configured yet → admin drives the write path.
-    ctx.client()
-        .record_fill(&ctx.admin, &ctx.solver, &(100 * USDC));
+    ctx.client().record_fill(
+        &ctx.admin,
+        &ctx.solver,
+        &next_intent(&ctx.env),
+        &(100 * USDC),
+    );
 
     let rec = ctx.client().get_solver(&ctx.solver).unwrap();
     assert_eq!(rec.fills_completed, 1);
@@ -270,9 +285,11 @@ fn record_fill_updates_volume_and_score() {
 fn record_failure_lowers_score() {
     let ctx = setup();
     ctx.register(FLOOR);
-    ctx.client().record_fill(&ctx.admin, &ctx.solver, &0);
+    ctx.client()
+        .record_fill(&ctx.admin, &ctx.solver, &next_intent(&ctx.env), &0);
     let before = ctx.client().get_reputation_score(&ctx.solver).unwrap();
-    ctx.client().record_failure(&ctx.admin, &ctx.solver);
+    ctx.client()
+        .record_failure(&ctx.admin, &ctx.solver, &next_intent(&ctx.env));
     let after = ctx.client().get_reputation_score(&ctx.solver).unwrap();
     assert!(after < before, "{after} !< {before}");
 }
@@ -287,7 +304,7 @@ fn writer_can_drive_write_path_and_strangers_cannot() {
     // Before a writer is set, a stranger is rejected with WriterNotSet.
     assert_eq!(
         ctx.client()
-            .try_record_fill(&stranger, &ctx.solver, &0),
+            .try_record_fill(&stranger, &ctx.solver, &next_intent(&ctx.env), &0),
         Err(Ok(Error::WriterNotSet.into()))
     );
 
@@ -295,101 +312,139 @@ fn writer_can_drive_write_path_and_strangers_cannot() {
     assert_eq!(ctx.client().get_writer(), Some(writer.clone()));
 
     // Writer works…
-    ctx.client().record_fill(&writer, &ctx.solver, &(10 * USDC));
+    ctx.client()
+        .record_fill(&writer, &ctx.solver, &next_intent(&ctx.env), &(10 * USDC));
     assert_eq!(ctx.client().get_solver(&ctx.solver).unwrap().fills_completed, 1);
 
     // …a stranger still does not.
     assert_eq!(
         ctx.client()
-            .try_record_fill(&stranger, &ctx.solver, &0),
+            .try_record_fill(&stranger, &ctx.solver, &next_intent(&ctx.env), &0),
         Err(Ok(Error::Unauthorized.into()))
     );
 }
 
-// ─── Obligation locks (#392) ───────────────────────────────────────────────
+// ─── Per-intent idempotency (#390) ─────────────────────────────────────────
 
-fn intent(env: &Env, seed: u8) -> BytesN<32> {
-    BytesN::from_array(env, &[seed; 32])
-}
-
-/// Registers the default solver and configures a writer.
-fn with_writer(ctx: &Ctx) -> Address {
+#[test]
+fn record_fill_is_exactly_once_per_intent() {
+    let ctx = setup();
     ctx.register(FLOOR);
-    let writer = Address::generate(&ctx.env);
-    ctx.client().set_writer(&writer);
-    writer
-}
-
-#[test]
-fn lock_and_release_track_open_obligations() {
-    let ctx = setup();
-    let writer = with_writer(&ctx);
     let c = ctx.client();
-    let (a, b) = (intent(&ctx.env, 1), intent(&ctx.env, 2));
+    let intent = next_intent(&ctx.env);
 
-    assert_eq!(c.get_open_obligations(&ctx.solver), 0);
-    assert_eq!(c.lock_obligation(&writer, &ctx.solver, &a), 1);
-    assert_eq!(c.lock_obligation(&writer, &ctx.solver, &b), 2);
-    assert!(c.has_obligation(&ctx.solver, &a));
-    assert_eq!(c.get_open_obligations(&ctx.solver), 2);
-
-    assert_eq!(c.release_obligation(&writer, &ctx.solver, &a), 1);
-    assert!(!c.has_obligation(&ctx.solver, &a));
-    assert!(c.has_obligation(&ctx.solver, &b));
-    assert_eq!(c.release_obligation(&writer, &ctx.solver, &b), 0);
-    assert_eq!(c.get_open_obligations(&ctx.solver), 0);
-}
-
-#[test]
-fn lock_obligation_is_idempotent_per_intent() {
-    let ctx = setup();
-    let writer = with_writer(&ctx);
-    let c = ctx.client();
-    let a = intent(&ctx.env, 1);
-
-    assert_eq!(c.lock_obligation(&writer, &ctx.solver, &a), 1);
-    // A retried accept for the same intent must not double-count.
-    assert_eq!(c.lock_obligation(&writer, &ctx.solver, &a), 1);
-    assert_eq!(c.get_open_obligations(&ctx.solver), 1);
-}
-
-#[test]
-fn release_obligation_is_idempotent_per_intent() {
-    let ctx = setup();
-    let writer = with_writer(&ctx);
-    let c = ctx.client();
-    let (a, b) = (intent(&ctx.env, 1), intent(&ctx.env, 2));
-    c.lock_obligation(&writer, &ctx.solver, &a);
-    c.lock_obligation(&writer, &ctx.solver, &b);
-
-    assert_eq!(c.release_obligation(&writer, &ctx.solver, &a), 1);
-    // Releasing the same intent again (e.g. fill then re-open) is a no-op,
-    // and must not release the solver's other obligation.
-    assert_eq!(c.release_obligation(&writer, &ctx.solver, &a), 1);
-    // Releasing an intent that was never locked is a no-op too.
+    c.record_fill(&ctx.admin, &ctx.solver, &intent, &(10 * USDC));
     assert_eq!(
-        c.release_obligation(&writer, &ctx.solver, &intent(&ctx.env, 9)),
-        1
+        c.try_record_fill(&ctx.admin, &ctx.solver, &intent, &(10 * USDC)),
+        Err(Ok(Error::AlreadyRecorded.into()))
     );
-    assert!(c.has_obligation(&ctx.solver, &b));
+    let record = c.get_solver(&ctx.solver).unwrap();
+    assert_eq!(record.fills_completed, 1);
+    assert_eq!(record.total_volume, 10 * USDC);
 }
 
 #[test]
-fn obligations_are_scoped_per_solver() {
+fn record_failure_is_exactly_once_per_intent() {
     let ctx = setup();
-    let writer = with_writer(&ctx);
+    ctx.register(FLOOR);
+    let c = ctx.client();
+    let intent = next_intent(&ctx.env);
+
+    c.record_failure(&ctx.admin, &ctx.solver, &intent);
+    assert_eq!(
+        c.try_record_failure(&ctx.admin, &ctx.solver, &intent),
+        Err(Ok(Error::AlreadyRecorded.into()))
+    );
+    assert_eq!(c.get_solver(&ctx.solver).unwrap().fills_failed, 1);
+}
+
+#[test]
+fn a_retried_slash_cannot_double_slash() {
+    let ctx = setup();
+    ctx.register(10 * FLOOR);
+    let c = ctx.client();
+    let intent = next_intent(&ctx.env);
+
+    let (slashed, _) = c.slash(&ctx.admin, &ctx.solver, &intent);
+    let bond_after_first = c.get_solver(&ctx.solver).unwrap().bond_amount;
+    assert_eq!(
+        c.try_slash(&ctx.admin, &ctx.solver, &intent),
+        Err(Ok(Error::AlreadyRecorded.into()))
+    );
+    let record = c.get_solver(&ctx.solver).unwrap();
+    assert_eq!(record.bond_amount, bond_after_first);
+    assert_eq!(record.slashed_total, slashed);
+    assert_eq!(ctx.bond().balance(&ctx.fee_recipient), slashed);
+}
+
+#[test]
+fn idempotency_keys_are_per_action() {
+    let ctx = setup();
+    ctx.register(10 * FLOOR);
+    let c = ctx.client();
+    let intent = next_intent(&ctx.env);
+
+    // A failure and a slash for the same intent are distinct writes.
+    c.record_failure(&ctx.admin, &ctx.solver, &intent);
+    c.slash(&ctx.admin, &ctx.solver, &intent);
+    let fill = Symbol::new(&ctx.env, "fill");
+    let failure = Symbol::new(&ctx.env, "failure");
+    let slash = Symbol::new(&ctx.env, "slash");
+    assert!(c.is_intent_recorded(&failure, &intent));
+    assert!(c.is_intent_recorded(&slash, &intent));
+    assert!(!c.is_intent_recorded(&fill, &intent));
+}
+
+#[test]
+fn an_intent_fill_cannot_be_credited_to_a_second_solver() {
+    let ctx = setup();
+    ctx.register(FLOOR);
     let c = ctx.client();
     let other = Address::generate(&ctx.env);
     ctx.mint(&other, FLOOR);
     c.register_solver(&other, &FLOOR);
-    let a = intent(&ctx.env, 1);
+    let intent = next_intent(&ctx.env);
 
-    c.lock_obligation(&writer, &ctx.solver, &a);
-    assert_eq!(c.get_open_obligations(&other), 0);
-    assert!(!c.has_obligation(&other, &a));
-    // Releasing under the wrong solver leaves the real lock in place.
-    assert_eq!(c.release_obligation(&writer, &other, &a), 0);
-    assert_eq!(c.get_open_obligations(&ctx.solver), 1);
+    c.record_fill(&ctx.admin, &ctx.solver, &intent, &(10 * USDC));
+    assert_eq!(
+        c.try_record_fill(&ctx.admin, &other, &intent, &(10 * USDC)),
+        Err(Ok(Error::AlreadyRecorded.into()))
+    );
+    assert_eq!(c.get_solver(&other).unwrap().fills_completed, 0);
+}
+
+#[test]
+fn a_failed_write_does
+    let c = ctx.client();
+    let other = Address::generate(&ctx.env);
+    ctx.mint(&other, FLOOR);
+    c.register_solver(&other, &FLOOR);
+    let intent = next_intent(&ctx.env);
+
+    c.record_fill(&ctx.admin, &ctx.solver, &intent, &(10 * USDC));
+    assert_eq!(
+        c.try_record_fill(&ctx.admin, &other, &intent, &(10 * USDC)),
+        Err(Ok(Error::AlreadyRecorded.into()))
+    );
+    assert_eq!(c.get_solver(&other).unwrap().fills_completed, 0);
+}
+
+#[test]
+fn a_failed_write_does_not_consume_the_intent() {
+    let ctx = setup();
+    let c = ctx.client();
+    let intent = next_intent(&ctx.env);
+
+    // Solver not registered yet: the write reverts, key included.
+    assert_eq!(
+        c.try_record_fill(&ctx.admin, &ctx.solver, &intent, &0),
+        Err(Ok(Error::SolverNotRegistered.into()))
+    );
+    assert!(!c.is_intent_recorded(&Symbol::new(&ctx.env, "fill"), &intent));
+
+    ctx.register(FLOOR);
+    c.record_fill(&ctx.admin, &ctx.solver, &intent, &0);
+    assert_eq!(c.get_solver(&ctx.solver).unwrap().fills_completed, 1);
 }
 
 #[test]
@@ -450,6 +505,17 @@ fn lock_obligation_rejects_unregistered_solver() {
     );
 }
 
+#[test]
+fn obligations_are_scoped_per_solver() {
+    let ctx = setup();
+    let writer = with_writer(&ctx);
+    let c = ctx.client();
+    let other = Address::generate(&ctx.env);
+    ctx.mint(&other, FLOOR);
+    c.register_solver(&other, &FLOOR);
+
+}
+
 // ─── Tier demotion on slash ────────────────────────────────────────────────
 
 #[test]
@@ -458,10 +524,17 @@ fn slash_demotes_tier_and_pays_fee_recipient() {
     // Bond exactly at the Bronze floor.
     ctx.register(500 * USDC);
     // One clean fill → score ~9_001 → qualifies for Bronze (needs >= 1_000).
-    ctx.client().record_fill(&ctx.admin, &ctx.solver, &(100 * USDC));
+    ctx.client().record_fill(
+        &ctx.admin,
+        &ctx.solver,
+        &next_intent(&ctx.env),
+        &(100 * USDC),
+    );
     assert_eq!(ctx.client().get_tier(&ctx.solver), 1);
 
-    let (slashed, new_tier) = ctx.client().slash(&ctx.admin, &ctx.solver);
+    let (slashed, new_tier) = ctx
+        .client()
+        .slash(&ctx.admin, &ctx.solver, &next_intent(&ctx.env));
 
     // Bronze slash is the full 10% → 50 USDC, dropping bond to 450 USDC,
     // below the 500 USDC Bronze floor → demoted to Unranked.
@@ -482,11 +555,18 @@ fn slash_uses_the_tier_specific_bps() {
     let ctx = setup();
     // Platinum: bond 50_000 USDC + a clean fill → score ~9_001 ≥ 9_000.
     ctx.register(50_000 * USDC);
-    ctx.client().record_fill(&ctx.admin, &ctx.solver, &(100 * USDC));
+    ctx.client().record_fill(
+        &ctx.admin,
+        &ctx.solver,
+        &next_intent(&ctx.env),
+        &(100 * USDC),
+    );
     assert_eq!(ctx.client().get_tier(&ctx.solver), 4);
 
     // Platinum slash bps = 500 → 5% of 50_000 = 2_500 USDC.
-    let (slashed, _new_tier) = ctx.client().slash(&ctx.admin, &ctx.solver);
+    let (slashed, _new_tier) = ctx
+        .client()
+        .slash(&ctx.admin, &ctx.solver, &next_intent(&ctx.env));
     assert_eq!(slashed, 2_500 * USDC);
 }
 

@@ -62,9 +62,17 @@ and currently returns 0 for every tier.
 
 | Function | Returns | Effect |
 |---|---|---|
-| `record_fill(caller, solver, amount)` | — | `fills_completed += 1`, `total_volume += amount`. |
-| `record_failure(caller, solver)` | — | `fills_failed += 1` (no bond movement). |
-| `slash(caller, solver)` | `(slash_amount: i128, new_tier: u32)` | Takes `bond * slash_bps(tier) / 10_000` (min 1), transfers it to the fee recipient, `fills_failed += 1`. |
+| `record_fill(caller, solver, intent_id, amount)` | — | `fills_completed += 1`, `total_volume += amount`. |
+| `record_failure(caller, solver, intent_id)` | — | `fills_failed += 1` (no bond movement). |
+| `slash(caller, solver, intent_id)` | `(slash_amount: i128, new_tier: u32)` | Takes `bond * slash_bps(tier) / 10_000` (min 1), transfers it to the fee recipient, `fills_failed += 1`. |
+
+Each write is **exactly once per `intent_id`** (#390): a second `record_fill`,
+`record_failure` or `slash` for the same intent fails with `AlreadyRecorded`,
+whatever the solver. Keys are per action, so a `record_failure` and a `slash`
+for the same intent are independent. A write that reverts (e.g.
+`SolverNotRegistered`) does not consume its key. Check with
+`is_intent_recorded(action, intent_id)`, where `action` is `fill`, `failure`
+or `slash`.
 
 `caller` is explicit (mirrors `intent_settlement::pause`) so the registry can
 accept calls from either the admin or the settlement contract without an
@@ -157,6 +165,7 @@ yield the same outputs in `intent_settlement`:
 | 10 | `ThresholdOutOfBounds` | threshold value outside its bound |
 | 11 | `ThresholdsNotMonotonic` | thresholds not strictly increasing |
 | 12 | `WriterNotSet` | write path used before `set_writer` by a non-admin caller |
+| 13 | `AlreadyRecorded` | write-path call repeated for an `intent_id` already recorded for that action |
 
 ---
 
