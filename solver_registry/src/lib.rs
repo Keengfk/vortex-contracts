@@ -79,6 +79,10 @@ const PERSISTENT_TTL_EXTEND_TO: u32 = DAY_IN_LEDGERS * 30;
 const INSTANCE_TTL_THRESHOLD: u32 = DAY_IN_LEDGERS * 30;
 const INSTANCE_TTL_EXTEND_TO: u32 = DAY_IN_LEDGERS * 60;
 
+/// Delay between `propose_writer` and `execute_writer` (issue #389). Matches
+/// `intent_settlement`'s `ADMIN_TIMELOCK_DELAY`.
+pub const WRITER_TIMELOCK_DELAY: u64 = 172_800; // 48 hours
+
 // ─── Storage ─────────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -93,6 +97,9 @@ pub enum DataKey {
     /// Instance: the settlement contract authorized to call `record_fill` /
     /// `record_failure` / `slash`. Absent until `set_writer`.
     Writer,
+    /// Instance: `(Address, u64)` writer rotation proposed by
+    /// `propose_writer` and the earliest timestamp `execute_writer` may run.
+    PendingWriter,
     /// Instance: `Vec<TierThreshold>` of length 5 — the effective tier table.
     Thresholds,
     /// Instance: registered-solver count (`u32`).
@@ -177,8 +184,15 @@ pub enum Error {
     /// `record_fill` / `record_failure` / `slash` called before `set_writer`
     /// with a caller that is not the admin.
     WriterNotSet = 12,
+    /// `execute_writer` called before the rotation timelock elapsed.
+    TimelockNotElapsed = 13,
+    /// `execute_writer` / `cancel_writer` with no rotation pending.
+    NoPendingWriter = 14,
+    /// `set_writer` called once a writer exists; rotation goes through
+    /// `propose_writer` / `execute_writer`.
+    WriterAlreadySet = 15,
     /// This write was already applied for this `intent_id` (issue #390).
-    AlreadyRecorded = 13,
+    AlreadyRecorded = 16,
 }
 
 // ─── Reputation formula ──────────────────────────────────────────────────────
@@ -253,10 +267,16 @@ impl SolverRegistry {
 
     // ── Admin ────────────────────────────────────────────────────────────────
 
-    /// Admin-only: set (or rotate) the settlement contract permitted to call
-    /// `record_fill` / `record_failure` / `slash`.
+    /// Admin-only: set the **initial** settlement contract permitted to call
+    /// `record_fill` / `record_failure` / `slash`. Once a writer exists this
+    /// fails with `WriterAlreadySet`: rotating it goes through the timelocked
+    /// `propose_writer` / `execute_writer` flow, so a compromised admin key
+    /// can't silently swap in a writer that slashes every solver.
     pub fn set_writer(env: Env, writer: Address) {
         Self::require_admin(&env);
+        if env.storage().instance().has(&DataKey::Writer) {
+            panic_with_error!(&env, Error::WriterAlreadySet);
+        }
         env.storage().instance().set(&DataKey::Writer, &writer);
         Self::bump_instance_ttl(&env);
         env.events()
@@ -266,6 +286,63 @@ impl SolverRegistry {
     /// The configured settlement writer, if any.
     pub fn get_writer(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::Writer)
+    }
+
+    /// Admin-only: propose rotating the writer to `new_writer`. A
+    /// `writer_proposed` event fires immediately for off-chain monitors, and
+    /// `execute_writer` may only run once `WRITER_TIMELOCK_DELAY` has elapsed.
+    /// A fresh proposal overwrites any pending one and resets the timelock.
+    pub fn propose_writer(env: Env, new_writer: Address) {
+        Self::require_admin(&env);
+        let eta = env.ledger().timestamp() + WRITER_TIMELOCK_DELAY;
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingWriter, &(new_writer.clone(), eta));
+        Self::bump_instance_ttl(&env);
+        env.events()
+            .publish((Symbol::new(&env, "writer_proposed"),), (new_writer, eta));
+    }
+
+    /// Admin-only: apply the pending writer rotation once its timelock has
+    /// elapsed. `new_writer` must match the proposal, so a stale or replaced
+    /// proposal can't be executed by mistake. Emits `writer_set`.
+    pub fn execute_writer(env: Env, new_writer: Address) {
+        Self::require_admin(&env);
+        let (pending, eta): (Address, u64) = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingWriter)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoPendingWriter));
+        if pending != new_writer {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+        if env.ledger().timestamp() < eta {
+            panic_with_error!(&env, Error::TimelockNotElapsed);
+        }
+        env.storage().instance().remove(&DataKey::PendingWriter);
+        env.storage().instance().set(&DataKey::Writer, &new_writer);
+        Self::bump_instance_ttl(&env);
+        env.events()
+            .publish((Symbol::new(&env, "writer_set"),), new_writer);
+    }
+
+    /// Admin-only: discard the pending writer rotation. Fails with
+    /// `NoPendingWriter` if none is pending.
+    pub fn cancel_writer(env: Env) {
+        Self::require_admin(&env);
+        let (pending, _eta): (Address, u64) = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingWriter)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoPendingWriter));
+        env.storage().instance().remove(&DataKey::PendingWriter);
+        env.events()
+            .publish((Symbol::new(&env, "writer_proposal_cancelled"),), pending);
+    }
+
+    /// The pending writer rotation, if any: `(new_writer, eta)`.
+    pub fn get_pending_writer(env: Env) -> Option<(Address, u64)> {
+        env.storage().instance().get(&DataKey::PendingWriter)
     }
 
     /// Admin-only: tune one tier's `min_bond` / `min_score_bps`.

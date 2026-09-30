@@ -46,7 +46,11 @@ and currently returns 0 for every tier.
 | Function | Auth | Notes |
 |---|---|---|
 | `initialize(admin, bond_token, fee_recipient)` | `admin` | Once. Seeds the default tier table. |
-| `set_writer(writer)` | admin | Address allowed to drive the write path (§2.3). |
+| `set_writer(writer)` | admin | Sets the **initial** address allowed to drive the write path (§2.3). Fails with `WriterAlreadySet` once a writer exists. |
+| `propose_writer(new_writer)` | admin | Starts a writer rotation; `execute_writer` allowed after `WRITER_TIMELOCK_DELAY` (48 h). A new proposal replaces the pending one and resets the timer. Emits `writer_proposed(new_writer, eta)`. |
+| `execute_writer(new_writer)` | admin | Applies the pending rotation once the timelock has elapsed; `new_writer` must match the proposal. Emits `writer_set`. |
+| `cancel_writer()` | admin | Discards the pending rotation. Emits `writer_proposal_cancelled`. |
+| `get_pending_writer()` | — | `Option<(Address, u64)>`: pending writer and its eta. |
 | `set_tier_threshold(tier, min_bond, min_score_bps)` | admin | `tier ∈ 1..=4`; see 2.4. |
 
 ### 2.2 Solver self-service
@@ -165,7 +169,10 @@ yield the same outputs in `intent_settlement`:
 | 10 | `ThresholdOutOfBounds` | threshold value outside its bound |
 | 11 | `ThresholdsNotMonotonic` | thresholds not strictly increasing |
 | 12 | `WriterNotSet` | write path used before `set_writer` by a non-admin caller |
-| 13 | `AlreadyRecorded` | write-path call repeated for an `intent_id` already recorded for that action |
+| 13 | `TimelockNotElapsed` | `execute_writer` before the rotation eta |
+| 14 | `NoPendingWriter` | `execute_writer` / `cancel_writer` with no rotation pending |
+| 15 | `WriterAlreadySet` | `set_writer` once a writer exists (rotate via `propose_writer`) |
+| 16 | `AlreadyRecorded` | write-path call repeated for an `intent_id` already recorded for that action |
 
 ---
 
