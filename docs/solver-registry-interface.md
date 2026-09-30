@@ -51,6 +51,10 @@ and currently returns 0 for every tier.
 | `execute_writer(new_writer)` | admin | Applies the pending rotation once the timelock has elapsed; `new_writer` must match the proposal. Emits `writer_set`. |
 | `cancel_writer()` | admin | Discards the pending rotation. Emits `writer_proposal_cancelled`. |
 | `get_pending_writer()` | — | `Option<(Address, u64)>`: pending writer and its eta. |
+| `propose_admin(new_admin)` | admin | Starts an admin handover; `accept_admin` allowed after `ADMIN_TIMELOCK_DELAY` (48 h). A new proposal replaces the pending one and resets the timer. Emits `admin_transfer_proposed(new_admin, eta)`. |
+| `accept_admin(new_admin)` | `new_admin` | Completes the handover once the timelock has elapsed; must be the proposed address. Emits `admin_transferred(old, new)`. |
+| `cancel_admin_transfer()` | admin | Discards the pending handover. Emits `admin_transfer_cancelled`. |
+| `get_pending_admin()` | — | `Option<(Address, u64)>`: proposed admin and its eta. |
 | `set_tier_threshold(tier, min_bond, min_score_bps)` | admin | `tier ∈ 1..=4`; see 2.4. |
 
 ### 2.2 Solver self-service
@@ -173,6 +177,8 @@ yield the same outputs in `intent_settlement`:
 | 14 | `NoPendingWriter` | `execute_writer` / `cancel_writer` with no rotation pending |
 | 15 | `WriterAlreadySet` | `set_writer` once a writer exists (rotate via `propose_writer`) |
 | 16 | `AlreadyRecorded` | write-path call repeated for an `intent_id` already recorded for that action |
+| 17 | `AdminTimelockNotElapsed` | `accept_admin` before the handover eta |
+| 18 | `NoPendingAdminTransfer` | `accept_admin` / `cancel_admin_transfer` with no handover pending |
 
 ---
 

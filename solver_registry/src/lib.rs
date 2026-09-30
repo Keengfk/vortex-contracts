@@ -79,6 +79,10 @@ const PERSISTENT_TTL_EXTEND_TO: u32 = DAY_IN_LEDGERS * 30;
 const INSTANCE_TTL_THRESHOLD: u32 = DAY_IN_LEDGERS * 30;
 const INSTANCE_TTL_EXTEND_TO: u32 = DAY_IN_LEDGERS * 60;
 
+/// Delay between `propose_admin` and `accept_admin` (issue #393). Matches
+/// `intent_settlement`'s `ADMIN_TIMELOCK_DELAY`.
+pub const ADMIN_TIMELOCK_DELAY: u64 = 172_800; // 48 hours
+
 /// Delay between `propose_writer` and `execute_writer` (issue #389). Matches
 /// `intent_settlement`'s `ADMIN_TIMELOCK_DELAY`.
 pub const WRITER_TIMELOCK_DELAY: u64 = 172_800; // 48 hours
@@ -90,6 +94,9 @@ pub const WRITER_TIMELOCK_DELAY: u64 = 172_800; // 48 hours
 pub enum DataKey {
     /// Instance: admin `Address` (set in `initialize`).
     Admin,
+    /// Instance: `(Address, u64)` admin handover proposed by `propose_admin`
+    /// and the earliest timestamp `accept_admin` may run.
+    PendingAdmin,
     /// Instance: bond token (`Address`) solvers stake.
     BondToken,
     /// Instance: `Address` that receives slashed bond.
@@ -193,6 +200,10 @@ pub enum Error {
     WriterAlreadySet = 15,
     /// This write was already applied for this `intent_id` (issue #390).
     AlreadyRecorded = 16,
+    /// `accept_admin` called before the handover timelock elapsed.
+    AdminTimelockNotElapsed = 17,
+    /// `accept_admin` / `cancel_admin_transfer` with no handover pending.
+    NoPendingAdminTransfer = 18,
 }
 
 // ─── Reputation formula ──────────────────────────────────────────────────────
@@ -281,6 +292,74 @@ impl SolverRegistry {
         Self::bump_instance_ttl(&env);
         env.events()
             .publish((Symbol::new(&env, "writer_set"),), writer);
+    }
+
+    /// Admin-only: propose handing the admin role to `new_admin`. An
+    /// `admin_transfer_proposed` event fires immediately for off-chain
+    /// monitors, and `new_admin` may accept once `ADMIN_TIMELOCK_DELAY` has
+    /// elapsed. A fresh proposal replaces any pending one and resets the
+    /// timelock.
+    pub fn propose_admin(env: Env, new_admin: Address) {
+        Self::require_admin(&env);
+        let eta = env.ledger().timestamp() + ADMIN_TIMELOCK_DELAY;
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &(new_admin.clone(), eta));
+        Self::bump_instance_ttl(&env);
+        env.events().publish(
+            (Symbol::new(&env, "admin_transfer_proposed"),),
+            (new_admin, eta),
+        );
+    }
+
+    /// The proposed admin completes the handover once the timelock has
+    /// elapsed. Two-step: `new_admin` must sign, so the role can't be handed
+    /// to an address nobody controls. Emits `admin_transferred(old, new)`.
+    pub fn accept_admin(env: Env, new_admin: Address) {
+        let (pending, eta): (Address, u64) = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoPendingAdminTransfer));
+        if pending != new_admin {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+        if env.ledger().timestamp() < eta {
+            panic_with_error!(&env, Error::AdminTimelockNotElapsed);
+        }
+        new_admin.require_auth();
+
+        let old_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        Self::bump_instance_ttl(&env);
+        env.events().publish(
+            (Symbol::new(&env, "admin_transferred"),),
+            (old_admin, new_admin),
+        );
+    }
+
+    /// Admin-only: discard the pending admin handover. Fails with
+    /// `NoPendingAdminTransfer` if none is pending.
+    pub fn cancel_admin_transfer(env: Env) {
+        Self::require_admin(&env);
+        let (pending, _eta): (Address, u64) = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoPendingAdminTransfer));
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        env.events()
+            .publish((Symbol::new(&env, "admin_transfer_cancelled"),), pending);
+    }
+
+    /// The pending admin handover, if any: `(new_admin, eta)`.
+    pub fn get_pending_admin(env: Env) -> Option<(Address, u64)> {
+        env.storage().instance().get(&DataKey::PendingAdmin)
     }
 
     /// The configured settlement writer, if any.
