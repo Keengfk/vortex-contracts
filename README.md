@@ -618,3 +618,8 @@ Current ecosystem tooling examples:
 ## License
 
 [MIT](./LICENSE) © 2025–2026 Vortex Protocol Contributors
+
+## Handsoff notes
+
+<!-- handsoff-issue-404 -->
+- #404: [High] Add on-chain rate-of-change guardrails to protocol parameters
